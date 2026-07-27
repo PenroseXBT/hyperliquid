@@ -78,6 +78,8 @@ pub struct SourceStateResponse {
     pub account_value: Decimal,
     pub source_time_ms: u64,
     pub positions: BTreeMap<String, SourceAssetPosition>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub closed_candles: Vec<ClosedCandle>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -196,6 +198,17 @@ pub struct HyperliquidPublicTransport<C: Clock> {
     metrics: Arc<PublicTransportMetrics>,
     market_assets: Arc<Mutex<BTreeSet<String>>>,
     candidate_audit: Arc<Mutex<CandidateAuditSnapshot>>,
+    technical_fetch: Arc<Mutex<TechnicalCandleFetchState>>,
+}
+
+const TECHNICAL_UNIVERSE_LIMIT: usize = 25;
+const TECHNICAL_BATCH_INTERVAL_MS: u64 = 5_000;
+
+#[derive(Debug, Default)]
+struct TechnicalCandleFetchState {
+    assets: BTreeSet<String>,
+    requested_buckets: BTreeMap<(String, CandleInterval), u64>,
+    last_batch_started_ms: Option<u64>,
 }
 
 impl<C: Clock> HyperliquidPublicTransport<C> {
@@ -220,6 +233,7 @@ impl<C: Clock> HyperliquidPublicTransport<C> {
             metrics: Arc::new(PublicTransportMetrics::default()),
             market_assets: Arc::new(Mutex::new(BTreeSet::new())),
             candidate_audit: Arc::new(Mutex::new(BTreeMap::new())),
+            technical_fetch: Arc::new(Mutex::new(TechnicalCandleFetchState::default())),
         })
     }
 
@@ -296,6 +310,82 @@ impl<C: Clock> HyperliquidPublicTransport<C> {
             .responses_accepted
             .fetch_add(1, Ordering::SeqCst);
         Ok(candles)
+    }
+
+    async fn fetch_due_source_candles(
+        &self,
+        positions: &BTreeMap<String, SourceAssetPosition>,
+        now_ms: u64,
+    ) -> Vec<ClosedCandle> {
+        let reservation = {
+            let mut state = self
+                .technical_fetch
+                .lock()
+                .expect("technical candle fetch mutex poisoned");
+            for asset in positions.keys() {
+                if state.assets.len() >= TECHNICAL_UNIVERSE_LIMIT {
+                    break;
+                }
+                state.assets.insert(asset.clone());
+            }
+            if state
+                .last_batch_started_ms
+                .is_some_and(|last| now_ms.saturating_sub(last) < TECHNICAL_BATCH_INTERVAL_MS)
+            {
+                None
+            } else {
+                let due = state.assets.iter().find_map(|asset| {
+                    let intervals = CandleInterval::ALL
+                        .into_iter()
+                        .filter(|interval| {
+                            let bucket = now_ms / interval.duration_ms();
+                            state
+                                .requested_buckets
+                                .get(&(asset.clone(), *interval))
+                                .is_none_or(|requested| *requested < bucket)
+                        })
+                        .collect::<Vec<_>>();
+                    (!intervals.is_empty()).then(|| (asset.clone(), intervals))
+                });
+                if let Some((asset, intervals)) = &due {
+                    state.last_batch_started_ms = Some(now_ms);
+                    for interval in intervals {
+                        state
+                            .requested_buckets
+                            .insert((asset.clone(), *interval), now_ms / interval.duration_ms());
+                    }
+                }
+                due
+            }
+        };
+        let Some((asset, intervals)) = reservation else {
+            return Vec::new();
+        };
+        let mut accepted = Vec::new();
+        let mut failed = Vec::new();
+        for interval in intervals {
+            let duration = interval.duration_ms();
+            let history = u64::try_from(interval.warmup_candles() + 2).unwrap_or(u64::MAX);
+            let start = now_ms.saturating_sub(duration.saturating_mul(history));
+            match self
+                .fetch_candle_snapshot(&asset, interval, start, now_ms, now_ms)
+                .await
+            {
+                Ok(mut candles) => accepted.append(&mut candles),
+                Err(_) => failed.push(interval),
+            }
+        }
+        if !failed.is_empty() {
+            let mut state = self
+                .technical_fetch
+                .lock()
+                .expect("technical candle fetch mutex poisoned");
+            for interval in failed {
+                state.requested_buckets.remove(&(asset.clone(), interval));
+            }
+        }
+        accepted.sort_by_key(|candle| (candle.interval, candle.open_time_ms));
+        accepted
     }
 
     async fn perform(
@@ -425,17 +515,17 @@ impl<C: Clock> HyperliquidPublicTransport<C> {
             let hash = hash_payload_bytes(&bytes);
             self.with_candidate_audit(request, &subject, |audit| audit.record_payload(hash));
         }
-        let payload = self
-            .parse_payload(request.kind, &subject, &bytes)
-            .map_err(|failure| {
-                self.metrics
-                    .invalid_responses
-                    .fetch_add(1, Ordering::SeqCst);
-                if request.kind == ReadRequestKind::SourceState {
-                    self.record_candidate_failure(request, &subject, failure);
-                }
-                ReadFailure::InvalidResponse
-            })?;
+        let mut payload =
+            self.parse_payload(request.kind, &subject, &bytes)
+                .map_err(|failure| {
+                    self.metrics
+                        .invalid_responses
+                        .fetch_add(1, Ordering::SeqCst);
+                    if request.kind == ReadRequestKind::SourceState {
+                        self.record_candidate_failure(request, &subject, failure);
+                    }
+                    ReadFailure::InvalidResponse
+                })?;
         if let PublicPayload::SourceState(state) = &payload {
             let maximum_age = self
                 .policy
@@ -451,6 +541,11 @@ impl<C: Clock> HyperliquidPublicTransport<C> {
                 self.record_candidate_failure(request, &subject, failure);
                 return Err(ReadFailure::InvalidResponse);
             }
+        }
+        if let PublicPayload::SourceState(state) = &mut payload {
+            state.closed_candles = self
+                .fetch_due_source_candles(&state.positions, wall_clock_ms())
+                .await;
         }
         let received_at_mono = self.clock.now_ms();
         let validity = match request.kind {
@@ -813,6 +908,7 @@ fn parse_source_state_with_metadata(
         account_value,
         source_time_ms: wire.time,
         positions: parsed,
+        closed_candles: Vec::new(),
     })
 }
 
@@ -1074,6 +1170,20 @@ mod tests {
             Decimal::from(3)
         );
         assert!(parse_book("ETH", book).is_err());
+    }
+
+    #[test]
+    fn candle_parser_accepts_every_required_interval_and_only_closed_rows() {
+        for interval in CandleInterval::ALL {
+            let payload = format!(
+                r#"[{{"t":1,"T":99,"s":"BTC","i":"{}","o":"100","c":"101","h":"102","l":"99","v":"12","n":3}},{{"t":100,"T":201,"s":"BTC","i":"{}","o":"101","c":"102","h":"103","l":"100","v":"13","n":4}}]"#,
+                interval.api_name(),
+                interval.api_name()
+            );
+            let candles = parse_candle_snapshot("BTC", interval, payload.as_bytes(), 200).unwrap();
+            assert_eq!(candles.len(), 1);
+            assert_eq!(candles[0].interval, interval);
+        }
     }
 
     #[test]

@@ -6,7 +6,9 @@ use copytrade_core::authorized_intent::{
     AuthorizedExecutionIntent, PreSigningContext, TimeInForce, AUTHORIZED_INTENT_SCHEMA_VERSION,
 };
 use copytrade_core::configuration::CopyTradeConfig;
-use copytrade_core::consensus::{ConsensusInput, SourceExposureBook, SourceExposureState};
+use copytrade_core::consensus::{
+    bounded_additive_consensus, ConsensusInput, SourceExposureBook, SourceExposureState,
+};
 use copytrade_core::decision::{
     canonical_target_hash, construct_decision, construct_planned_actions, derive_config_hash,
     derive_planned_cloid, derive_projection_hash, derive_risk_policy_hash,
@@ -745,7 +747,18 @@ impl LiveShadowEngine {
         now: Timestamp,
     ) -> Result<(), LiveShadowError> {
         match response.payload {
-            PublicPayload::SourceState(state) => {
+            PublicPayload::SourceState(mut state) => {
+                let closed_candles = std::mem::take(&mut state.closed_candles);
+                let mut technical_changed = false;
+                for candle in closed_candles {
+                    technical_changed |= self
+                        .technical_engine
+                        .accept_closed_candle(candle)
+                        .map_err(|error| {
+                            LiveShadowError::Core(format!("invalid closed candle: {error:?}"))
+                        })?
+                        == CandleAcceptance::Accepted;
+                }
                 let candidate_id = state.candidate_id.clone();
                 let sequence = self
                     .source_sequences
@@ -788,6 +801,9 @@ impl LiveShadowEngine {
                     }
                     SnapshotAcceptance::Expired => self.metrics.stale_source_snapshots += 1,
                     _ => self.metrics.rejected_source_snapshots += 1,
+                }
+                if technical_changed {
+                    self.construct_next_decision(response.received_at_mono)?;
                 }
             }
             PublicPayload::MarketSnapshot(mids) => {
@@ -942,7 +958,7 @@ impl LiveShadowEngine {
                     .or_default()
                     .push(ConsensusInput {
                         candidate_id: id.clone(),
-                        allocation_weight: candidate.allocation_weight * source_budget,
+                        allocation_weight: candidate.allocation_weight,
                         confidence_modifier: candidate
                             .confidence_modifier
                             .ok_or_else(|| LiveShadowError::Core("missing confidence".into()))?,
@@ -951,25 +967,44 @@ impl LiveShadowEngine {
                         quarantined: false,
                         snapshot_age_ms: now.saturating_sub(snapshot.received_at),
                     });
-                let confidence = candidate
-                    .confidence_modifier
-                    .ok_or_else(|| LiveShadowError::Core("missing confidence".into()))?;
-                let bounded = exposure.clamp(
-                    -self.config.global_risk.max_source_exposure,
-                    self.config.global_risk.max_source_exposure,
-                );
-                let contribution = Decimal::from_f64(
-                    candidate.allocation_weight * source_budget * confidence * bounded,
-                )
-                .ok_or(LiveShadowError::Arithmetic)?;
-                source_contributions
-                    .entry(asset.clone())
-                    .or_default()
-                    .insert(id.clone(), contribution);
             }
         }
         for asset in self.technical_engine.tracked_assets() {
             consensus_inputs.entry(asset.clone()).or_default();
+        }
+        // Collapse the complete source book to one bounded source component
+        // before applying the fixed 35/65 strategy allocation. Applying 35%
+        // independently to every source would let a large source set saturate
+        // the whole portfolio and crowd out the technical component.
+        for (asset, inputs) in &mut consensus_inputs {
+            let source = bounded_additive_consensus(
+                inputs,
+                self.config.global_risk.max_source_exposure,
+                self.config.global_risk.source_snapshot_max_age_ms,
+            )
+            .map_err(|error| LiveShadowError::Core(error.to_string()))?;
+            let scaled_contributions = source
+                .contribution_by_candidate
+                .into_iter()
+                .map(|(candidate, contribution)| {
+                    Decimal::from_f64(contribution * source_budget)
+                        .map(|value| (candidate, value))
+                        .ok_or(LiveShadowError::Arithmetic)
+                })
+                .collect::<Result<BTreeMap<_, _>, _>>()?;
+            source_contributions.insert(asset.clone(), scaled_contributions);
+            inputs.clear();
+            if source.exposure != 0.0 {
+                inputs.push(ConsensusInput {
+                    candidate_id: "source:aggregate".into(),
+                    allocation_weight: source_budget,
+                    confidence_modifier: 1.0,
+                    source_exposure: source.exposure,
+                    enabled: true,
+                    quarantined: false,
+                    snapshot_age_ms: 0,
+                });
+            }
         }
         if eligibility.active_ids.is_empty() {
             return Ok(None);
@@ -1038,8 +1073,11 @@ impl LiveShadowEngine {
                     })?
                 {
                     let score = target.score.to_f64().ok_or(LiveShadowError::Arithmetic)?;
-                    let component_id =
-                        format!("technical:{:?}", target.archetype).to_ascii_lowercase();
+                    let component_id = format!(
+                        "technical:{}:{}",
+                        target.archetype.as_str(),
+                        target.regime.as_str()
+                    );
                     consensus_inputs
                         .entry(asset.clone())
                         .or_default()
@@ -2657,6 +2695,7 @@ mod tests {
                         account_value: Decimal::from(1_000),
                         source_time_ms: 1_000,
                         positions,
+                        closed_candles: Vec::new(),
                     }),
                     ReadRequestKind::SourceState,
                     1_000,

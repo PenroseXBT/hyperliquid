@@ -32,6 +32,26 @@ impl CandleInterval {
             Self::TwelveHours => "12h",
         }
     }
+
+    pub const fn duration_ms(self) -> u64 {
+        match self {
+            Self::FifteenMinutes => 15 * 60 * 1_000,
+            Self::ThirtyMinutes => 30 * 60 * 1_000,
+            Self::OneHour => 60 * 60 * 1_000,
+            Self::FourHours => 4 * 60 * 60 * 1_000,
+            Self::TwelveHours => 12 * 60 * 60 * 1_000,
+        }
+    }
+
+    pub const fn warmup_candles(self) -> usize {
+        match self {
+            Self::FifteenMinutes => 22,
+            Self::ThirtyMinutes => 51,
+            Self::OneHour => 51,
+            Self::FourHours => 101,
+            Self::TwelveHours => 201,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -82,11 +102,32 @@ pub enum MarketRegime {
     StrongBear,
 }
 
+impl MarketRegime {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::StrongBull => "strong_bull",
+            Self::TransitionUp => "transition_up",
+            Self::Range => "range",
+            Self::TransitionDown => "transition_down",
+            Self::StrongBear => "strong_bear",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SignalArchetype {
     TrendPullback,
     RegimeBreakout,
+}
+
+impl SignalArchetype {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::TrendPullback => "trend_pullback",
+            Self::RegimeBreakout => "regime_breakout",
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -284,6 +325,13 @@ struct CandleIdentity {
     payload_hash: [u8; 32],
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ExitTiming {
+    Hold,
+    Reduce,
+    Flatten,
+}
+
 #[derive(Debug, Default)]
 struct AssetCandles {
     intervals: BTreeMap<CandleInterval, VecDeque<ClosedCandle>>,
@@ -364,6 +412,7 @@ impl TechnicalEngine {
         let mut candidate = Decimal::from_f64_retain(raw_score.clamp(-1.0, 1.0))
             .ok_or(TechnicalError::Arithmetic)?;
         let current = candles.current_score;
+        let exit_timing = primary_exit_30m(candles, current)?;
         let abs = candidate.abs().to_f64().ok_or(TechnicalError::Arithmetic)?;
         let current_sign = current.signum();
         let candidate_sign = candidate.signum();
@@ -401,6 +450,15 @@ impl TechnicalEngine {
                 current
             };
         }
+        candidate = match exit_timing {
+            ExitTiming::Flatten => Decimal::ZERO,
+            ExitTiming::Reduce if !current.is_zero() && candidate.signum() == current_sign => {
+                current_sign
+                    * Decimal::from_f64_retain(self.config.reduce_threshold)
+                        .ok_or(TechnicalError::Arithmetic)?
+            }
+            ExitTiming::Hold | ExitTiming::Reduce => candidate,
+        };
         if !candidate.is_zero() {
             let expected = self.config.expected_atr_fraction * atr_fraction;
             let round_trip = costs.round_trip(self.config.expected_holding_hours)?;
@@ -429,6 +487,44 @@ impl TechnicalEngine {
     pub fn tracked_assets(&self) -> impl Iterator<Item = &String> {
         self.assets.keys()
     }
+}
+
+fn primary_exit_30m(
+    candles: &AssetCandles,
+    current: Decimal,
+) -> Result<ExitTiming, TechnicalError> {
+    if current.is_zero() {
+        return Ok(ExitTiming::Hold);
+    }
+    let Some(series) = candles.intervals.get(&CandleInterval::ThirtyMinutes) else {
+        return Ok(ExitTiming::Hold);
+    };
+    let closes = closes(series)?;
+    if closes.len() < 22 {
+        return Ok(ExitTiming::Hold);
+    }
+    let previous = &closes[..closes.len() - 1];
+    let close = *closes.last().ok_or(TechnicalError::Arithmetic)?;
+    let previous_close = *previous.last().ok_or(TechnicalError::Arithmetic)?;
+    let ma7 = sma(&closes, 7).ok_or(TechnicalError::Arithmetic)?;
+    let ma21 = sma(&closes, 21).ok_or(TechnicalError::Arithmetic)?;
+    let previous_ma21 = sma(previous, 21).ok_or(TechnicalError::Arithmetic)?;
+    let rsi14 = rsi(&closes, 14).ok_or(TechnicalError::Arithmetic)?;
+    Ok(if current.is_sign_positive() {
+        if (close < ma21 && previous_close >= previous_ma21) || rsi14 <= 42.0 {
+            ExitTiming::Flatten
+        } else if close < ma7 || rsi14 < 50.0 {
+            ExitTiming::Reduce
+        } else {
+            ExitTiming::Hold
+        }
+    } else if (close > ma21 && previous_close <= previous_ma21) || rsi14 >= 58.0 {
+        ExitTiming::Flatten
+    } else if close > ma7 || rsi14 > 50.0 {
+        ExitTiming::Reduce
+    } else {
+        ExitTiming::Hold
+    })
 }
 
 fn classify(
@@ -487,6 +583,7 @@ fn regime_12h(candles: &VecDeque<ClosedCandle>) -> Result<RegimeState, Technical
     let previous = &closes[..closes.len() - 1];
     let slope50 = (ma50 - sma(previous, 50).ok_or(TechnicalError::Arithmetic)?) / atr14;
     let slope100 = (ma100 - sma(previous, 100).ok_or(TechnicalError::Arithmetic)?) / atr14;
+    let rsi14 = rsi(&closes, 14).ok_or(TechnicalError::Arithmetic)?;
     let quote_volumes = quote_volumes(candles)?;
     let volume_above = *quote_volumes.last().ok_or(TechnicalError::Arithmetic)?
         > sma(&quote_volumes[..quote_volumes.len() - 1], 20).ok_or(TechnicalError::Arithmetic)?;
@@ -500,6 +597,8 @@ fn regime_12h(candles: &VecDeque<ClosedCandle>) -> Result<RegimeState, Technical
         && ma100 > ma200
         && slope50 > 0.0
         && slope100 > 0.0
+        && rsi14 >= 55.0
+        && volume_above
     {
         MarketRegime::StrongBull
     } else if last < ma21
@@ -510,6 +609,8 @@ fn regime_12h(candles: &VecDeque<ClosedCandle>) -> Result<RegimeState, Technical
         && ma100 < ma200
         && slope50 < 0.0
         && slope100 < 0.0
+        && rsi14 <= 45.0
+        && volume_above
     {
         MarketRegime::StrongBear
     } else if ma7 > ma14
@@ -517,6 +618,7 @@ fn regime_12h(candles: &VecDeque<ClosedCandle>) -> Result<RegimeState, Technical
         && previous_ma21 <= previous_ma50
         && ma21 > ma50
         && slope50 >= 0.0
+        && rsi14 > 50.0
         && volume_above
     {
         MarketRegime::TransitionUp
@@ -525,6 +627,7 @@ fn regime_12h(candles: &VecDeque<ClosedCandle>) -> Result<RegimeState, Technical
         && previous_ma21 >= previous_ma50
         && ma21 < ma50
         && slope50 <= 0.0
+        && rsi14 < 50.0
         && volume_above
     {
         MarketRegime::TransitionDown
@@ -552,13 +655,31 @@ fn trend_4h(candles: &VecDeque<ClosedCandle>) -> Result<TrendState, TechnicalErr
     let close = *closes.last().ok_or(TechnicalError::Arithmetic)?;
     let ma21 = sma(&closes, 21).ok_or(TechnicalError::Arithmetic)?;
     let ma50 = sma(&closes, 50).ok_or(TechnicalError::Arithmetic)?;
+    let ma100 = sma(&closes, 100).ok_or(TechnicalError::Arithmetic)?;
     let slope21 = ma21 - sma(previous, 21).ok_or(TechnicalError::Arithmetic)?;
     let slope50 = ma50 - sma(previous, 50).ok_or(TechnicalError::Arithmetic)?;
     let rsi = rsi(&closes, 14).ok_or(TechnicalError::Arithmetic)?;
+    let volumes = quote_volumes(candles)?;
+    let volume_confirms = *volumes.last().ok_or(TechnicalError::Arithmetic)?
+        >= sma(&volumes[..volumes.len() - 1], 20).ok_or(TechnicalError::Arithmetic)?;
     Ok(
-        if close > ma21 && ma21 > ma50 && slope21 > 0.0 && slope50 >= 0.0 && rsi > 50.0 {
+        if close > ma21
+            && ma21 > ma50
+            && ma50 > ma100
+            && slope21 > 0.0
+            && slope50 >= 0.0
+            && rsi > 50.0
+            && volume_confirms
+        {
             TrendState::Bullish
-        } else if close < ma21 && ma21 < ma50 && slope21 < 0.0 && slope50 <= 0.0 && rsi < 50.0 {
+        } else if close < ma21
+            && ma21 < ma50
+            && ma50 < ma100
+            && slope21 < 0.0
+            && slope50 <= 0.0
+            && rsi < 50.0
+            && volume_confirms
+        {
             TrendState::Bearish
         } else {
             TrendState::Neutral
@@ -827,6 +948,30 @@ mod tests {
             .round_trip(6)
             .unwrap(),
             0.0023
+        );
+    }
+
+    #[test]
+    fn thirty_minute_structure_break_flattens_before_slow_regime_changes() {
+        let mut asset = AssetCandles {
+            current_score: Decimal::ONE,
+            ..AssetCandles::default()
+        };
+        let series = asset
+            .intervals
+            .entry(CandleInterval::ThirtyMinutes)
+            .or_default();
+        for index in 0..21 {
+            series.push_back(candle(
+                CandleInterval::ThirtyMinutes,
+                index,
+                100 + i64::try_from(index).unwrap(),
+            ));
+        }
+        series.push_back(candle(CandleInterval::ThirtyMinutes, 21, 80));
+        assert_eq!(
+            primary_exit_30m(&asset, Decimal::ONE).unwrap(),
+            ExitTiming::Flatten
         );
     }
 }
