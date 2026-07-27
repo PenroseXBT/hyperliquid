@@ -1,7 +1,7 @@
 use crate::ipc_client::{
     IntentDispatchState, ProductionDispatchHandle, ProductionIntentDispatcher,
 };
-use crate::live_shadow::{LiveShadowEngine, ProductionIntentIdentity};
+use crate::live_shadow::{LiveShadowEngine, ProductionIntentIdentity, UnsignedShadowStateIdentity};
 use crate::profitability::{summarize_profitability, ProfitabilitySummary};
 use crate::public_mainnet::{HyperliquidPublicTransport, PublicTransportPolicy};
 use crate::qualification_evidence::{
@@ -37,11 +37,25 @@ pub struct QualificationOptions {
     pub release_manifest_path: PathBuf,
     pub isolation_report_path: PathBuf,
     pub output: PathBuf,
+    pub state_root: Option<PathBuf>,
     pub duration_seconds: u64,
     pub transport_gate: bool,
     pub profitability_gate: bool,
     pub micro_density_gate: bool,
     pub production: Option<ProductionObserverRuntime>,
+}
+
+fn persist_unsigned_state(
+    engine: &mut LiveShadowEngine,
+    state_path: Option<&Path>,
+    identity: &UnsignedShadowStateIdentity,
+) -> Result<(), Box<dyn Error>> {
+    if let Some(path) = state_path {
+        engine
+            .persist_unsigned_state(path, identity)
+            .map_err(|error| error.to_string())?;
+    }
+    Ok(())
 }
 
 #[derive(Clone)]
@@ -74,6 +88,12 @@ struct Counters {
 }
 
 pub async fn run_qualification(options: QualificationOptions) -> Result<PathBuf, Box<dyn Error>> {
+    if options.production.is_some() && options.state_root.is_some() {
+        return Err("unsigned state restoration is forbidden in production mode".into());
+    }
+    if options.state_root.is_some() && !options.profitability_gate {
+        return Err("--state-root is supported only by unsigned profitability runs".into());
+    }
     if options.production.is_some() {
         if options.duration_seconds < 60 {
             return Err("production observer duration must be at least 60 seconds".into());
@@ -215,6 +235,33 @@ pub async fn run_qualification(options: QualificationOptions) -> Result<PathBuf,
         inactive_freshness,
     )
     .map_err(|error| error.to_string())?;
+    let state_identity = UnsignedShadowStateIdentity {
+        source_tree_sha256: manifest.source_tree_sha256.clone(),
+        observer_binary_sha256: sha256_file(std::env::current_exe()?)?,
+        configuration_sha256: manifest.configuration_sha256.clone(),
+        risk_policy_sha256: manifest.risk_policy_sha256.clone(),
+    };
+    let state_path = options
+        .state_root
+        .as_ref()
+        .map(|root| root.join("unsigned-shadow-state.json"));
+    if let Some(path) = state_path.as_deref() {
+        if path.exists() {
+            engine
+                .restore_unsigned_state(path, &state_identity)
+                .map_err(|error| error.to_string())?;
+            evidence.append_log(
+                false,
+                "unsigned_shadow_state=restored identity_verified=true",
+            )?;
+        } else {
+            persist_unsigned_state(&mut engine, Some(path), &state_identity)?;
+            evidence.append_log(
+                false,
+                "unsigned_shadow_state=initialized identity_verified=true",
+            )?;
+        }
+    }
     if let Some(production) = &options.production {
         engine.enable_production_intents(production.identity.clone());
         let mut state = production.state.lock().await;
@@ -275,6 +322,7 @@ pub async fn run_qualification(options: QualificationOptions) -> Result<PathBuf,
     if options.profitability_gate {
         engine.record_equity_boundary(start)?;
         evidence.append_replay_event(start, ReplayPayload::EquityBoundary)?;
+        persist_unsigned_state(&mut engine, state_path.as_deref(), &state_identity)?;
     }
     while clock.now_ms() < deadline {
         let now = clock.now_ms();
@@ -434,7 +482,75 @@ pub async fn run_qualification(options: QualificationOptions) -> Result<PathBuf,
         counters.maximum_pending = counters.maximum_pending.max(health.pending);
         counters.maximum_successors = counters.maximum_successors.max(health.successors);
         counters.maximum_in_flight = counters.maximum_in_flight.max(health.in_flight);
-        tokio::select! { result=tasks.join_next(),if !tasks.is_empty()=>{let(dispatch,result,started_at,kind)=result.ok_or("task set ended")??; let completed_request=dispatch.request().clone(); record_latency(counters.transport_latency_ms_by_kind.entry(kind).or_default(), clock.now_ms().saturating_sub(started_at)); let outcome=scheduler.finish(dispatch,result); append_freshness_decision(&mut evidence,&completed_request,outcome,clock.now_ms())?; match outcome{ExecutionOutcome::CompletedFresh=>counters.completed_fresh+=1,ExecutionOutcome::CompletedButStale=>{counters.completed_stale+=1;counters.response_rejected_as_stale+=1},ExecutionOutcome::Superseded=>counters.completed_stale+=1,ExecutionOutcome::RetryScheduled=>counters.retries+=1,ExecutionOutcome::RetryExhausted=>counters.retry_exhausted+=1,ExecutionOutcome::InvalidResponse=>counters.invalid_responses+=1,ExecutionOutcome::PermanentFailure=>counters.permanent_failures+=1}; if outcome==ExecutionOutcome::CompletedFresh {if let Some(response)=transport.take_accepted(&completed_request){if let Some(tier)=response.source_tier{*counters.accepted_count_by_tier.entry(tier).or_default()+=1;}let accepted_at=clock.now_ms(); evidence.append_replay_event(accepted_at,ReplayPayload::AcceptedResponse{response:response.clone()})?; engine.ingest(response,accepted_at).map_err(|e|e.to_string())?; dispatch_production_intents(&mut engine,options.production.as_ref()).await?;}} else {let _=transport.take_accepted(&completed_request);}}, _=tokio::signal::ctrl_c()=>{interrupted=true;break}, _=sleep(Duration::from_millis(25))=>{} }
+        tokio::select! {
+            result = tasks.join_next(), if !tasks.is_empty() => {
+                let (dispatch, result, started_at, kind) = result.ok_or("task set ended")??;
+                let completed_request = dispatch.request().clone();
+                record_latency(
+                    counters.transport_latency_ms_by_kind.entry(kind).or_default(),
+                    clock.now_ms().saturating_sub(started_at),
+                );
+                let outcome = scheduler.finish(dispatch, result);
+                append_freshness_decision(
+                    &mut evidence,
+                    &completed_request,
+                    outcome,
+                    clock.now_ms(),
+                )?;
+                match outcome {
+                    ExecutionOutcome::CompletedFresh => counters.completed_fresh += 1,
+                    ExecutionOutcome::CompletedButStale => {
+                        counters.completed_stale += 1;
+                        counters.response_rejected_as_stale += 1;
+                    }
+                    ExecutionOutcome::Superseded => counters.completed_stale += 1,
+                    ExecutionOutcome::RetryScheduled => counters.retries += 1,
+                    ExecutionOutcome::RetryExhausted => counters.retry_exhausted += 1,
+                    ExecutionOutcome::InvalidResponse => counters.invalid_responses += 1,
+                    ExecutionOutcome::PermanentFailure => counters.permanent_failures += 1,
+                }
+                if outcome == ExecutionOutcome::CompletedFresh {
+                    if let Some(response) = transport.take_accepted(&completed_request) {
+                        if let Some(tier) = response.source_tier {
+                            *counters.accepted_count_by_tier.entry(tier).or_default() += 1;
+                        }
+                        let accepted_at = clock.now_ms();
+                        evidence.append_replay_event(
+                            accepted_at,
+                            ReplayPayload::AcceptedResponse {
+                                response: response.clone(),
+                            },
+                        )?;
+                        let persist_after_ingest = match &response.payload {
+                            crate::public_mainnet::PublicPayload::SourceState(state) => {
+                                !state.closed_candles.is_empty()
+                            }
+                            _ => true,
+                        };
+                        engine.ingest(response, accepted_at).map_err(|e| e.to_string())?;
+                        dispatch_production_intents(
+                            &mut engine,
+                            options.production.as_ref(),
+                        )
+                        .await?;
+                        if persist_after_ingest {
+                            persist_unsigned_state(
+                                &mut engine,
+                                state_path.as_deref(),
+                                &state_identity,
+                            )?;
+                        }
+                    }
+                } else {
+                    let _ = transport.take_accepted(&completed_request);
+                }
+            }
+            _ = tokio::signal::ctrl_c() => {
+                interrupted = true;
+                break;
+            }
+            _ = sleep(Duration::from_millis(25)) => {}
+        }
         let now = clock.now_ms();
         if now >= decision_due && now.saturating_add(40_000) < deadline {
             evidence.append_replay_event(now, ReplayPayload::DecisionTick)?;
@@ -442,6 +558,7 @@ pub async fn run_qualification(options: QualificationOptions) -> Result<PathBuf,
                 .construct_next_decision(now)
                 .map_err(|e| e.to_string())?;
             dispatch_production_intents(&mut engine, options.production.as_ref()).await?;
+            persist_unsigned_state(&mut engine, state_path.as_deref(), &state_identity)?;
             decision_due = now + 20_000;
         }
         if (options.profitability_gate || options.micro_density_gate)
@@ -450,6 +567,7 @@ pub async fn run_qualification(options: QualificationOptions) -> Result<PathBuf,
             engine.record_equity_boundary(profitability_bucket_due)?;
             evidence
                 .append_replay_event(profitability_bucket_due, ReplayPayload::EquityBoundary)?;
+            persist_unsigned_state(&mut engine, state_path.as_deref(), &state_identity)?;
             profitability_bucket_due = profitability_bucket_due
                 .checked_add(300_000)
                 .ok_or("bucket deadline overflow")?;
@@ -551,6 +669,7 @@ pub async fn run_qualification(options: QualificationOptions) -> Result<PathBuf,
                     .ingest(response, accepted_at)
                     .map_err(|e| e.to_string())?;
                 dispatch_production_intents(&mut engine, options.production.as_ref()).await?;
+                persist_unsigned_state(&mut engine, state_path.as_deref(), &state_identity)?;
             }
         } else {
             let _ = transport.take_accepted(&completed_request);
@@ -562,6 +681,7 @@ pub async fn run_qualification(options: QualificationOptions) -> Result<PathBuf,
             Some(last) if last < deadline => {
                 engine.record_equity_boundary(deadline)?;
                 evidence.append_replay_event(deadline, ReplayPayload::EquityBoundary)?;
+                persist_unsigned_state(&mut engine, state_path.as_deref(), &state_identity)?;
             }
             Some(_) => return Err("final equity boundary exceeds deadline".into()),
             None => return Err("initial equity boundary missing".into()),
@@ -574,6 +694,7 @@ pub async fn run_qualification(options: QualificationOptions) -> Result<PathBuf,
     engine
         .persist_target_state(output.join("virtual-target-ledger.json"))
         .map_err(|e| e.to_string())?;
+    persist_unsigned_state(&mut engine, state_path.as_deref(), &state_identity)?;
     let elapsed = (clock.now_ms() - start) / 1000;
     let chain = verify_checkpoint_chain(output.join("periodic-checkpoints.jsonl"))?;
     if std::fs::read_to_string(output.join("event-chain-head.txt"))?.trim() != chain {

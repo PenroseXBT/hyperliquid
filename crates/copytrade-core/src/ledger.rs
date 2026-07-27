@@ -352,6 +352,13 @@ impl DualLedger {
         Ok(ledger)
     }
 
+    pub fn validate_integrity(&self) -> Result<(), LedgerError> {
+        if self.schema_version != 2 {
+            return Err(LedgerError::SchemaMismatch);
+        }
+        self.validate()
+    }
+
     fn validate(&self) -> Result<(), LedgerError> {
         for book in std::iter::once(&self.portfolio).chain(self.sources.values()) {
             for (asset, position) in &book.positions {
@@ -360,6 +367,11 @@ impl DualLedger {
                     .get(asset)
                     .map_or(Decimal::ZERO, |episode| episode.signed_quantity);
                 if *position != open_quantity {
+                    return Err(LedgerError::PositionDivergence);
+                }
+            }
+            for (asset, episode) in &book.open {
+                if book.positions.get(asset).copied() != Some(episode.signed_quantity) {
                     return Err(LedgerError::PositionDivergence);
                 }
             }

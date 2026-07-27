@@ -37,6 +37,7 @@ struct Arguments {
     release_manifest: PathBuf,
     isolation_report: PathBuf,
     output: PathBuf,
+    state_root: Option<PathBuf>,
     duration_seconds: Option<u64>,
     bundle: Option<PathBuf>,
     journal: Option<PathBuf>,
@@ -113,6 +114,7 @@ async fn run() -> Result<(), Box<dyn Error>> {
                 release_manifest_path: arguments.release_manifest,
                 isolation_report_path: arguments.isolation_report,
                 output: arguments.output,
+                state_root: arguments.state_root,
                 duration_seconds: arguments.duration_seconds.ok_or("--duration is required")?,
                 transport_gate: false,
                 profitability_gate: false,
@@ -129,6 +131,7 @@ async fn run() -> Result<(), Box<dyn Error>> {
                 release_manifest_path: arguments.release_manifest,
                 isolation_report_path: arguments.isolation_report,
                 output: arguments.output,
+                state_root: arguments.state_root,
                 duration_seconds: arguments.duration_seconds.ok_or("--duration is required")?,
                 transport_gate: true,
                 profitability_gate: false,
@@ -145,6 +148,7 @@ async fn run() -> Result<(), Box<dyn Error>> {
                 release_manifest_path: arguments.release_manifest,
                 isolation_report_path: arguments.isolation_report,
                 output: arguments.output,
+                state_root: arguments.state_root,
                 duration_seconds: arguments.duration_seconds.ok_or("--duration is required")?,
                 transport_gate: false,
                 profitability_gate: true,
@@ -161,6 +165,7 @@ async fn run() -> Result<(), Box<dyn Error>> {
                 release_manifest_path: arguments.release_manifest,
                 isolation_report_path: arguments.isolation_report,
                 output: arguments.output,
+                state_root: arguments.state_root,
                 duration_seconds: arguments.duration_seconds.ok_or("--duration is required")?,
                 transport_gate: false,
                 profitability_gate: false,
@@ -216,6 +221,7 @@ fn parse_arguments(arguments: impl Iterator<Item = String>) -> Result<Arguments,
     let mut release_manifest = PathBuf::from("target/hl1j/release-manifest.json");
     let mut isolation_report = PathBuf::from("target/hl1c/isolation-report.txt");
     let mut output = PathBuf::from("target/hl1k");
+    let mut state_root = None;
     let mut duration_seconds = None;
     let mut bundle = None;
     let mut journal = None;
@@ -284,6 +290,11 @@ fn parse_arguments(arguments: impl Iterator<Item = String>) -> Result<Arguments,
             }
             "--output" => {
                 output = PathBuf::from(arguments.next().ok_or("--output requires a path")?)
+            }
+            "--state-root" => {
+                state_root = Some(PathBuf::from(
+                    arguments.next().ok_or("--state-root requires a path")?,
+                ))
             }
             "--duration" => {
                 duration_seconds = Some(parse_duration_seconds(
@@ -367,6 +378,7 @@ fn parse_arguments(arguments: impl Iterator<Item = String>) -> Result<Arguments,
         release_manifest,
         isolation_report,
         output,
+        state_root,
         duration_seconds,
         bundle,
         journal,
@@ -547,6 +559,7 @@ async fn run_production_observer(arguments: &Arguments) -> Result<(), Box<dyn Er
         release_manifest_path: arguments.release_manifest.clone(),
         isolation_report_path: arguments.isolation_report.clone(),
         output: arguments.output.clone(),
+        state_root: arguments.state_root.clone(),
         duration_seconds: arguments.duration_seconds.unwrap_or(315_360_000),
         transport_gate: false,
         profitability_gate: false,
@@ -806,6 +819,24 @@ mod tests {
         .unwrap();
         assert_eq!(parsed.operation, Operation::Observe);
         assert_eq!(parsed.request_policy, PathBuf::from("policy.json"));
+    }
+
+    #[test]
+    fn profitability_parser_accepts_persistent_state_root() {
+        let parsed = parse_arguments(
+            [
+                "qualify-profitability".to_string(),
+                "--state-root".to_string(),
+                "/data/su6-forward/state".to_string(),
+            ]
+            .into_iter(),
+        )
+        .unwrap();
+        assert_eq!(parsed.operation, Operation::QualifyProfitability);
+        assert_eq!(
+            parsed.state_root,
+            Some(PathBuf::from("/data/su6-forward/state"))
+        );
     }
 
     #[test]

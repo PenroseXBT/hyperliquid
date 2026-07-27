@@ -166,6 +166,34 @@ impl VirtualTargetLedger {
         }
         Ok(ledger)
     }
+
+    pub fn validate_integrity(&self) -> Result<(), TargetStateError> {
+        if self.schema_version != TARGET_LEDGER_SCHEMA_VERSION {
+            return Err(TargetStateError::SchemaMismatch);
+        }
+        for state in self.assets.values() {
+            let committed = state
+                .filled_notional
+                .checked_add(state.acknowledged_open_notional)
+                .and_then(|value| value.checked_add(state.unknown_result_notional))
+                .ok_or(TargetStateError::ArithmeticOverflow("committed exposure"))?;
+            let expected = state
+                .admitted_target_notional
+                .checked_sub(committed)
+                .ok_or(TargetStateError::ArithmeticOverflow("target residual"))?;
+            if expected != state.executable_residual {
+                return Err(TargetStateError::Persistence(
+                    "target residual invariant mismatch".into(),
+                ));
+            }
+        }
+        if !self.assets.is_empty() && self.latest_target_version().is_none() {
+            return Err(TargetStateError::Persistence(
+                "target versions are inconsistent".into(),
+            ));
+        }
+        Ok(())
+    }
 }
 
 #[cfg(test)]

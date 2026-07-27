@@ -317,7 +317,7 @@ pub enum TechnicalError {
     Arithmetic,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 struct CandleIdentity {
     interval: CandleInterval,
     open_time_ms: u64,
@@ -332,14 +332,14 @@ enum ExitTiming {
     Flatten,
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 struct AssetCandles {
     intervals: BTreeMap<CandleInterval, VecDeque<ClosedCandle>>,
     accepted: BTreeSet<CandleIdentity>,
     current_score: Decimal,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TechnicalEngine {
     config: TechnicalStrategyConfig,
     assets: BTreeMap<String, AssetCandles>,
@@ -352,6 +352,10 @@ impl TechnicalEngine {
             config,
             assets: BTreeMap::new(),
         })
+    }
+
+    pub fn configuration(&self) -> &TechnicalStrategyConfig {
+        &self.config
     }
 
     pub fn accept_closed_candle(

@@ -32,7 +32,7 @@ use copytrade_core::target_state::VirtualTargetLedger;
 use copytrade_core::technical::{CandleAcceptance, CostEstimate, TechnicalEngine, TechnicalTarget};
 use rust_decimal::prelude::{FromPrimitive, ToPrimitive};
 use rust_decimal::Decimal;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
 use std::error::Error;
@@ -391,7 +391,7 @@ struct PendingBookIntent {
     first_seen_at_mono: Timestamp,
 }
 
-#[derive(Clone)]
+#[derive(Clone, Serialize, Deserialize)]
 struct ContinuationIntent {
     root_planned_cloid: String,
     parent_planned_cloid: String,
@@ -612,6 +612,33 @@ pub struct LiveShadowEngine {
     production_exposure_blocked: bool,
     technical_engine: TechnicalEngine,
     technical_targets: BTreeMap<String, TechnicalTarget>,
+    ledger_time_offset: Timestamp,
+    ledger_time_high_watermark: Timestamp,
+}
+
+const UNSIGNED_SHADOW_STATE_SCHEMA_VERSION: u32 = 1;
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UnsignedShadowStateIdentity {
+    pub source_tree_sha256: String,
+    pub observer_binary_sha256: String,
+    pub configuration_sha256: String,
+    pub risk_policy_sha256: String,
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct DurableUnsignedShadowState {
+    schema_version: u32,
+    identity: UnsignedShadowStateIdentity,
+    ledger: DualLedger,
+    target_ledger: VirtualTargetLedger,
+    technical_engine: TechnicalEngine,
+    decision_sequence: u64,
+    continuations: BTreeMap<String, ContinuationIntent>,
+    accrued_funding: BTreeMap<String, Decimal>,
+    last_mids: Option<MarketSnapshotResponse>,
+    ledger_time_high_watermark: Timestamp,
 }
 
 #[derive(Debug, Clone)]
@@ -683,6 +710,8 @@ impl LiveShadowEngine {
             production_exposure_blocked: false,
             technical_engine,
             technical_targets: BTreeMap::new(),
+            ledger_time_offset: 0,
+            ledger_time_high_watermark: 0,
         })
     }
 
@@ -1717,8 +1746,13 @@ impl LiveShadowEngine {
         if !execution.modeled_filled_quantity.is_zero() {
             self.accrued_funding.remove(&book.asset);
         }
+        let ledger_timestamp = self
+            .ledger_time_offset
+            .checked_add(received_at)
+            .ok_or(LiveShadowError::Arithmetic)?;
+        self.ledger_time_high_watermark = self.ledger_time_high_watermark.max(ledger_timestamp);
         self.ledger
-            .apply_portfolio_execution(&execution, received_at)
+            .apply_portfolio_execution(&execution, ledger_timestamp)
             .map_err(core)?;
         let allocations = allocate_source_fill(
             &self.ledger.source_positions_for_asset(&book.asset),
@@ -1733,7 +1767,7 @@ impl LiveShadowEngine {
                 self.ledger.source_position(candidate, &book.asset),
             )?;
             self.ledger
-                .apply_source_execution(candidate, &source_execution, received_at)
+                .apply_source_execution(candidate, &source_execution, ledger_timestamp)
                 .map_err(core)?;
         }
         validate_source_reconciliation(
@@ -1899,6 +1933,138 @@ impl LiveShadowEngine {
     pub fn ledger(&self) -> &DualLedger {
         &self.ledger
     }
+
+    pub fn persist_unsigned_state(
+        &mut self,
+        path: impl AsRef<std::path::Path>,
+        identity: &UnsignedShadowStateIdentity,
+    ) -> Result<(), LiveShadowError> {
+        let path = path.as_ref();
+        let parent = path
+            .parent()
+            .ok_or_else(|| LiveShadowError::Core("state path has no parent".into()))?;
+        std::fs::create_dir_all(parent).map_err(|error| {
+            self.metrics.persistence_failures += 1;
+            LiveShadowError::Core(error.to_string())
+        })?;
+        let mut continuations = self.continuations.clone();
+        for (asset, pending) in &self.pending {
+            if pending.action.retry_generation > 0 {
+                continuations.insert(
+                    asset.clone(),
+                    ContinuationIntent {
+                        root_planned_cloid: pending.root_planned_cloid.clone(),
+                        parent_planned_cloid: pending
+                            .parent_planned_cloid
+                            .clone()
+                            .unwrap_or_else(|| pending.root_planned_cloid.clone()),
+                        next_retry_generation: pending.action.retry_generation,
+                    },
+                );
+            }
+        }
+        let state = DurableUnsignedShadowState {
+            schema_version: UNSIGNED_SHADOW_STATE_SCHEMA_VERSION,
+            identity: identity.clone(),
+            ledger: self.ledger.clone(),
+            target_ledger: self.target_ledger.clone(),
+            technical_engine: self.technical_engine.clone(),
+            decision_sequence: self.decision_sequence,
+            continuations,
+            accrued_funding: self.accrued_funding.clone(),
+            last_mids: self.mids.as_ref().map(|(mids, _)| mids.clone()),
+            ledger_time_high_watermark: self.ledger_time_high_watermark,
+        };
+        let bytes = serde_json::to_vec(&state).map_err(|error| {
+            self.metrics.persistence_failures += 1;
+            LiveShadowError::Core(error.to_string())
+        })?;
+        let temporary = path.with_extension("tmp");
+        let result = (|| -> Result<(), std::io::Error> {
+            use std::io::Write;
+            let mut file = std::fs::OpenOptions::new()
+                .create(true)
+                .truncate(true)
+                .write(true)
+                .open(&temporary)?;
+            file.write_all(&bytes)?;
+            file.sync_all()?;
+            std::fs::rename(&temporary, path)?;
+            std::fs::File::open(parent)?.sync_all()
+        })();
+        result.map_err(|error| {
+            self.metrics.persistence_failures += 1;
+            LiveShadowError::Core(error.to_string())
+        })
+    }
+
+    pub fn restore_unsigned_state(
+        &mut self,
+        path: impl AsRef<std::path::Path>,
+        expected_identity: &UnsignedShadowStateIdentity,
+    ) -> Result<(), LiveShadowError> {
+        let bytes = std::fs::read(path).map_err(core)?;
+        let state: DurableUnsignedShadowState = serde_json::from_slice(&bytes).map_err(core)?;
+        if state.schema_version != UNSIGNED_SHADOW_STATE_SCHEMA_VERSION {
+            return Err(LiveShadowError::Core(
+                "unsigned shadow state schema mismatch".into(),
+            ));
+        }
+        if &state.identity != expected_identity {
+            return Err(LiveShadowError::Core(
+                "unsigned shadow state identity mismatch".into(),
+            ));
+        }
+        state.ledger.validate_integrity().map_err(core)?;
+        state.target_ledger.validate_integrity().map_err(core)?;
+        if state.technical_engine.configuration() != &self.config.technical {
+            return Err(LiveShadowError::Core(
+                "unsigned shadow technical configuration mismatch".into(),
+            ));
+        }
+        for asset in state.ledger.portfolio_assets() {
+            if state
+                .last_mids
+                .as_ref()
+                .and_then(|mids| mids.mids.get(&asset))
+                .is_none()
+            {
+                return Err(LiveShadowError::Core(format!(
+                    "unsigned shadow state missing mark for open asset {asset}"
+                )));
+            }
+        }
+        self.ledger = state.ledger;
+        self.target_ledger = state.target_ledger;
+        self.technical_engine = state.technical_engine;
+        self.decision_sequence = state.decision_sequence;
+        self.continuations = state.continuations;
+        self.accrued_funding = state.accrued_funding;
+        self.mids = state.last_mids.map(|mids| (mids, 0));
+        self.ledger_time_offset = state
+            .ledger_time_high_watermark
+            .checked_add(1)
+            .ok_or(LiveShadowError::Arithmetic)?;
+        self.ledger_time_high_watermark = state.ledger_time_high_watermark;
+        self.last_funding_accrual = None;
+        self.previous_target = self
+            .target_ledger
+            .latest_target_version()
+            .map(|version| {
+                Ok(PreviousTargetState {
+                    version,
+                    target_hash: canonical_target_hash(&self.target_ledger.admitted_targets())
+                        .map_err(core)?,
+                })
+            })
+            .transpose()?;
+        self.pending.clear();
+        self.pending_book.clear();
+        self.technical_targets.clear();
+        self.refresh_desired_books();
+        Ok(())
+    }
+
     pub fn metrics(&self) -> &LiveShadowMetrics {
         &self.metrics
     }
@@ -2800,6 +2966,68 @@ mod tests {
         assert_eq!(density.partial_fills, 1);
         assert_eq!(density.unresolved_actionable_targets, 1);
         assert!(density.root_conservation_verified);
+
+        let state_path = std::env::temp_dir().join(format!(
+            "copytrade-unsigned-shadow-state-{}-{}.json",
+            std::process::id(),
+            engine.decision_sequence
+        ));
+        let identity = UnsignedShadowStateIdentity {
+            source_tree_sha256: "source".into(),
+            observer_binary_sha256: "observer".into(),
+            configuration_sha256: "configuration".into(),
+            risk_policy_sha256: "risk".into(),
+        };
+        let expected_ledger = engine.ledger.clone();
+        let expected_targets = engine.target_ledger.clone();
+        let expected_sequence = engine.decision_sequence;
+        let expected_root = follow_up.root_planned_cloid.clone();
+        let expected_retry_generation = follow_up.action.retry_generation;
+        engine
+            .persist_unsigned_state(&state_path, &identity)
+            .unwrap();
+
+        let mut wrong_identity = identity.clone();
+        wrong_identity.observer_binary_sha256 = "different-observer".into();
+        let mut rejected = LiveShadowEngine::new(
+            engine.config.clone(),
+            b"partial-fixture",
+            "rejected-run",
+            40_000,
+            80_000,
+        )
+        .unwrap();
+        assert!(rejected
+            .restore_unsigned_state(&state_path, &wrong_identity)
+            .is_err());
+
+        let mut restored = LiveShadowEngine::new(
+            engine.config.clone(),
+            b"partial-fixture",
+            "restored-run",
+            40_000,
+            80_000,
+        )
+        .unwrap();
+        restored
+            .restore_unsigned_state(&state_path, &identity)
+            .unwrap();
+        std::fs::remove_file(state_path).unwrap();
+
+        assert_eq!(restored.ledger, expected_ledger);
+        assert_eq!(restored.target_ledger, expected_targets);
+        assert_eq!(restored.decision_sequence, expected_sequence);
+        assert_eq!(restored.ledger.portfolio_open_count(), 1);
+        assert!(restored.ledger_time_offset > engine.ledger_time_high_watermark);
+        assert!(restored.pending.is_empty());
+        assert_eq!(
+            restored.continuations["BTC"].root_planned_cloid,
+            expected_root
+        );
+        assert_eq!(
+            restored.continuations["BTC"].next_retry_generation,
+            expected_retry_generation
+        );
     }
 
     #[test]
