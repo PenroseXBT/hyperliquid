@@ -1,0 +1,12 @@
+[Unit]
+Description=Hyperliquid Signer IPC Socket
+
+[Socket]
+ListenStream=/run/hype-arb/signer.sock
+SocketUser=hype-signer
+SocketGroup=hype-arb
+SocketMode=0660
+RemoveOnStop=true
+
+[Install]
+WantedBy=sockets.target

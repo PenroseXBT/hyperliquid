@@ -1,0 +1,5 @@
+/target
+.env
+config/agent.env
+config/ledger.json
+config/secrets/

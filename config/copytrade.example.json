@@ -1,0 +1,96 @@
+{
+  "schema_version": 2,
+  "global_risk": {
+    "global_risk_scale": 0.1,
+    "max_single_asset_equity_pct": 0.65,
+    "max_net_equity_pct": 0.65,
+    "max_source_exposure": 1.0,
+    "min_order_notional_usd": 10.0,
+    "order_rounding_buffer_usd": 0.2,
+    "closeability_margin_usd": 0.5,
+    "slot_rank_hysteresis": 0.02,
+    "source_snapshot_max_age_ms": 75000
+  },
+  "starting_equity_usd": 100.0,
+  "unlimited_mode": true,
+  "min_win_rate_pct": 98.0,
+  "max_active_traders": 0,
+  "min_closed_trades": 50,
+  "vetting_lookback_days": 14,
+  "global_max_leverage": 8.75,
+  "leverage_curve": [
+    {
+      "equity_usd": 100.0,
+      "target_leverage": 8.75
+    },
+    {
+      "equity_usd": 1000.0,
+      "target_leverage": 8.0
+    },
+    {
+      "equity_usd": 10000.0,
+      "target_leverage": 6.0
+    },
+    {
+      "equity_usd": 100000.0,
+      "target_leverage": 3.0
+    },
+    {
+      "equity_usd": 500000.0,
+      "target_leverage": 1.25
+    }
+  ],
+  "per_asset_max_exposure_pct": 65.0,
+  "max_single_order_notional_usd": 2500.0,
+  "min_order_notional_usd": 10.0,
+  "min_trader_confidence_score": 95.0,
+  "min_closed_pnl_usd": 0.0,
+  "poll_interval_secs": 20,
+  "max_account_drawdown_pct": 8.0,
+  "ledger_path": "config/ledger.json",
+  "maker_fee_bps": 1.5,
+  "taker_fee_bps": 4.5,
+  "slippage_buffer_bps": 4.0,
+  "dynamic_slippage_enabled": true,
+  "latency_timeout_ms": 200,
+  "order_rate_limit_per_sec": 5.0,
+  "sharpe_target": 15.0,
+  "sharpe_lookback_hours": 96,
+  "min_sharpe_samples": 50,
+  "enforce_sharpe_gate": true,
+  "trader_sharpe_floor": 10.0,
+  "confidence_decay_lambda": 0.32,
+  "prune_inactive_trader_hours": 168,
+  "vetting": {
+    "min_win_rate_pct": 98.0,
+    "min_closed_trades": 50,
+    "lookback_days": 14
+  },
+  "execution": {
+    "dynamic_slippage_enabled": true,
+    "max_slippage_bps": 4.0,
+    "min_order_usd": 10.0,
+    "max_order_usd": 2500.0,
+    "latency_timeout_ms": 200,
+    "order_rate_limit_per_sec": 5.0
+  },
+  "performance": {
+    "target_sharpe": 15.0,
+    "lookback_hours": 96,
+    "min_samples": 50,
+    "enforce_sharpe_gate": true,
+    "trader_sharpe_floor": 10.0,
+    "confidence_decay_lambda": 0.32,
+    "prune_inactive_trader_hours": 168
+  },
+  "follower_address": null,
+  "candidates": [
+    {
+      "address": "0x0000000000000000000000000000000000000000",
+      "label": "replace-with-discovered-wallet",
+      "allocation_weight": 1.0,
+      "confidence_modifier": 1.0,
+      "enabled": false
+    }
+  ]
+}

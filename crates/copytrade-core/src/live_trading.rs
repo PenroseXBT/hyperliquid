@@ -1,0 +1,766 @@
+use crate::decision::{
+    DecisionId, MarketSnapshotId, PayloadHash, PlannedAction, PlannedCloid, Side, TargetVersion,
+};
+use crate::ledger::{DualLedger, EpisodeId, LedgerError, PortfolioEpisode};
+use crate::shadow::{LatencyScenario, ShadowExecution, ShadowExecutionId};
+use crate::technical::{MarketRegime, SignalArchetype};
+use rust_decimal::Decimal;
+use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
+use std::collections::{BTreeMap, BTreeSet};
+use std::path::Path;
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub struct ExchangeOrderId(pub String);
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub struct ExchangeTradeId(pub String);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub struct FundingEventId(pub [u8; 32]);
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub struct ExchangeFillIdentity {
+    pub exchange_order_id: ExchangeOrderId,
+    pub trade_id: ExchangeTradeId,
+    pub cloid: PlannedCloid,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LiquidityClassification {
+    Maker,
+    Taker,
+    Unknown,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum StrategyComponent {
+    SourceOnly,
+    TechnicalOnly,
+    SourceTechnicalAgreement,
+    SourceTechnicalDisagreement,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StrategyComponentAttribution {
+    pub component: StrategyComponent,
+    pub source_fraction: Decimal,
+    pub technical_fraction: Decimal,
+    pub archetype: Option<SignalArchetype>,
+    pub regime: Option<MarketRegime>,
+    pub side: Side,
+}
+
+impl StrategyComponentAttribution {
+    pub fn validate(&self) -> Result<(), LedgerError> {
+        if self.source_fraction < Decimal::ZERO
+            || self.technical_fraction < Decimal::ZERO
+            || self.source_fraction > Decimal::ONE
+            || self.technical_fraction > Decimal::ONE
+            || self
+                .source_fraction
+                .checked_add(self.technical_fraction)
+                .is_none_or(|total| total != Decimal::ONE)
+        {
+            return Err(LedgerError::InvalidLiveEvent(
+                "strategy attribution fractions must sum to one",
+            ));
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct VerifiedExchangeFill {
+    pub identity: ExchangeFillIdentity,
+    pub decision_id: DecisionId,
+    pub target_version: TargetVersion,
+    pub root_cloid: PlannedCloid,
+    pub parent_cloid: Option<PlannedCloid>,
+    pub continuation_generation: u32,
+    pub asset: String,
+    pub side: Side,
+    pub reduce_only: bool,
+    pub filled_quantity: Decimal,
+    pub average_fill_price: Decimal,
+    pub submitted_limit_price: Decimal,
+    pub fee_amount: Decimal,
+    pub exchange_closed_pnl: Decimal,
+    pub fee_asset: String,
+    pub liquidity: LiquidityClassification,
+    pub decision_reference_price: Decimal,
+    pub occurred_at: u64,
+    pub decision_timestamp: u64,
+    pub exchange_equity_after: Decimal,
+    pub source_hash: PayloadHash,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct VerifiedFundingEvent {
+    pub event_id: FundingEventId,
+    pub asset: String,
+    /// Signed exchange equity delta: negative when funding is paid, positive when received.
+    pub amount: Decimal,
+    pub occurred_at: u64,
+    pub source_hash: PayloadHash,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LiveFillAccounting {
+    pub identity: ExchangeFillIdentity,
+    pub decision_id: DecisionId,
+    pub root_cloid: PlannedCloid,
+    pub parent_cloid: Option<PlannedCloid>,
+    pub continuation_generation: u32,
+    pub asset: String,
+    pub side: Side,
+    pub filled_quantity: Decimal,
+    pub average_fill_price: Decimal,
+    pub submitted_limit_price: Decimal,
+    pub fee_amount: Decimal,
+    pub exchange_closed_pnl: Decimal,
+    pub fee_asset: String,
+    pub liquidity: LiquidityClassification,
+    pub decision_reference_price: Decimal,
+    pub decision_to_fill_slippage: Decimal,
+    pub position_before: Decimal,
+    pub position_after: Decimal,
+    pub current_equity: Decimal,
+    pub settled_equity: Decimal,
+    pub deployment_equity: Decimal,
+    pub occurred_at: u64,
+    #[serde(default)]
+    pub strategy_attribution: Option<StrategyComponentAttribution>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FundingAccounting {
+    pub event: VerifiedFundingEvent,
+    pub current_equity: Decimal,
+    pub settled_equity: Decimal,
+    pub deployment_equity: Decimal,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LiveTradingState {
+    schema_version: u32,
+    starting_equity: Decimal,
+    current_equity: Decimal,
+    settled_equity: Decimal,
+    deployment_equity: Decimal,
+    ledger: DualLedger,
+    applied_fills: BTreeSet<ExchangeFillIdentity>,
+    applied_funding: BTreeSet<FundingEventId>,
+    fill_events: Vec<LiveFillAccounting>,
+    funding_events: Vec<FundingAccounting>,
+    #[serde(default)]
+    verified_fills: Vec<VerifiedExchangeFill>,
+    #[serde(default)]
+    verified_funding: Vec<VerifiedFundingEvent>,
+    #[serde(default)]
+    exchange_gross_pnl_by_open_episode: BTreeMap<String, Decimal>,
+    #[serde(default)]
+    open_episode_attribution: BTreeMap<String, StrategyComponentAttribution>,
+    #[serde(default)]
+    closed_episode_attribution: BTreeMap<EpisodeId, StrategyComponentAttribution>,
+    fill_cursor_ms: u64,
+    #[serde(default)]
+    funding_cursor_ms: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AppliedFillResult {
+    Applied {
+        accounting: LiveFillAccounting,
+        closed_episode: Option<PortfolioEpisode>,
+    },
+    AlreadyApplied,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AppliedFundingResult {
+    Applied(FundingAccounting),
+    AlreadyApplied,
+}
+
+impl LiveTradingState {
+    pub fn new(starting_equity: Decimal, fill_cursor_ms: u64) -> Result<Self, LedgerError> {
+        if starting_equity <= Decimal::ZERO {
+            return Err(LedgerError::InvalidLiveEvent(
+                "starting equity must be positive",
+            ));
+        }
+        Ok(Self {
+            schema_version: 1,
+            starting_equity,
+            current_equity: starting_equity,
+            settled_equity: starting_equity,
+            deployment_equity: starting_equity,
+            ledger: DualLedger::default(),
+            applied_fills: BTreeSet::new(),
+            applied_funding: BTreeSet::new(),
+            fill_events: Vec::new(),
+            funding_events: Vec::new(),
+            verified_fills: Vec::new(),
+            verified_funding: Vec::new(),
+            exchange_gross_pnl_by_open_episode: BTreeMap::new(),
+            open_episode_attribution: BTreeMap::new(),
+            closed_episode_attribution: BTreeMap::new(),
+            fill_cursor_ms,
+            funding_cursor_ms: fill_cursor_ms,
+        })
+    }
+
+    pub fn position(&self, asset: &str) -> Decimal {
+        self.ledger.portfolio_position(asset)
+    }
+
+    pub fn positions(&self) -> BTreeMap<String, Decimal> {
+        self.ledger
+            .portfolio_assets()
+            .into_iter()
+            .map(|asset| {
+                let position = self.ledger.portfolio_position(&asset);
+                (asset, position)
+            })
+            .collect()
+    }
+
+    pub fn current_equity(&self) -> Decimal {
+        self.current_equity
+    }
+
+    pub fn settled_equity(&self) -> Decimal {
+        self.settled_equity
+    }
+
+    pub fn deployment_equity(&self) -> Decimal {
+        self.deployment_equity
+    }
+
+    pub fn fill_cursor_ms(&self) -> u64 {
+        self.fill_cursor_ms
+    }
+
+    pub fn advance_fill_cursor(&mut self, cursor_ms: u64) -> Result<(), LedgerError> {
+        if cursor_ms < self.fill_cursor_ms {
+            return Err(LedgerError::InvalidLiveEvent(
+                "fill cursor cannot move backwards",
+            ));
+        }
+        self.fill_cursor_ms = cursor_ms;
+        Ok(())
+    }
+
+    pub fn funding_cursor_ms(&self) -> u64 {
+        self.funding_cursor_ms
+    }
+
+    pub fn advance_funding_cursor(&mut self, cursor_ms: u64) -> Result<(), LedgerError> {
+        if cursor_ms < self.funding_cursor_ms {
+            return Err(LedgerError::InvalidLiveEvent(
+                "funding cursor cannot move backwards",
+            ));
+        }
+        self.funding_cursor_ms = cursor_ms;
+        Ok(())
+    }
+
+    pub fn reconcile_equity(&mut self, exchange_equity: Decimal) -> Result<(), LedgerError> {
+        if exchange_equity <= Decimal::ZERO {
+            return Err(LedgerError::InvalidLiveEvent(
+                "exchange equity must be positive",
+            ));
+        }
+        self.current_equity = exchange_equity;
+        self.recompute_deployment();
+        Ok(())
+    }
+
+    pub fn reconcile_positions(
+        &self,
+        exchange_positions: &BTreeMap<String, Decimal>,
+    ) -> Result<(), LedgerError> {
+        if self.positions() == *exchange_positions {
+            Ok(())
+        } else {
+            Err(LedgerError::PositionDivergence)
+        }
+    }
+
+    pub fn fill_events(&self) -> &[LiveFillAccounting] {
+        &self.fill_events
+    }
+
+    pub fn funding_events(&self) -> &[FundingAccounting] {
+        &self.funding_events
+    }
+
+    pub fn verified_fills(&self) -> &[VerifiedExchangeFill] {
+        &self.verified_fills
+    }
+
+    pub fn verified_funding(&self) -> &[VerifiedFundingEvent] {
+        &self.verified_funding
+    }
+
+    pub fn latest_exchange_event_timestamp(&self) -> Option<u64> {
+        self.verified_fills
+            .last()
+            .map(|fill| fill.occurred_at)
+            .into_iter()
+            .chain(
+                self.verified_funding
+                    .last()
+                    .map(|funding| funding.occurred_at),
+            )
+            .max()
+    }
+
+    pub fn set_strategy_attribution(
+        &mut self,
+        asset: impl Into<String>,
+        attribution: StrategyComponentAttribution,
+    ) -> Result<(), LedgerError> {
+        attribution.validate()?;
+        self.open_episode_attribution
+            .insert(asset.into(), attribution);
+        Ok(())
+    }
+
+    pub fn closed_episode_attribution(
+        &self,
+        episode_id: EpisodeId,
+    ) -> Option<&StrategyComponentAttribution> {
+        self.closed_episode_attribution.get(&episode_id)
+    }
+
+    pub fn save_atomic(&self, path: impl AsRef<Path>) -> Result<(), LedgerError> {
+        let path = path.as_ref();
+        let parent = path
+            .parent()
+            .ok_or_else(|| LedgerError::Persistence("live ledger path has no parent".into()))?;
+        std::fs::create_dir_all(parent)
+            .map_err(|error| LedgerError::Persistence(error.to_string()))?;
+        let bytes = serde_json::to_vec(self)
+            .map_err(|error| LedgerError::Persistence(error.to_string()))?;
+        let temporary = path.with_extension("tmp");
+        let mut file = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(true)
+            .write(true)
+            .open(&temporary)
+            .map_err(|error| LedgerError::Persistence(error.to_string()))?;
+        std::io::Write::write_all(&mut file, &bytes)
+            .and_then(|_| file.sync_all())
+            .map_err(|error| LedgerError::Persistence(error.to_string()))?;
+        std::fs::rename(&temporary, path)
+            .map_err(|error| LedgerError::Persistence(error.to_string()))?;
+        std::fs::File::open(parent)
+            .and_then(|directory| directory.sync_all())
+            .map_err(|error| LedgerError::Persistence(error.to_string()))?;
+        Ok(())
+    }
+
+    pub fn load(path: impl AsRef<Path>) -> Result<Self, LedgerError> {
+        let bytes =
+            std::fs::read(path).map_err(|error| LedgerError::Persistence(error.to_string()))?;
+        let state: Self = serde_json::from_slice(&bytes)
+            .map_err(|error| LedgerError::Persistence(error.to_string()))?;
+        if state.schema_version != 1
+            || state.starting_equity <= Decimal::ZERO
+            || state.current_equity <= Decimal::ZERO
+            || state.settled_equity <= Decimal::ZERO
+            || state.deployment_equity != state.current_equity.min(state.settled_equity)
+        {
+            return Err(LedgerError::SchemaMismatch);
+        }
+        let fill_identities: BTreeSet<_> = state
+            .fill_events
+            .iter()
+            .map(|event| event.identity.clone())
+            .collect();
+        let funding_identities: BTreeSet<_> = state
+            .funding_events
+            .iter()
+            .map(|event| event.event.event_id)
+            .collect();
+        if fill_identities.len() != state.fill_events.len()
+            || fill_identities != state.applied_fills
+            || funding_identities.len() != state.funding_events.len()
+            || funding_identities != state.applied_funding
+        {
+            return Err(LedgerError::SchemaMismatch);
+        }
+        Ok(state)
+    }
+
+    fn recompute_deployment(&mut self) {
+        self.deployment_equity = self.current_equity.min(self.settled_equity);
+    }
+}
+
+pub fn apply_exchange_fill(
+    state: &mut LiveTradingState,
+    fill: VerifiedExchangeFill,
+) -> Result<AppliedFillResult, LedgerError> {
+    validate_fill(&fill)?;
+    if state.applied_fills.contains(&fill.identity) {
+        return if state
+            .verified_fills
+            .iter()
+            .any(|existing| existing == &fill)
+        {
+            Ok(AppliedFillResult::AlreadyApplied)
+        } else {
+            Err(LedgerError::InvalidLiveEvent(
+                "exchange fill identity payload conflict",
+            ))
+        };
+    }
+    // Apply to a clone so every validation/arithmetic failure is transactional.
+    let mut next = state.clone();
+    let verified_fill = fill.clone();
+    let position_before = next.ledger.portfolio_position(&fill.asset);
+    let strategy_attribution = next.open_episode_attribution.get(&fill.asset).cloned();
+    let signed_delta = match fill.side {
+        Side::Buy => fill.filled_quantity,
+        Side::Sell => -fill.filled_quantity,
+    };
+    let position_after = position_before
+        .checked_add(signed_delta)
+        .ok_or(LedgerError::ArithmeticOverflow("live position"))?;
+    let filled_notional = fill
+        .filled_quantity
+        .checked_mul(fill.average_fill_price)
+        .ok_or(LedgerError::ArithmeticOverflow("live filled notional"))?;
+    let slippage = fill
+        .average_fill_price
+        .checked_sub(fill.decision_reference_price)
+        .and_then(|difference| difference.abs().checked_mul(fill.filled_quantity))
+        .ok_or(LedgerError::ArithmeticOverflow("live slippage"))?;
+    let shadow = ShadowExecution {
+        shadow_execution_id: ShadowExecutionId(derive_execution_id(&fill.identity)),
+        action: PlannedAction {
+            decision_id: fill.decision_id,
+            target_version: fill.target_version,
+            asset: fill.asset.clone(),
+            side: fill.side,
+            rounded_notional: filled_notional,
+            reduce_only: fill.reduce_only,
+            action_ordinal: 0,
+            retry_generation: fill.continuation_generation,
+            planned_cloid: fill.identity.cloid,
+        },
+        decision_timestamp_mono: fill.decision_timestamp,
+        decision_market_snapshot_id: MarketSnapshotId(fill.source_hash.0),
+        evaluation_market_snapshot_id: MarketSnapshotId(fill.source_hash.0),
+        latency_scenario: LatencyScenario::Expected,
+        configured_latency_ms: fill.occurred_at.saturating_sub(fill.decision_timestamp),
+        proposed_limit_price: fill.submitted_limit_price,
+        rounded_quantity: fill.filled_quantity,
+        modeled_filled_quantity: fill.filled_quantity,
+        modeled_average_fill_price: Some(fill.average_fill_price),
+        unfilled_ioc_remainder: Decimal::ZERO,
+        modeled_filled_notional: filled_notional,
+        fees: fill.fee_amount,
+        funding: Decimal::ZERO,
+        slippage,
+        position_before,
+        position_after,
+    };
+    let closed_before = next.ledger.portfolio_closed().len();
+    next.ledger
+        .apply_portfolio_execution(&shadow, fill.occurred_at)?;
+    let exchange_gross = next
+        .exchange_gross_pnl_by_open_episode
+        .entry(fill.asset.clone())
+        .or_default();
+    *exchange_gross = exchange_gross
+        .checked_add(fill.exchange_closed_pnl)
+        .ok_or(LedgerError::ArithmeticOverflow("exchange gross pnl"))?;
+    let did_close = next.ledger.portfolio_closed().len() > closed_before;
+    if did_close {
+        let reconciled_gross = next
+            .exchange_gross_pnl_by_open_episode
+            .remove(&fill.asset)
+            .ok_or(LedgerError::PositionDivergence)?;
+        next.ledger
+            .reconcile_last_portfolio_gross_pnl(&fill.asset, reconciled_gross)?;
+    }
+    let closed_episode = did_close
+        .then(|| next.ledger.portfolio_closed().last().cloned())
+        .flatten();
+    if let Some(episode) = &closed_episode {
+        if let Some(attribution) = next.open_episode_attribution.remove(&episode.asset) {
+            next.closed_episode_attribution
+                .insert(episode.episode_id, attribution);
+        }
+        next.settled_equity = next
+            .settled_equity
+            .checked_add(episode.net_pnl)
+            .ok_or(LedgerError::ArithmeticOverflow("settled equity"))?;
+    }
+    next.current_equity = fill.exchange_equity_after;
+    if next.current_equity <= Decimal::ZERO || next.settled_equity <= Decimal::ZERO {
+        return Err(LedgerError::InvalidLiveEvent("equity became nonpositive"));
+    }
+    next.recompute_deployment();
+    let accounting = LiveFillAccounting {
+        identity: fill.identity.clone(),
+        decision_id: fill.decision_id,
+        root_cloid: fill.root_cloid,
+        parent_cloid: fill.parent_cloid,
+        continuation_generation: fill.continuation_generation,
+        asset: fill.asset,
+        side: fill.side,
+        filled_quantity: fill.filled_quantity,
+        average_fill_price: fill.average_fill_price,
+        submitted_limit_price: fill.submitted_limit_price,
+        fee_amount: fill.fee_amount,
+        exchange_closed_pnl: fill.exchange_closed_pnl,
+        fee_asset: fill.fee_asset,
+        liquidity: fill.liquidity,
+        decision_reference_price: fill.decision_reference_price,
+        decision_to_fill_slippage: slippage,
+        position_before,
+        position_after,
+        current_equity: next.current_equity,
+        settled_equity: next.settled_equity,
+        deployment_equity: next.deployment_equity,
+        occurred_at: fill.occurred_at,
+        strategy_attribution,
+    };
+    next.applied_fills.insert(fill.identity);
+    next.fill_events.push(accounting.clone());
+    next.verified_fills.push(verified_fill);
+    *state = next;
+    Ok(AppliedFillResult::Applied {
+        accounting,
+        closed_episode,
+    })
+}
+
+pub fn apply_funding_event(
+    state: &mut LiveTradingState,
+    event: VerifiedFundingEvent,
+) -> Result<AppliedFundingResult, LedgerError> {
+    if event.asset.is_empty() {
+        return Err(LedgerError::InvalidLiveEvent("funding asset is empty"));
+    }
+    if state.applied_funding.contains(&event.event_id) {
+        return if state
+            .verified_funding
+            .iter()
+            .any(|existing| existing == &event)
+        {
+            Ok(AppliedFundingResult::AlreadyApplied)
+        } else {
+            Err(LedgerError::InvalidLiveEvent(
+                "funding event identity payload conflict",
+            ))
+        };
+    }
+    let mut next = state.clone();
+    let verified_funding = event.clone();
+    let funding_cost = -event.amount;
+    next.ledger
+        .apply_portfolio_funding(&event.asset, funding_cost)?;
+    next.current_equity = next
+        .current_equity
+        .checked_add(event.amount)
+        .ok_or(LedgerError::ArithmeticOverflow("funding equity"))?;
+    if next.current_equity <= Decimal::ZERO {
+        return Err(LedgerError::InvalidLiveEvent(
+            "funding made equity nonpositive",
+        ));
+    }
+    next.recompute_deployment();
+    let accounting = FundingAccounting {
+        event: event.clone(),
+        current_equity: next.current_equity,
+        settled_equity: next.settled_equity,
+        deployment_equity: next.deployment_equity,
+    };
+    next.applied_funding.insert(event.event_id);
+    next.funding_events.push(accounting.clone());
+    next.verified_funding.push(verified_funding);
+    *state = next;
+    Ok(AppliedFundingResult::Applied(accounting))
+}
+
+fn validate_fill(fill: &VerifiedExchangeFill) -> Result<(), LedgerError> {
+    if fill.asset.is_empty()
+        || fill.filled_quantity <= Decimal::ZERO
+        || fill.average_fill_price <= Decimal::ZERO
+        || fill.submitted_limit_price <= Decimal::ZERO
+        || fill.fee_asset.is_empty()
+        || fill.decision_reference_price <= Decimal::ZERO
+        || fill.exchange_equity_after <= Decimal::ZERO
+        || fill.occurred_at < fill.decision_timestamp
+        || fill.identity.cloid != fill.root_cloid && fill.continuation_generation == 0
+        || fill.continuation_generation > 0 && fill.parent_cloid.is_none()
+    {
+        return Err(LedgerError::InvalidLiveEvent(
+            "invalid verified exchange fill",
+        ));
+    }
+    Ok(())
+}
+
+fn derive_execution_id(identity: &ExchangeFillIdentity) -> [u8; 32] {
+    let mut hash = Sha256::new();
+    hash.update(b"LIVE/EXCHANGE_FILL/V1");
+    hash.update((identity.exchange_order_id.0.len() as u32).to_be_bytes());
+    hash.update(identity.exchange_order_id.0.as_bytes());
+    hash.update((identity.trade_id.0.len() as u32).to_be_bytes());
+    hash.update(identity.trade_id.0.as_bytes());
+    hash.update(identity.cloid.0);
+    hash.finalize().into()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn fill(trade: &str, side: Side, price: i64, equity: i64) -> VerifiedExchangeFill {
+        VerifiedExchangeFill {
+            identity: ExchangeFillIdentity {
+                exchange_order_id: ExchangeOrderId("42".into()),
+                trade_id: ExchangeTradeId(trade.into()),
+                cloid: PlannedCloid([2; 16]),
+            },
+            decision_id: DecisionId([1; 32]),
+            target_version: TargetVersion(1),
+            root_cloid: PlannedCloid([2; 16]),
+            parent_cloid: None,
+            continuation_generation: 0,
+            asset: "BTC".into(),
+            side,
+            reduce_only: side == Side::Sell,
+            filled_quantity: Decimal::ONE,
+            average_fill_price: Decimal::from(price),
+            submitted_limit_price: Decimal::from(price),
+            fee_amount: Decimal::new(1, 1),
+            exchange_closed_pnl: if side == Side::Sell {
+                Decimal::from(2)
+            } else {
+                Decimal::ZERO
+            },
+            fee_asset: "USDC".into(),
+            liquidity: LiquidityClassification::Taker,
+            decision_reference_price: Decimal::from(price),
+            occurred_at: if side == Side::Buy { 10 } else { 20 },
+            decision_timestamp: if side == Side::Buy { 9 } else { 19 },
+            exchange_equity_after: Decimal::from(equity),
+            source_hash: PayloadHash([3; 32]),
+        }
+    }
+
+    #[test]
+    fn duplicate_fill_and_funding_are_exactly_once() {
+        let mut state = LiveTradingState::new(Decimal::from(100), 0).unwrap();
+        let entry = fill("1", Side::Buy, 10, 99);
+        assert!(matches!(
+            apply_exchange_fill(&mut state, entry.clone()).unwrap(),
+            AppliedFillResult::Applied { .. }
+        ));
+        assert_eq!(
+            apply_exchange_fill(&mut state, entry).unwrap(),
+            AppliedFillResult::AlreadyApplied
+        );
+        let funding = VerifiedFundingEvent {
+            event_id: FundingEventId([4; 32]),
+            asset: "BTC".into(),
+            amount: Decimal::new(-1, 1),
+            occurred_at: 15,
+            source_hash: PayloadHash([5; 32]),
+        };
+        assert!(matches!(
+            apply_funding_event(&mut state, funding.clone()).unwrap(),
+            AppliedFundingResult::Applied(_)
+        ));
+        assert_eq!(
+            apply_funding_event(&mut state, funding).unwrap(),
+            AppliedFundingResult::AlreadyApplied
+        );
+        assert_eq!(state.fill_events().len(), 1);
+        assert_eq!(state.funding_events().len(), 1);
+    }
+
+    #[test]
+    fn duplicate_exchange_identities_with_changed_payload_fail_closed() {
+        let mut state = LiveTradingState::new(Decimal::from(100), 0).unwrap();
+        let entry = fill("1", Side::Buy, 10, 99);
+        apply_exchange_fill(&mut state, entry.clone()).unwrap();
+        let mut conflicting_fill = entry;
+        conflicting_fill.fee_amount = Decimal::ONE;
+        assert!(apply_exchange_fill(&mut state, conflicting_fill).is_err());
+
+        let funding = VerifiedFundingEvent {
+            event_id: FundingEventId([4; 32]),
+            asset: "BTC".into(),
+            amount: Decimal::new(-1, 1),
+            occurred_at: 15,
+            source_hash: PayloadHash([5; 32]),
+        };
+        apply_funding_event(&mut state, funding.clone()).unwrap();
+        let mut conflicting_funding = funding;
+        conflicting_funding.amount = Decimal::ONE;
+        assert!(apply_funding_event(&mut state, conflicting_funding).is_err());
+    }
+
+    #[test]
+    fn settled_equity_changes_only_when_episode_closes() {
+        let mut state = LiveTradingState::new(Decimal::from(100), 0).unwrap();
+        apply_exchange_fill(&mut state, fill("1", Side::Buy, 10, 99)).unwrap();
+        assert_eq!(state.settled_equity(), Decimal::from(100));
+        let result = apply_exchange_fill(&mut state, fill("2", Side::Sell, 12, 101)).unwrap();
+        let AppliedFillResult::Applied { closed_episode, .. } = result else {
+            panic!("fill was not applied")
+        };
+        assert!(closed_episode.is_some());
+        assert_eq!(state.settled_equity(), Decimal::new(1018, 1));
+        assert_eq!(
+            state.deployment_equity(),
+            Decimal::new(1018, 1).min(Decimal::from(101))
+        );
+    }
+
+    #[test]
+    fn funding_is_realized_into_settled_equity_when_episode_closes() {
+        let mut state = LiveTradingState::new(Decimal::from(100), 0).unwrap();
+        apply_exchange_fill(&mut state, fill("1", Side::Buy, 10, 99)).unwrap();
+        apply_funding_event(
+            &mut state,
+            VerifiedFundingEvent {
+                event_id: FundingEventId([8; 32]),
+                asset: "BTC".into(),
+                amount: Decimal::new(-1, 1),
+                occurred_at: 15,
+                source_hash: PayloadHash([5; 32]),
+            },
+        )
+        .unwrap();
+        assert_eq!(state.settled_equity(), Decimal::from(100));
+        apply_exchange_fill(&mut state, fill("2", Side::Sell, 12, 101)).unwrap();
+        assert_eq!(state.settled_equity(), Decimal::new(1017, 1));
+    }
+
+    #[test]
+    fn failed_live_event_is_transactional() {
+        let mut state = LiveTradingState::new(Decimal::from(100), 0).unwrap();
+        let before = state.clone();
+        let event = VerifiedFundingEvent {
+            event_id: FundingEventId([9; 32]),
+            asset: "BTC".into(),
+            amount: Decimal::from(-101),
+            occurred_at: 1,
+            source_hash: PayloadHash([1; 32]),
+        };
+        assert!(apply_funding_event(&mut state, event).is_err());
+        assert_eq!(state, before);
+    }
+}

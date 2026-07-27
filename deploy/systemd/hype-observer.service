@@ -1,0 +1,37 @@
+[Unit]
+Description=Hyperliquid Copytrade Observer
+After=network-online.target hype-signer.service
+Wants=network-online.target
+Requires=hype-signer.service
+
+[Service]
+Type=simple
+User=hype-observer
+Group=hype-arb
+WorkingDirectory=/opt/hype-arb
+ExecStartPre=/opt/hype-arb/scripts/production_preflight.sh observer /opt/hype-arb/release/production-manifest.json /opt/hype-arb/release/production-manifest.sha256 /opt/hype-arb/bin/copytrade-observer /opt/hype-arb/bin/copytrade-signer /opt/hype-arb/policy/production-ipc-v1.json /opt/hype-arb/deploy/topology/production-host.json /opt/hype-arb/config/copytrade.json
+ExecStart=/opt/hype-arb/bin/copytrade-observer production --config /opt/hype-arb/config/copytrade.json --request-policy /opt/hype-arb/config/read-api-policy.json --transport-policy /opt/hype-arb/config/public-mainnet-transport.json --manifest /opt/hype-arb/release/production-manifest.json --isolation-report /opt/hype-arb/release/isolation-report.txt --signer-socket /run/hype-arb/signer.sock --ipc-policy /opt/hype-arb/policy/production-ipc-v1.json --intent-journal /var/lib/hype-arb/observer/intents.json --output /var/lib/hype-arb/observer --expected-signer-uid @HYPE_SIGNER_UID@ --expected-signer-gid @HYPE_ARB_GID@
+Restart=on-failure
+RestartSec=1
+LimitNOFILE=65536
+TasksMax=512
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectKernelLogs=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+LockPersonality=true
+MemoryDenyWriteExecute=true
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+ReadWritePaths=/var/lib/hype-arb/observer /run/hype-arb
+Environment=RUST_BACKTRACE=0
+CPUAffinity=@OBSERVER_CPU_AFFINITY@
+NUMAPolicy=preferred
+NUMAMask=@NIC_NUMA_NODE@
+
+[Install]
+WantedBy=multi-user.target

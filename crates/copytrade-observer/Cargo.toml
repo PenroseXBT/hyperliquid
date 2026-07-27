@@ -1,0 +1,18 @@
+[package]
+name = "copytrade-observer"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[dependencies]
+copytrade-core = { path = "../copytrade-core" }
+futures-util = "0.3"
+reqwest = { version = "0.11", default-features = false, features = ["json", "rustls-tls"] }
+rust_decimal = { version = "=1.36.0", default-features = false, features = ["std", "serde"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0.113"
+rmp-serde = "1"
+sha2 = "0.10"
+tokio = { version = "1", features = ["fs", "macros", "net", "rt-multi-thread", "signal", "sync", "time"] }
+
+[dev-dependencies]

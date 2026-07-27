@@ -1,0 +1,1272 @@
+{
+  "schema_version": 2,
+  "global_risk": {
+    "global_risk_scale": 0.1,
+    "max_single_asset_equity_pct": 0.65,
+    "max_net_equity_pct": 0.65,
+    "max_source_exposure": 1.0,
+    "min_order_notional_usd": 10.0,
+    "order_rounding_buffer_usd": 0.2,
+    "closeability_margin_usd": 0.5,
+    "slot_rank_hysteresis": 0.02,
+    "source_snapshot_max_age_ms": 75000
+  },
+  "unlimited_mode": true,
+  "starting_equity_usd": 100.0,
+  "min_win_rate_pct": 98.0,
+  "max_active_traders": 0,
+  "min_closed_trades": 50,
+  "vetting_lookback_days": 365,
+  "min_closed_pnl_usd": 0.0,
+  "poll_interval_secs": 20,
+  "max_account_drawdown_pct": 8.0,
+  "max_total_leverage": 8.75,
+  "leverage_curve": [
+    {
+      "equity_usd": 100.0,
+      "target_leverage": 8.75
+    },
+    {
+      "equity_usd": 1000.0,
+      "target_leverage": 8.0
+    },
+    {
+      "equity_usd": 10000.0,
+      "target_leverage": 6.0
+    },
+    {
+      "equity_usd": 100000.0,
+      "target_leverage": 3.0
+    },
+    {
+      "equity_usd": 500000.0,
+      "target_leverage": 1.25
+    }
+  ],
+  "max_asset_notional_pct": 65.0,
+  "max_single_order_notional_usd": 2500.0,
+  "min_order_notional_usd": 10.0,
+  "min_trader_confidence_score": 95.0,
+  "maker_fee_bps": 1.5,
+  "taker_fee_bps": 4.5,
+  "slippage_buffer_bps": 4.0,
+  "dynamic_slippage_enabled": true,
+  "latency_timeout_ms": 200,
+  "order_rate_limit_per_sec": 5.0,
+  "sharpe_target": 15.0,
+  "sharpe_lookback_hours": 96,
+  "min_sharpe_samples": 50,
+  "enforce_sharpe_gate": true,
+  "trader_sharpe_floor": 10.0,
+  "confidence_decay_lambda": 0.32,
+  "ledger_path": "config/ledger.json",
+  "prune_inactive_trader_hours": 168,
+  "follower_address": null,
+  "vetting": {
+    "min_win_rate_pct": 98.0,
+    "min_closed_trades": 50,
+    "lookback_days": 365
+  },
+  "execution": {
+    "dynamic_slippage_enabled": true,
+    "max_slippage_bps": 4.0,
+    "min_order_usd": 10.0,
+    "max_order_usd": 2500.0,
+    "latency_timeout_ms": 200,
+    "order_rate_limit_per_sec": 5.0
+  },
+  "performance": {
+    "target_sharpe": 15.0,
+    "lookback_hours": 96,
+    "min_samples": 50,
+    "enforce_sharpe_gate": true,
+    "trader_sharpe_floor": 10.0,
+    "confidence_decay_lambda": 0.32,
+    "prune_inactive_trader_hours": 168
+  },
+  "candidates": [
+    {
+      "address": "0x71dfc07de32c2ebf1c4801f4b1c9e40b76d4a23d",
+      "label": "hyperdash-extremely-profitable-48",
+      "allocation_weight": 1.0,
+      "enabled": true,
+      "confidence_modifier": 1.0
+    },
+    {
+      "address": "0xbadbb1de95b5f333623ebece7026932fa5039ee6",
+      "label": "hyperdash-extremely-profitable-202",
+      "allocation_weight": 1.0,
+      "enabled": true,
+      "confidence_modifier": 1.0
+    },
+    {
+      "address": "0x939f95036d2e7b6d7419ec072bf9d967352204d2",
+      "label": "hyperdash-extremely-profitable-50",
+      "allocation_weight": 1.0,
+      "enabled": true,
+      "confidence_modifier": 1.0
+    },
+    {
+      "address": "0x8af700ba841f30e0a3fcb0ee4c4a9d223e1efa05",
+      "label": "hyperdash-extremely-profitable-7",
+      "allocation_weight": 1.0,
+      "enabled": true,
+      "confidence_modifier": 1.0
+    },
+    {
+      "address": "0x06cecfbac34101ae41c88ebc2450f8602b3d164b",
+      "label": "hyperdash-extremely-profitable-67",
+      "allocation_weight": 1.0,
+      "enabled": true,
+      "confidence_modifier": 1.0
+    },
+    {
+      "address": "0x8607a7d180de23645db594d90621d837749408d5",
+      "label": "hyperdash-extremely-profitable-36",
+      "allocation_weight": 1.0,
+      "enabled": true,
+      "confidence_modifier": 1.0
+    },
+    {
+      "address": "0xb798aef79972ce8f73d47b9ebbcda6bbb7ec4fbf",
+      "label": "hyperdash-extremely-profitable-233",
+      "allocation_weight": 1.0,
+      "enabled": true,
+      "confidence_modifier": 1.0
+    },
+    {
+      "address": "0x6bea81d7a0c5939a5ce5552e125ab57216cc597f",
+      "label": "hyperdash-extremely-profitable-274",
+      "allocation_weight": 1.0,
+      "enabled": true,
+      "confidence_modifier": 1.0
+    },
+    {
+      "address": "0x8e096995c3e4a3f0bc5b3ea1cba94de2aa4d70c9",
+      "label": "hyperdash-extremely-profitable-108",
+      "allocation_weight": 1.0,
+      "enabled": true,
+      "confidence_modifier": 1.0
+    },
+    {
+      "address": "0x0ddf9bae2af4b874b96d287a5ad42eb47138a902",
+      "label": "hyperdash-extremely-profitable-9",
+      "allocation_weight": 1.0,
+      "enabled": true,
+      "confidence_modifier": 1.0
+    },
+    {
+      "address": "0xc7290b4b308431a985fa9e3e8a335c2f7650517c",
+      "label": "hyperdash-extremely-profitable-121",
+      "allocation_weight": 1.0,
+      "enabled": true,
+      "confidence_modifier": 1.0
+    },
+    {
+      "address": "0xfce053a5e461683454bf37ad66d20344c0e3f4c0",
+      "label": "hyperdash-extremely-profitable-189",
+      "allocation_weight": 1.0,
+      "enabled": true,
+      "confidence_modifier": 1.0
+    },
+    {
+      "address": "0x16bf84af3f85f8c8a97597bf2be549dfe0dee637",
+      "label": "hyperdash-extremely-profitable-44",
+      "allocation_weight": 1.0,
+      "enabled": true,
+      "confidence_modifier": 1.0
+    },
+    {
+      "address": "0xe0665019fcf5ffa4a5aea5cf65f84016fcbe78da",
+      "label": "hyperdash-extremely-profitable-283",
+      "allocation_weight": 1.0,
+      "enabled": true,
+      "confidence_modifier": 1.0
+    },
+    {
+      "address": "0xb632c6580173a16154f17cdafc6eb27e95cf73b7",
+      "label": "hyperdash-extremely-profitable-73",
+      "allocation_weight": 1.0,
+      "enabled": true,
+      "confidence_modifier": 1.0
+    },
+    {
+      "address": "0x9c2a2a966ed8e47f0c8b7e2ec2b91424f229f6a8",
+      "label": "hyperdash-extremely-profitable-45",
+      "allocation_weight": 1.0,
+      "enabled": true,
+      "confidence_modifier": 1.0
+    },
+    {
+      "address": "0xfd97600ac44b3c4e20ac1a5f23e3b18d10fa5912",
+      "label": "hyperdash-extremely-profitable-90",
+      "allocation_weight": 1.0,
+      "enabled": true,
+      "confidence_modifier": 1.0
+    },
+    {
+      "address": "0xaf0fdd39e5d92499b0ed9f68693da99c0ec1e92e",
+      "label": "hyperdash-extremely-profitable-93",
+      "allocation_weight": 1.0,
+      "enabled": true,
+      "confidence_modifier": 1.0
+    },
+    {
+      "address": "0xf899937184168b1d9dee75acbaa3fef0f52888db",
+      "label": "hyperdash-extremely-profitable-239",
+      "allocation_weight": 1.0,
+      "enabled": true,
+      "confidence_modifier": 1.0
+    },
+    {
+      "address": "0x9c16bc8f1104e4d2f72267eb981fa12de7cc4a6f",
+      "label": "hyperdash-extremely-profitable-179",
+      "allocation_weight": 1.0,
+      "enabled": true,
+      "confidence_modifier": 1.0
+    },
+    {
+      "address": "0xfb941d2344b72ea9101400392b818173772d0ddf",
+      "label": "hyperdash-extremely-profitable-55",
+      "allocation_weight": 1.0,
+      "enabled": true,
+      "confidence_modifier": 1.0
+    },
+    {
+      "address": "0xd21d931890d27b6e7e2e668f27931e17698e90f1",
+      "label": "hyperdash-extremely-profitable-134",
+      "allocation_weight": 1.0,
+      "enabled": true,
+      "confidence_modifier": 1.0
+    },
+    {
+      "address": "0x469e9a7f624b04c24f0e64edf8d8a277e6bf58a5",
+      "label": "hyperdash-extremely-profitable-39",
+      "allocation_weight": 1.0,
+      "enabled": true,
+      "confidence_modifier": 1.0
+    },
+    {
+      "address": "0xa445a0a15b1d50fa0c4bfe6796d9447e0da5329d",
+      "label": "hyperdash-extremely-profitable-155",
+      "allocation_weight": 1.0,
+      "enabled": true,
+      "confidence_modifier": 1.0
+    },
+    {
+      "address": "0xc6758a779bccee1ef0190dbe8292fdf44076795d",
+      "label": "hyperdash-extremely-profitable-145",
+      "allocation_weight": 1.0,
+      "enabled": true,
+      "confidence_modifier": 1.0
+    },
+    {
+      "address": "0xcac1f1c3e4599e044dc2a9d38a9b6ef1af1bdae8",
+      "label": "hyperdash-extremely-profitable-251",
+      "allocation_weight": 1.0,
+      "enabled": true,
+      "confidence_modifier": 1.0
+    },
+    {
+      "address": "0x218a65e21eddeece7a9df38c6bbdd89f692b7da2",
+      "label": "hyperdash-extremely-profitable-74",
+      "allocation_weight": 1.0,
+      "enabled": true,
+      "confidence_modifier": 1.0
+    },
+    {
+      "address": "0xfe7ce058edc7cfcde9ef8262ba51f8d4796ab7ae",
+      "label": "hyperdash-extremely-profitable-35",
+      "allocation_weight": 1.0,
+      "enabled": true,
+      "confidence_modifier": 1.0
+    },
+    {
+      "address": "0x7fba7e745bd97f828c824589680749b55a8c04ab",
+      "label": "hyperdash-extremely-profitable-58",
+      "allocation_weight": 1.0,
+      "enabled": true,
+      "confidence_modifier": 1.0
+    },
+    {
+      "address": "0xad227f63d34e7251c1d0ab65e64eeea07aee4e44",
+      "label": "hyperdash-extremely-profitable-118",
+      "allocation_weight": 1.0,
+      "enabled": true,
+      "confidence_modifier": 1.0
+    },
+    {
+      "address": "0x4a96036fb1529561fa3eeeb2781fad2d4f25500e",
+      "label": "hyperdash-extremely-profitable-128",
+      "allocation_weight": 1.0,
+      "enabled": true,
+      "confidence_modifier": 1.0
+    },
+    {
+      "address": "0xf62edeee17968d4c55d1c74936d2110333342f30",
+      "label": "hyperdash-extremely-profitable-187",
+      "allocation_weight": 1.0,
+      "enabled": true,
+      "confidence_modifier": 1.0
+    },
+    {
+      "address": "0x7eb9026d0183942458bd4660371c3cc0a2df3beb",
+      "label": "hyperdash-extremely-profitable-116",
+      "allocation_weight": 1.0,
+      "enabled": true,
+      "confidence_modifier": 1.0
+    },
+    {
+      "address": "0xd67ca2c6f8bc84acf4fa4472b82a8740dc0a53ff",
+      "label": "hyperdash-extremely-profitable-144",
+      "allocation_weight": 1.0,
+      "enabled": true,
+      "confidence_modifier": 1.0
+    },
+    {
+      "address": "0x091159a8106b077c13e89bc09701117e8b5f129a",
+      "label": "hyperdash-extremely-profitable-31",
+      "allocation_weight": 1.0,
+      "enabled": true,
+      "confidence_modifier": 1.0
+    },
+    {
+      "address": "0xc59498175d6d317642aeb97f895a7ce1aa992191",
+      "label": "hyperdash-extremely-profitable-21",
+      "allocation_weight": 1.0,
+      "enabled": true,
+      "confidence_modifier": 1.0
+    },
+    {
+      "address": "0xd96ea3bcce83d4e1ef8abd1776eecd0cea1bb09e",
+      "label": "hyperdash-extremely-profitable-271",
+      "allocation_weight": 1.0,
+      "enabled": true,
+      "confidence_modifier": 1.0
+    },
+    {
+      "address": "0x089fe537f4b2af55fa990bc64ff4125800bba4f8",
+      "label": "hyperdash-extremely-profitable-23",
+      "allocation_weight": 1.0,
+      "enabled": true,
+      "confidence_modifier": 1.0
+    },
+    {
+      "address": "0x2fcb6898d5a0623de19c3691904927685014c4d8",
+      "label": "hyperdash-extremely-profitable-78",
+      "allocation_weight": 1.0,
+      "enabled": true,
+      "confidence_modifier": 1.0
+    },
+    {
+      "address": "0xdd7a372377fc633f74ab6e20963803d52f448830",
+      "label": "hyperdash-extremely-profitable-217",
+      "allocation_weight": 1.0,
+      "enabled": true,
+      "confidence_modifier": 1.0
+    },
+    {
+      "address": "0xfb8c34145bdea190693325d0ab01e81120909b3f",
+      "label": "hyperdash-extremely-profitable-216",
+      "allocation_weight": 1.0,
+      "enabled": true,
+      "confidence_modifier": 1.0
+    },
+    {
+      "address": "0x15a4f009bb324a3fb9e36137136b201e3fe0dfdb",
+      "label": "hyperdash-extremely-profitable-88",
+      "allocation_weight": 1.0,
+      "enabled": true,
+      "confidence_modifier": 1.0
+    },
+    {
+      "address": "0x4196dc4a1dc7d3bfd5434adf04c829f4ccaf480d",
+      "label": "hyperdash-extremely-profitable-222",
+      "allocation_weight": 1.0,
+      "enabled": true,
+      "confidence_modifier": 1.0
+    },
+    {
+      "address": "0xd6e56265890b76413d1d527eb9b75e334c0c5b42",
+      "label": "hyperdash-extremely-profitable-51",
+      "allocation_weight": 1.0,
+      "enabled": true,
+      "confidence_modifier": 1.0
+    },
+    {
+      "address": "0x3ee505ba316879d246a8fd2b3d7ee63b51b44fab",
+      "label": "hyperdash-extremely-profitable-82",
+      "allocation_weight": 1.0,
+      "enabled": true,
+      "confidence_modifier": 1.0
+    },
+    {
+      "address": "0x54dbc1fbf6b1cd59807db61109b1d9eb91fd1a04",
+      "label": "hyperdash-extremely-profitable-135",
+      "allocation_weight": 1.0,
+      "enabled": true,
+      "confidence_modifier": 1.0
+    },
+    {
+      "address": "0x15b325660a1c4a9582a7d834c31119c0cb9e3a42",
+      "label": "hyperdash-extremely-profitable-110",
+      "allocation_weight": 1.0,
+      "enabled": true,
+      "confidence_modifier": 1.0
+    },
+    {
+      "address": "0xcf5343ba750a6e30afbb1dadda08bc78f8c8ee11",
+      "label": "hyperdash-extremely-profitable-16",
+      "allocation_weight": 1.0,
+      "enabled": true,
+      "confidence_modifier": 1.0
+    },
+    {
+      "address": "0xdd9f274410c8c704bdbb599dce6c4fb34be4f50a",
+      "label": "hyperdash-extremely-profitable-124",
+      "allocation_weight": 1.0,
+      "enabled": true,
+      "confidence_modifier": 1.0
+    },
+    {
+      "address": "0x0cacfc8c96b84bc5698fcdcb5ffd536b4a246170",
+      "label": "hyperdash-extremely-profitable-250",
+      "allocation_weight": 1.0,
+      "enabled": true,
+      "confidence_modifier": 1.0
+    },
+    {
+      "address": "0xbe19541903f64af97bcf8436f4d15bf3a56b8bd1",
+      "label": "hyperdash-extremely-profitable-30",
+      "allocation_weight": 1.0,
+      "enabled": true,
+      "confidence_modifier": 1.0
+    },
+    {
+      "address": "0x6859da14835424957a1e6b397d8026b1d9ff7e1e",
+      "label": "hyperdash-extremely-profitable-92",
+      "allocation_weight": 1.0,
+      "enabled": true,
+      "confidence_modifier": 1.0
+    },
+    {
+      "address": "0x418aa6bf98a2b2bc93779f810330d88cde488888",
+      "label": "hyperdash-extremely-profitable-136",
+      "allocation_weight": 1.0,
+      "enabled": true,
+      "confidence_modifier": 1.0
+    },
+    {
+      "address": "0x350e33a777d510616fbdb483d1de3b50d1edfcfb",
+      "label": "hyperdash-extremely-profitable-125",
+      "allocation_weight": 1.0,
+      "enabled": true,
+      "confidence_modifier": 1.0
+    },
+    {
+      "address": "0xa6ee1ed1ae80b8352603654b39f5e7b9bedd5078",
+      "label": "hyperdash-extremely-profitable-203",
+      "allocation_weight": 1.0,
+      "enabled": true,
+      "confidence_modifier": 1.0
+    },
+    {
+      "address": "0x152e41f0b83e6cad4b5dc730c1d6279b7d67c9dc",
+      "label": "hyperdash-extremely-profitable-22",
+      "allocation_weight": 1.0,
+      "enabled": true,
+      "confidence_modifier": 1.0
+    },
+    {
+      "address": "0x42b6d907f36255d48f70db8b4a2684088a162634",
+      "label": "hyperdash-extremely-profitable-91",
+      "allocation_weight": 1.0,
+      "enabled": true,
+      "confidence_modifier": 1.0
+    },
+    {
+      "address": "0xbb34960afec64f3f1cc78b0c9c342c4657021696",
+      "label": "hyperdash-extremely-profitable-111",
+      "allocation_weight": 1.0,
+      "enabled": true,
+      "confidence_modifier": 1.0
+    },
+    {
+      "address": "0x1e771e1b95c86491299d6e2a5c3b3842d03b552e",
+      "label": "hyperdash-extremely-profitable-59",
+      "allocation_weight": 1.0,
+      "enabled": true,
+      "confidence_modifier": 1.0
+    },
+    {
+      "address": "0xdfe5195e7cc1a2eca9b0df09d4646472a8c4a402",
+      "label": "hyperdash-extremely-profitable-242",
+      "allocation_weight": 1.0,
+      "enabled": true,
+      "confidence_modifier": 1.0
+    },
+    {
+      "address": "0xe24166173f1e956845a0660c8b26db334dced71a",
+      "label": "hyperdash-extremely-profitable-137",
+      "allocation_weight": 1.0,
+      "enabled": true,
+      "confidence_modifier": 1.0
+    },
+    {
+      "address": "0xdbcc96bcada067864902aad14e029fe7c422f147",
+      "label": "hyperdash-extremely-profitable-84",
+      "allocation_weight": 1.0,
+      "enabled": true,
+      "confidence_modifier": 1.0
+    },
+    {
+      "address": "0x8bcf7a888c66f635ac4a2caf42a8dd12a3b20b14",
+      "label": "hyperdash-extremely-profitable-102",
+      "allocation_weight": 1.0,
+      "enabled": true,
+      "confidence_modifier": 1.0
+    },
+    {
+      "address": "0x42bc06d636e9a9a93edb1ddf781ee97821a73946",
+      "label": "hyperdash-extremely-profitable-97",
+      "allocation_weight": 1.0,
+      "enabled": true,
+      "confidence_modifier": 1.0
+    },
+    {
+      "address": "0xfc98b6ec7f59ea13354bae6171a9120692fb8777",
+      "label": "hyperdash-extremely-profitable-166",
+      "allocation_weight": 1.0,
+      "enabled": true,
+      "confidence_modifier": 1.0
+    },
+    {
+      "address": "0xa4be91acc74feabab71b8878b66b8f5277212520",
+      "label": "hyperdash-extremely-profitable-268",
+      "allocation_weight": 1.0,
+      "enabled": true,
+      "confidence_modifier": 1.0
+    },
+    {
+      "address": "0xfeec88b13fc0be31695069f02bac18538a154e9c",
+      "label": "hyperdash-extremely-profitable-272",
+      "allocation_weight": 1.0,
+      "enabled": true,
+      "confidence_modifier": 1.0
+    },
+    {
+      "address": "0xe0698483810b7ac6ece05988efe06707fd8049f5",
+      "label": "hyperdash-extremely-profitable-83",
+      "allocation_weight": 1.0,
+      "enabled": true,
+      "confidence_modifier": 1.0
+    },
+    {
+      "address": "0x90dbb196cacf24bd212b377a0dd62eaad5e8151b",
+      "label": "hyperdash-extremely-profitable-99",
+      "allocation_weight": 1.0,
+      "enabled": true,
+      "confidence_modifier": 1.0
+    },
+    {
+      "address": "0xf5a523b171032c060d49c39fbf2e9bec473e1286",
+      "label": "hyperdash-extremely-profitable-157",
+      "allocation_weight": 1.0,
+      "enabled": true,
+      "confidence_modifier": 1.0
+    },
+    {
+      "address": "0x48d826da83e69844f2f84b2db50703a933d137a2",
+      "label": "hyperdash-extremely-profitable-41",
+      "allocation_weight": 1.0,
+      "enabled": true,
+      "confidence_modifier": 1.0
+    },
+    {
+      "address": "0xbe4e91ae63090eeb4165dfcfc35db3a4eb76e75e",
+      "label": "hyperdash-extremely-profitable-141",
+      "allocation_weight": 1.0,
+      "enabled": true,
+      "confidence_modifier": 1.0
+    },
+    {
+      "address": "0xe09726ff25f5001f37b15049f54116cb83d7d0fe",
+      "label": "hyperdash-extremely-profitable-77",
+      "allocation_weight": 1.0,
+      "enabled": true,
+      "confidence_modifier": 1.0
+    },
+    {
+      "address": "0xb245ed242d9f9a86e75cdb30892d9d922cd568ba",
+      "label": "hyperdash-extremely-profitable-258",
+      "allocation_weight": 1.0,
+      "enabled": true,
+      "confidence_modifier": 1.0
+    },
+    {
+      "address": "0x325edd95bb016c36027ce3b9f7595af7094a9564",
+      "label": "hyperdash-extremely-profitable-64",
+      "allocation_weight": 1.0,
+      "enabled": true,
+      "confidence_modifier": 1.0
+    },
+    {
+      "address": "0x9321d8117e73b0c79035f0e87debcfd8dbb1d75a",
+      "label": "hyperdash-extremely-profitable-34",
+      "allocation_weight": 1.0,
+      "enabled": true,
+      "confidence_modifier": 1.0
+    },
+    {
+      "address": "0x4f24303e0af2e4a94abcd516a3c80d38262bde6a",
+      "label": "hyperdash-extremely-profitable-159",
+      "allocation_weight": 1.0,
+      "enabled": true,
+      "confidence_modifier": 1.0
+    },
+    {
+      "address": "0x3a122449de235a40481689442271c0731b805d69",
+      "label": "hyperdash-extremely-profitable-180",
+      "allocation_weight": 1.0,
+      "enabled": true,
+      "confidence_modifier": 1.0
+    },
+    {
+      "address": "0x5f94a51948d2376ad34a6fadfa2544e651b74b96",
+      "label": "hyperdash-extremely-profitable-52",
+      "allocation_weight": 1.0,
+      "enabled": true,
+      "confidence_modifier": 1.0
+    },
+    {
+      "address": "0x3b883b85fd41b81ef23b6041248bc6ac0b1c04a7",
+      "label": "hyperdash-extremely-profitable-80",
+      "allocation_weight": 1.0,
+      "enabled": true,
+      "confidence_modifier": 1.0
+    },
+    {
+      "address": "0xfdf891f2b214a4c9374d26595ec6d4080262e381",
+      "label": "hyperdash-extremely-profitable-181",
+      "allocation_weight": 1.0,
+      "enabled": true,
+      "confidence_modifier": 1.0
+    },
+    {
+      "address": "0x2cd991f48ba31536a96b772536a1daaaedf150ae",
+      "label": "hyperdash-extremely-profitable-129",
+      "allocation_weight": 1.0,
+      "enabled": true,
+      "confidence_modifier": 1.0
+    },
+    {
+      "address": "0xf3eb9dc9626800f5c2157a14adfaba2177e1f7b5",
+      "label": "hyperdash-extremely-profitable-196",
+      "allocation_weight": 1.0,
+      "enabled": true,
+      "confidence_modifier": 1.0
+    },
+    {
+      "address": "0x833b99b27dac651d02080f5e220e929df891db06",
+      "label": "hyperdash-extremely-profitable-174",
+      "allocation_weight": 1.0,
+      "enabled": true,
+      "confidence_modifier": 1.0
+    },
+    {
+      "address": "0x0514f2f3e0277c47117e3f33d9390efb0acfbdfe",
+      "label": "hyperdash-extremely-profitable-186",
+      "allocation_weight": 1.0,
+      "enabled": true,
+      "confidence_modifier": 1.0
+    },
+    {
+      "address": "0xbfc79c444c41a74516bf31237ebf586a231480b4",
+      "label": "hyperdash-extremely-profitable-208",
+      "allocation_weight": 1.0,
+      "enabled": true,
+      "confidence_modifier": 1.0
+    },
+    {
+      "address": "0xf929122994e177079c924631ba13fb280f5cd1f9",
+      "label": "hyperdash-extremely-profitable-94",
+      "allocation_weight": 1.0,
+      "enabled": true,
+      "confidence_modifier": 1.0
+    },
+    {
+      "address": "0xe091330c53b971ed4e886f902f18e8544a8d6705",
+      "label": "hyperdash-extremely-profitable-152",
+      "allocation_weight": 1.0,
+      "enabled": true,
+      "confidence_modifier": 1.0
+    },
+    {
+      "address": "0x95fde6cf0d305078b7eeac44182a931c169dd947",
+      "label": "hyperdash-extremely-profitable-170",
+      "allocation_weight": 1.0,
+      "enabled": true,
+      "confidence_modifier": 1.0
+    },
+    {
+      "address": "0xeafbe89e3bc638a540c166c45d2b12850fc6c402",
+      "label": "hyperdash-extremely-profitable-223",
+      "allocation_weight": 1.0,
+      "enabled": true,
+      "confidence_modifier": 1.0
+    },
+    {
+      "address": "0x7625dc67deab1864570ad816f59a9b867f280e49",
+      "label": "hyperdash-extremely-profitable-252",
+      "allocation_weight": 1.0,
+      "enabled": true,
+      "confidence_modifier": 1.0
+    },
+    {
+      "address": "0x47a127f496d001f187ac65fc24852274dc51d080",
+      "label": "hyperdash-extremely-profitable-160",
+      "allocation_weight": 1.0,
+      "enabled": true,
+      "confidence_modifier": 1.0
+    },
+    {
+      "address": "0x913df0b299f74ced052c5332a19a1fe72a343ad6",
+      "label": "hyperdash-extremely-profitable-255",
+      "allocation_weight": 1.0,
+      "enabled": true,
+      "confidence_modifier": 1.0
+    },
+    {
+      "address": "0xe2f86feccb1207710a442bc4e27a0701a290275a",
+      "label": "hyperdash-extremely-profitable-103",
+      "allocation_weight": 1.0,
+      "enabled": true,
+      "confidence_modifier": 1.0
+    },
+    {
+      "address": "0xa5fd942d4badbab4fe84a9e10f565dd40d5f15ff",
+      "label": "hyperdash-extremely-profitable-154",
+      "allocation_weight": 1.0,
+      "enabled": true,
+      "confidence_modifier": 1.0
+    },
+    {
+      "address": "0x944b5f7d8eece040aae1895c7fed03202aedf123",
+      "label": "hyperdash-extremely-profitable-244",
+      "allocation_weight": 1.0,
+      "enabled": true,
+      "confidence_modifier": 1.0
+    },
+    {
+      "address": "0xf97ad6704baec104d00b88e0c157e2b7b3a1ddd1",
+      "label": "hyperdash-extremely-profitable-212",
+      "allocation_weight": 1.0,
+      "enabled": true,
+      "confidence_modifier": 1.0
+    },
+    {
+      "address": "0xd487e26c62ed8c28ce3cc70b5791e501c2934982",
+      "label": "hyperdash-extremely-profitable-127",
+      "allocation_weight": 1.0,
+      "enabled": true,
+      "confidence_modifier": 1.0
+    },
+    {
+      "address": "0x56498e5f90c14060499b62b6f459b3e3fb9280c5",
+      "label": "hyperdash-extremely-profitable-126",
+      "allocation_weight": 1.0,
+      "enabled": true,
+      "confidence_modifier": 1.0
+    },
+    {
+      "address": "0xfbc9638938262f15cc1b3a751a54d538559da361",
+      "label": "hyperdash-extremely-profitable-232",
+      "allocation_weight": 1.0,
+      "enabled": true,
+      "confidence_modifier": 1.0
+    },
+    {
+      "address": "0x77375a8c9d13bf79afb2a87f1b0ac1dfd5f5bf66",
+      "label": "hyperdash-extremely-profitable-15",
+      "allocation_weight": 1.0,
+      "enabled": true,
+      "confidence_modifier": 1.0
+    },
+    {
+      "address": "0xa20fb0c9e04063eec5be286e9269028d966646fa",
+      "label": "hyperdash-extremely-profitable-158",
+      "allocation_weight": 1.0,
+      "enabled": true,
+      "confidence_modifier": 1.0
+    },
+    {
+      "address": "0x643430283b19fa5bd70a1138b495c2b43523cdd5",
+      "label": "hyperdash-extremely-profitable-184",
+      "allocation_weight": 1.0,
+      "enabled": true,
+      "confidence_modifier": 1.0
+    },
+    {
+      "address": "0xa4add8273d7f47318675bdfbcce3e9648cdb4509",
+      "label": "hyperdash-extremely-profitable-133",
+      "allocation_weight": 1.0,
+      "enabled": true,
+      "confidence_modifier": 1.0
+    },
+    {
+      "address": "0x36fbd89b5aa130b53708a98e729ad726daaf1f86",
+      "label": "hyperdash-extremely-profitable-204",
+      "allocation_weight": 1.0,
+      "enabled": true,
+      "confidence_modifier": 1.0
+    },
+    {
+      "address": "0x5e13d5cedbddd7237f659947ce64bec1294e2607",
+      "label": "hyperdash-extremely-profitable-98",
+      "allocation_weight": 1.0,
+      "enabled": true,
+      "confidence_modifier": 1.0
+    },
+    {
+      "address": "0xaea8e3bd369217cc6e3e6abddf0da318fba8e59b",
+      "label": "hyperdash-extremely-profitable-70",
+      "allocation_weight": 1.0,
+      "enabled": true,
+      "confidence_modifier": 1.0
+    },
+    {
+      "address": "0x72988778525f0ce15c5ac1804ac460606a987d6c",
+      "label": "hyperdash-extremely-profitable-147",
+      "allocation_weight": 1.0,
+      "enabled": true,
+      "confidence_modifier": 1.0
+    },
+    {
+      "address": "0x63d417a577b50c96f4f09148d4e4d70950db0522",
+      "label": "hyperdash-extremely-profitable-131",
+      "allocation_weight": 1.0,
+      "enabled": true,
+      "confidence_modifier": 1.0
+    },
+    {
+      "address": "0xbc433ba7c34752448c5361e5ed3038628a1753b0",
+      "label": "hyperdash-extremely-profitable-168",
+      "allocation_weight": 1.0,
+      "enabled": true,
+      "confidence_modifier": 1.0
+    },
+    {
+      "address": "0xa87a233e8a7d8951ff790a2e39738086cb5f71b7",
+      "label": "hyperdash-extremely-profitable-24",
+      "allocation_weight": 1.0,
+      "enabled": true,
+      "confidence_modifier": 1.0
+    },
+    {
+      "address": "0x1e37a337ed460039d1b15bd3bc489de789768d5e",
+      "label": "hyperdash-extremely-profitable-72",
+      "allocation_weight": 1.0,
+      "enabled": true,
+      "confidence_modifier": 1.0
+    },
+    {
+      "address": "0x1116b5fcc070945062e8879841c29807db373d0d",
+      "label": "hyperdash-extremely-profitable-162",
+      "allocation_weight": 1.0,
+      "enabled": true,
+      "confidence_modifier": 1.0
+    },
+    {
+      "address": "0x844b6ab0079fb36e6a99cba877574acd8f1e7f42",
+      "label": "hyperdash-extremely-profitable-197",
+      "allocation_weight": 1.0,
+      "enabled": true,
+      "confidence_modifier": 1.0
+    },
+    {
+      "address": "0x5bc43f38c2ddcd85857f218674cd384f172c3b0c",
+      "label": "hyperdash-extremely-profitable-69",
+      "allocation_weight": 1.0,
+      "enabled": true,
+      "confidence_modifier": 1.0
+    },
+    {
+      "address": "0x288ed4efc8fbd1e42a06fe083ea942d20c90b336",
+      "label": "hyperdash-extremely-profitable-151",
+      "allocation_weight": 1.0,
+      "enabled": true,
+      "confidence_modifier": 1.0
+    },
+    {
+      "address": "0x404ca2035b37bf2e83505134ebcf8d03babb5f03",
+      "label": "hyperdash-extremely-profitable-211",
+      "allocation_weight": 1.0,
+      "enabled": true,
+      "confidence_modifier": 1.0
+    },
+    {
+      "address": "0x6f97d329b072e0f7b74575565d806a4351b8f824",
+      "label": "hyperdash-extremely-profitable-214",
+      "allocation_weight": 1.0,
+      "enabled": true,
+      "confidence_modifier": 1.0
+    },
+    {
+      "address": "0x6bb971430554e3af58fbd469bce46ab2359a2d23",
+      "label": "hyperdash-extremely-profitable-61",
+      "allocation_weight": 1.0,
+      "enabled": true,
+      "confidence_modifier": 1.0
+    },
+    {
+      "address": "0xcb58b8f5ec6d47985f0728465c25a08ef9ad2c7b",
+      "label": "hyperdash-extremely-profitable-213",
+      "allocation_weight": 1.0,
+      "enabled": true,
+      "confidence_modifier": 1.0
+    },
+    {
+      "address": "0x185611e0343c14f53a4406891cb0fdc9e81808ae",
+      "label": "hyperdash-extremely-profitable-199",
+      "allocation_weight": 1.0,
+      "enabled": true,
+      "confidence_modifier": 1.0
+    },
+    {
+      "address": "0x8feb3a7d8bf1e424679fc75753b363eba5ee8185",
+      "label": "hyperdash-extremely-profitable-275",
+      "allocation_weight": 1.0,
+      "enabled": true,
+      "confidence_modifier": 1.0
+    },
+    {
+      "address": "0x507e0d7cb4cca156d09db13681ed4e5da66b411e",
+      "label": "hyperdash-extremely-profitable-270",
+      "allocation_weight": 1.0,
+      "enabled": true,
+      "confidence_modifier": 1.0
+    },
+    {
+      "address": "0x67fcc46ed2a63971697dad2fc7bb0091fe89e51d",
+      "label": "hyperdash-extremely-profitable-146",
+      "allocation_weight": 1.0,
+      "enabled": true,
+      "confidence_modifier": 1.0
+    },
+    {
+      "address": "0xca4903c207a0df58bf37d4bc8bbc5210726f53c8",
+      "label": "hyperdash-extremely-profitable-190",
+      "allocation_weight": 1.0,
+      "enabled": true,
+      "confidence_modifier": 1.0
+    },
+    {
+      "address": "0xeac842b2214cfece3f0d288293da19f408d91ede",
+      "label": "hyperdash-extremely-profitable-185",
+      "allocation_weight": 1.0,
+      "enabled": true,
+      "confidence_modifier": 1.0
+    },
+    {
+      "address": "0xa0ca3dcba02de989e35eb3810ad762a222315075",
+      "label": "hyperdash-extremely-profitable-209",
+      "allocation_weight": 1.0,
+      "enabled": true,
+      "confidence_modifier": 1.0
+    },
+    {
+      "address": "0x123dbca6a27005a3c4ce10cb66ee8ece8fc13bff",
+      "label": "hyperdash-extremely-profitable-87",
+      "allocation_weight": 1.0,
+      "enabled": true,
+      "confidence_modifier": 1.0
+    },
+    {
+      "address": "0x9751cec58be43e0e27d57ba49ac3d68ec269a97e",
+      "label": "hyperdash-extremely-profitable-43",
+      "allocation_weight": 1.0,
+      "enabled": true,
+      "confidence_modifier": 1.0
+    },
+    {
+      "address": "0xa9b95f2a2e7ef219021efc5c04c32761b8553bbd",
+      "label": "hyperdash-extremely-profitable-28",
+      "allocation_weight": 1.0,
+      "enabled": true,
+      "confidence_modifier": 1.0
+    },
+    {
+      "address": "0x1f67d79afc8d0e7609ddba6c9b657cc635f69981",
+      "label": "hyperdash-extremely-profitable-210",
+      "allocation_weight": 1.0,
+      "enabled": true,
+      "confidence_modifier": 1.0
+    },
+    {
+      "address": "0xac50a255e330c388f44b9d01259d6b153a9f0ed9",
+      "label": "hyperdash-extremely-profitable-288",
+      "allocation_weight": 1.0,
+      "enabled": true,
+      "confidence_modifier": 1.0
+    },
+    {
+      "address": "0xac26cf5f3c46b5e102048c65b977d2551b72a9c7",
+      "label": "hyperdash-extremely-profitable-173",
+      "allocation_weight": 1.0,
+      "enabled": true,
+      "confidence_modifier": 1.0
+    },
+    {
+      "address": "0x3bcae23e8c380dab4732e9a159c0456f12d866f3",
+      "label": "hyperdash-extremely-profitable-26",
+      "allocation_weight": 1.0,
+      "enabled": true,
+      "confidence_modifier": 1.0
+    },
+    {
+      "address": "0xa312114b5795dff9b8db50474dd57701aa78ad1e",
+      "label": "hyperdash-extremely-profitable-17",
+      "allocation_weight": 1.0,
+      "enabled": true,
+      "confidence_modifier": 1.0
+    },
+    {
+      "address": "0xcb02837caaee310c178501855b63bf7f4f4b1f8b",
+      "label": "hyperdash-extremely-profitable-220",
+      "allocation_weight": 1.0,
+      "enabled": true,
+      "confidence_modifier": 1.0
+    },
+    {
+      "address": "0x08c14b32c8a48894e4b933090ebcc9ce33b21135",
+      "label": "hyperdash-extremely-profitable-109",
+      "allocation_weight": 1.0,
+      "enabled": true,
+      "confidence_modifier": 1.0
+    },
+    {
+      "address": "0x0c4a3a7ac74d43732f9b5ea507f01ab72a381b19",
+      "label": "hyperdash-extremely-profitable-86",
+      "allocation_weight": 1.0,
+      "enabled": true,
+      "confidence_modifier": 1.0
+    },
+    {
+      "address": "0x7044be555aea5bddb3b9808658500d4e0d0a6b6e",
+      "label": "hyperdash-extremely-profitable-249",
+      "allocation_weight": 1.0,
+      "enabled": true,
+      "confidence_modifier": 1.0
+    },
+    {
+      "address": "0x07fd993f0fa3a185f7207adccd29f7a87404689d",
+      "label": "hyperdash-extremely-profitable-105",
+      "allocation_weight": 1.0,
+      "enabled": true,
+      "confidence_modifier": 1.0
+    },
+    {
+      "address": "0xcafe9392d902f6f517b1573371923ebf7ffa7b3b",
+      "label": "hyperdash-extremely-profitable-66",
+      "allocation_weight": 1.0,
+      "enabled": true,
+      "confidence_modifier": 1.0
+    },
+    {
+      "address": "0x349bd094209d50280dfaca12779576c748395c15",
+      "label": "hyperdash-extremely-profitable-264",
+      "allocation_weight": 1.0,
+      "enabled": true,
+      "confidence_modifier": 1.0
+    },
+    {
+      "address": "0x44c9c226cdfae773002b3f86d3966af3cd8f277c",
+      "label": "hyperdash-extremely-profitable-205",
+      "allocation_weight": 1.0,
+      "enabled": true,
+      "confidence_modifier": 1.0
+    },
+    {
+      "address": "0x36ac01de9bc76c0d744b38c3e13a0538d55c7568",
+      "label": "hyperdash-extremely-profitable-241",
+      "allocation_weight": 1.0,
+      "enabled": true,
+      "confidence_modifier": 1.0
+    },
+    {
+      "address": "0x1b7ca89aa121890b8572d326e363185cf4780c6a",
+      "label": "hyperdash-extremely-profitable-143",
+      "allocation_weight": 1.0,
+      "enabled": true,
+      "confidence_modifier": 1.0
+    },
+    {
+      "address": "0x369daedbefcb30b82154338c8fd613a70c60d251",
+      "label": "hyperdash-extremely-profitable-153",
+      "allocation_weight": 1.0,
+      "enabled": true,
+      "confidence_modifier": 1.0
+    },
+    {
+      "address": "0xd28e005c992b168d0b20fca312958e105bb260ab",
+      "label": "hyperdash-extremely-profitable-238",
+      "allocation_weight": 1.0,
+      "enabled": true,
+      "confidence_modifier": 1.0
+    },
+    {
+      "address": "0x972b0f9cde1266e860e546ac92e783741769400f",
+      "label": "hyperdash-extremely-profitable-262",
+      "allocation_weight": 1.0,
+      "enabled": true,
+      "confidence_modifier": 1.0
+    },
+    {
+      "address": "0xfdba13d24cb423a393603d72ca80f31b251a3727",
+      "label": "hyperdash-extremely-profitable-260",
+      "allocation_weight": 1.0,
+      "enabled": true,
+      "confidence_modifier": 1.0
+    },
+    {
+      "address": "0xac04753928961a06af540078410802cc443f5176",
+      "label": "hyperdash-extremely-profitable-123",
+      "allocation_weight": 1.0,
+      "enabled": true,
+      "confidence_modifier": 1.0
+    },
+    {
+      "address": "0xe607da942c20336a2a7bc5a56488b86aad2684ee",
+      "label": "hyperdash-extremely-profitable-246",
+      "allocation_weight": 1.0,
+      "enabled": true,
+      "confidence_modifier": 1.0
+    },
+    {
+      "address": "0xc6d7fdfbcb55d6cad6570c5838de394d2aa24015",
+      "label": "hyperdash-extremely-profitable-276",
+      "allocation_weight": 1.0,
+      "enabled": true,
+      "confidence_modifier": 1.0
+    },
+    {
+      "address": "0xab5e6f394951c28ab1873007e373202689cdbec3",
+      "label": "hyperdash-extremely-profitable-149",
+      "allocation_weight": 1.0,
+      "enabled": true,
+      "confidence_modifier": 1.0
+    },
+    {
+      "address": "0xe2990ce029db870c805e90a1a8a1d8a1c52255d6",
+      "label": "hyperdash-extremely-profitable-225",
+      "allocation_weight": 1.0,
+      "enabled": true,
+      "confidence_modifier": 1.0
+    },
+    {
+      "address": "0x05904930cae1e9a48c055f4a8a83480ba7fc6abf",
+      "label": "hyperdash-extremely-profitable-201",
+      "allocation_weight": 1.0,
+      "enabled": true,
+      "confidence_modifier": 1.0
+    },
+    {
+      "address": "0x99b1098d9d50aa076f78bd26ab22e6abd3710729",
+      "label": "hyperdash-extremely-profitable-263",
+      "allocation_weight": 1.0,
+      "enabled": true,
+      "confidence_modifier": 1.0
+    },
+    {
+      "address": "0xbb97757984fa4408c13bd3b4a9189f520bf317d3",
+      "label": "hyperdash-extremely-profitable-259",
+      "allocation_weight": 1.0,
+      "enabled": true,
+      "confidence_modifier": 1.0
+    },
+    {
+      "address": "0xdb6f5c58bb13d8aa101b0a5d1a70f737b5d1cd1c",
+      "label": "hyperdash-extremely-profitable-56",
+      "allocation_weight": 1.0,
+      "enabled": true,
+      "confidence_modifier": 1.0
+    },
+    {
+      "address": "0xc7f94fb3b3ba614b9b2bf80697ab5a31917005a2",
+      "label": "hyperdash-extremely-profitable-192",
+      "allocation_weight": 1.0,
+      "enabled": true,
+      "confidence_modifier": 1.0
+    },
+    {
+      "address": "0xe113311f35a53b196c0ab3ed31ad0bf937cc5c07",
+      "label": "hyperdash-extremely-profitable-240",
+      "allocation_weight": 1.0,
+      "enabled": true,
+      "confidence_modifier": 1.0
+    },
+    {
+      "address": "0x888e000c78b8f1aada5b3c99f880794907b76d77",
+      "label": "hyperdash-extremely-profitable-85",
+      "allocation_weight": 1.0,
+      "enabled": true,
+      "confidence_modifier": 1.0
+    },
+    {
+      "address": "0x29eb62882a8bd104a64400a2971d0d6881777043",
+      "label": "hyperdash-extremely-profitable-267",
+      "allocation_weight": 1.0,
+      "enabled": true,
+      "confidence_modifier": 1.0
+    },
+    {
+      "address": "0x28233e5edddfc9f71f0cecf58ca98f6a2ca11f43",
+      "label": "hyperdash-extremely-profitable-195",
+      "allocation_weight": 1.0,
+      "enabled": true,
+      "confidence_modifier": 1.0
+    },
+    {
+      "address": "0x10495f72a1623ff2d836a2cbb25eaba7ff92e246",
+      "label": "hyperdash-extremely-profitable-237",
+      "allocation_weight": 1.0,
+      "enabled": true,
+      "confidence_modifier": 1.0
+    },
+    {
+      "address": "0x60a8c761f39696b3b419f31dcda20b405cb685f6",
+      "label": "hyperdash-extremely-profitable-6",
+      "allocation_weight": 1.0,
+      "enabled": true,
+      "confidence_modifier": 1.0
+    },
+    {
+      "address": "0x0b83bc39c98335a4ac56999c4ee89053cdb0508a",
+      "label": "hyperdash-extremely-profitable-245",
+      "allocation_weight": 1.0,
+      "enabled": true,
+      "confidence_modifier": 1.0
+    },
+    {
+      "address": "0xacb66d1996501bcc82a0e7819c9e041599f5efbd",
+      "label": "hyperdash-extremely-profitable-38",
+      "allocation_weight": 1.0,
+      "enabled": true,
+      "confidence_modifier": 1.0
+    },
+    {
+      "address": "0x8cc94dc843e1ea7a19805e0cca43001123512b6a",
+      "label": "hyperdash-extremely-profitable-47",
+      "allocation_weight": 1.0,
+      "enabled": true,
+      "confidence_modifier": 1.0
+    },
+    {
+      "address": "0xd1692402c26392ccc8588631d7d5ca9aed4348e5",
+      "label": "hyperdash-extremely-profitable-253",
+      "allocation_weight": 1.0,
+      "enabled": true,
+      "confidence_modifier": 1.0
+    }
+  ]
+}

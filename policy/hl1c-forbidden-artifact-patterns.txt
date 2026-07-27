@@ -1,0 +1,13 @@
+# Known signing, secret-loading, approval, and exchange-mutation artifact patterns.
+LocalWallet
+# Generic TLS libraries contain a certificate SigningKey interface. Exchange/key
+# implementations remain excluded by the exact package denylist, source-symbol
+# policy, and the mutation-specific artifact patterns below.
+AuthenticatedExchangeClient
+ExchangeClient
+approve_agent
+HYPERLIQUID_PRIVATE_KEY
+HYPERLIQUID_MASTER_PRIVATE_KEY
+submit_order
+cancel_order
+load_secret

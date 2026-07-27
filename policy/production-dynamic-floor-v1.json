@@ -1,0 +1,7 @@
+{
+  "schema_version": 1,
+  "exchange_minimum_notional_usd": "10",
+  "rounding_buffer_usd": "0.2",
+  "closeability_margin_usd": "0.5",
+  "post_rounding_validation_required": true
+}

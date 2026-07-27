@@ -1,0 +1,9 @@
+{
+  "schema_version": 1,
+  "source": "hyperliquid_public_meta",
+  "require_known_asset_index": true,
+  "require_positive_mark_price": true,
+  "require_positive_tick_size": true,
+  "require_positive_size_step": true,
+  "reject_missing_or_stale_rules": true
+}

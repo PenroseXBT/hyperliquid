@@ -1,0 +1,42 @@
+{
+  "schema_version": 1,
+  "engine_instance_byte": 9,
+  "decision_sequence": 1,
+  "created_at_mono": 1000,
+  "follower_equity": "1000",
+  "curve_leverage": "8",
+  "markets": {
+    "BTC": {
+      "mark_price": "100000",
+      "price_tick": "1",
+      "size_step": "0.00001"
+    },
+    "ETH": {
+      "mark_price": "5000",
+      "price_tick": "0.1",
+      "size_step": "0.0001"
+    }
+  },
+  "sources": [
+    {
+      "candidate_id": "0x71dfc07de32c2ebf1c4801f4b1c9e40b76d4a23d",
+      "accepted_sequence": 42,
+      "received_at_mono": 1000,
+      "valid_until_mono": 41000,
+      "allocation_weight": 1.0,
+      "confidence_modifier": 1.0,
+      "exclusion_reason": null,
+      "exposures": { "BTC": 0.1, "ETH": -0.05 }
+    },
+    {
+      "candidate_id": "0xbadbb1de95b5f333623ebece7026932fa5039ee6",
+      "accepted_sequence": 7,
+      "received_at_mono": 900,
+      "valid_until_mono": 900,
+      "allocation_weight": 1.0,
+      "confidence_modifier": 1.0,
+      "exclusion_reason": "stale",
+      "exposures": { "BTC": -0.5 }
+    }
+  ]
+}

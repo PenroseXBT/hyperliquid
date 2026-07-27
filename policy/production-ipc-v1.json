@@ -1,0 +1,11 @@
+{
+  "protocol_version": 1,
+  "maximum_frame_bytes": 1048576,
+  "maximum_pending_intents": 256,
+  "maximum_pending_risk_reducing": 64,
+  "maximum_pending_exposure_increasing": 192,
+  "maximum_pending_events": 4096,
+  "maximum_reorder_window": 256,
+  "write_timeout_ms": 2000,
+  "acknowledgment_timeout_ms": 5000
+}

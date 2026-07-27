@@ -1,0 +1,9 @@
+{
+  "schema_version": 1,
+  "time_in_force": "Ioc",
+  "depth_priced_primary": true,
+  "execution_cushion_bps": "4",
+  "maximum_slippage_bps": "4",
+  "bounded_reference_fallback": true,
+  "unbounded_market_order_permitted": false
+}
