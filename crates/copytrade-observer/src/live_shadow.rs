@@ -24,7 +24,9 @@ use copytrade_core::decision::{
 };
 use copytrade_core::deployment_equity::{calculate_deployment_equity, DeploymentEquity};
 use copytrade_core::execution_floor::{validates_rounded_order, ExecutionFloorPolicy};
-use copytrade_core::exit_planning::{plan_risk_reducing_ioc, ExitPlanningBlock, ExitPlanningInput};
+use copytrade_core::exit_planning::{
+    plan_risk_reducing_ioc, ExitPlanningBlock, ExitPlanningInput, ResidualClass,
+};
 use copytrade_core::ledger::DualLedger;
 use copytrade_core::portfolio_risk::project_and_validate_portfolio;
 use copytrade_core::portfolio_risk::{MarketRules, PortfolioProjectionInput};
@@ -3342,11 +3344,13 @@ impl LiveShadowEngine {
             let filled_notional = filled_quantity
                 .checked_mul(reference_price)
                 .ok_or(LiveShadowError::Arithmetic)?;
-            let desired = self
+            let (desired, current_target_version) = self
                 .target_ledger
                 .get(&book.asset)
-                .map(|state| state.admitted_target_notional)
-                .unwrap_or_default();
+                .map(|state| (state.admitted_target_notional, Some(state.target_version)))
+                .unwrap_or((Decimal::ZERO, None));
+            let stale_target = current_target_version
+                .is_some_and(|version| version != pending.action.target_version);
             let exit = match plan_risk_reducing_ioc(&ExitPlanningInput {
                 asset: &book.asset,
                 desired_target_notional: desired,
@@ -3362,23 +3366,44 @@ impl LiveShadowEngine {
                 execution_cushion: cushion,
                 maximum_slippage,
             }) {
+                Ok(exit)
+                    if stale_target
+                        && exit.residual_class == ResidualClass::DirectionFlipCloseLeg =>
+                {
+                    self.retire_pending_action(
+                        &book.asset,
+                        &pending,
+                        received_at,
+                        ActionAttemptOutcome::SupersededByNewTarget,
+                    );
+                    return Ok(ExecutionRecompute::None);
+                }
                 Ok(exit) => exit,
+                Err(ExitPlanningBlock::AlreadySatisfied) => {
+                    self.retire_pending_action(
+                        &book.asset,
+                        &pending,
+                        received_at,
+                        ActionAttemptOutcome::NoLongerRequired,
+                    );
+                    return Ok(ExecutionRecompute::None);
+                }
+                Err(ExitPlanningBlock::ExposureIncreasing) if stale_target => {
+                    self.retire_pending_action(
+                        &book.asset,
+                        &pending,
+                        received_at,
+                        ActionAttemptOutcome::SupersededByNewTarget,
+                    );
+                    return Ok(ExecutionRecompute::None);
+                }
                 Err(ExitPlanningBlock::BelowExchangeMinimum { .. }) => {
-                    self.pending.remove(&book.asset);
-                    self.action_lifecycle_events.push(ActionLifecycleEvent {
-                        asset: book.asset.clone(),
-                        decision_id: pending.action.decision_id.to_string(),
-                        planned_cloid: pending.action.planned_cloid.to_string(),
-                        root_planned_cloid: pending.root_planned_cloid,
-                        parent_planned_cloid: pending.parent_planned_cloid,
-                        retry_generation: pending.action.retry_generation,
-                        observed_at_mono: received_at,
-                        requested_notional: pending.action.rounded_notional,
-                        filled_quantity: None,
-                        unfilled_quantity: None,
-                        outcome: ActionAttemptOutcome::BelowExchangeMinimumAfterCurrentRecompute,
-                    });
-                    self.refresh_desired_books();
+                    self.retire_pending_action(
+                        &book.asset,
+                        &pending,
+                        received_at,
+                        ActionAttemptOutcome::BelowExchangeMinimumAfterCurrentRecompute,
+                    );
                     return Ok(ExecutionRecompute::None);
                 }
                 Err(error) => {
@@ -3426,21 +3451,12 @@ impl LiveShadowEngine {
         if !validates_rounded_order(quantity, price_plan.limit_price, required_notional)
             .map_err(core)?
         {
-            self.pending.remove(&book.asset);
-            self.action_lifecycle_events.push(ActionLifecycleEvent {
-                asset: book.asset.clone(),
-                decision_id: pending.action.decision_id.to_string(),
-                planned_cloid: pending.action.planned_cloid.to_string(),
-                root_planned_cloid: pending.root_planned_cloid,
-                parent_planned_cloid: pending.parent_planned_cloid,
-                retry_generation: pending.action.retry_generation,
-                observed_at_mono: received_at,
-                requested_notional: pending.action.rounded_notional,
-                filled_quantity: None,
-                unfilled_quantity: Some(quantity),
-                outcome: ActionAttemptOutcome::BelowExchangeMinimumAfterCurrentRecompute,
-            });
-            self.refresh_desired_books();
+            self.retire_pending_action(
+                &book.asset,
+                &pending,
+                received_at,
+                ActionAttemptOutcome::BelowExchangeMinimumAfterCurrentRecompute,
+            );
             return Ok(ExecutionRecompute::None);
         }
         if let Some(identity) = self.production_identity.clone() {
@@ -4579,6 +4595,30 @@ impl LiveShadowEngine {
         Ok(())
     }
 
+    fn retire_pending_action(
+        &mut self,
+        asset: &str,
+        pending: &PendingShadow,
+        observed_at_mono: Timestamp,
+        outcome: ActionAttemptOutcome,
+    ) {
+        self.pending.remove(asset);
+        self.action_lifecycle_events.push(ActionLifecycleEvent {
+            asset: asset.to_string(),
+            decision_id: pending.action.decision_id.to_string(),
+            planned_cloid: pending.action.planned_cloid.to_string(),
+            root_planned_cloid: pending.root_planned_cloid.clone(),
+            parent_planned_cloid: pending.parent_planned_cloid.clone(),
+            retry_generation: pending.action.retry_generation,
+            observed_at_mono,
+            requested_notional: pending.action.rounded_notional,
+            filled_quantity: None,
+            unfilled_quantity: None,
+            outcome,
+        });
+        self.refresh_desired_books();
+    }
+
     fn refresh_desired_books(&mut self) {
         self.desired_books = self
             .pending
@@ -4957,7 +4997,9 @@ mod tests {
         WalletQualityObservation, VERY_PROFITABLE_COHORT_ID, VERY_PROFITABLE_COHORT_URL,
     };
     use copytrade_core::decision::MarketSnapshotId;
-    use copytrade_core::decision::{DecisionId, PlannedAction, PlannedCloid, TargetVersion};
+    use copytrade_core::decision::{
+        DecisionId, PlannedAction, PlannedCloid, SnapshotSetId, TargetVersion,
+    };
     use copytrade_core::scheduler::ReadRequestKind;
     use copytrade_core::shadow::ShadowExecutionId;
     use copytrade_core::technical::{CandleInterval, ClosedCandle, MarketRegime, SignalArchetype};
@@ -6471,6 +6513,321 @@ mod tests {
             valid_until_mono: at + 120_000,
             payload,
         }
+    }
+
+    #[derive(Deserialize)]
+    struct R7ResolvStaleReduceOnlyFixture {
+        source_bundle_id: String,
+        source_archive_sha256: String,
+        source_journal_sha256: String,
+        failure_event_sequence: u64,
+        last_valid_snapshot_generation: u64,
+        asset: String,
+        opening_quantity: Decimal,
+        opening_average_fill_price: Decimal,
+        current_reference_price: Decimal,
+        current_combined_target_fraction: Decimal,
+        pending_target_version: u64,
+        current_target_version: u64,
+    }
+
+    fn pending_reduce_only_engine(
+        asset: &str,
+        opening_quantity: Decimal,
+        opening_price: Decimal,
+        current_reference_price: Decimal,
+    ) -> (LiveShadowEngine, OrderBookResponse) {
+        let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../config/copytrade.json");
+        let mut config = CopyTradeConfig::from_path(path).unwrap();
+        let candidate = config.candidates[0].address.to_ascii_lowercase();
+        config.candidates.truncate(1);
+        config.technical.enabled = false;
+        let mut engine =
+            LiveShadowEngine::new(config, b"stale-reduce-only", "run", 40_000, 80_000).unwrap();
+        engine.set_source_tier(&candidate, SourceTier::Active);
+
+        let opening = crossing_test_execution(
+            asset,
+            Side::Buy,
+            opening_quantity,
+            opening_price,
+            Decimal::ZERO,
+            Decimal::ZERO,
+            Decimal::ZERO,
+            Decimal::ZERO,
+        );
+        engine
+            .ledger
+            .apply_portfolio_execution(&opening, 1)
+            .unwrap();
+        engine
+            .ledger
+            .apply_source_execution("technical:range_mean_reversion:range", &opening, 1)
+            .unwrap();
+        engine
+            .ingest(
+                accepted(
+                    PublicPayload::SourceState(SourceStateResponse {
+                        candidate_id: candidate,
+                        account_value: Decimal::from(1_000),
+                        source_time_ms: 1_000,
+                        positions: BTreeMap::new(),
+                        closed_candles: Vec::new(),
+                    }),
+                    ReadRequestKind::SourceState,
+                    1_000,
+                ),
+                1_000,
+            )
+            .unwrap();
+        engine
+            .ingest(
+                accepted(
+                    PublicPayload::MarketSnapshot(MarketSnapshotResponse {
+                        mids: BTreeMap::from([(asset.to_string(), current_reference_price)]),
+                    }),
+                    ReadRequestKind::MarketMids,
+                    1_000,
+                ),
+                1_000,
+            )
+            .unwrap();
+        engine
+            .ingest(
+                accepted(
+                    PublicPayload::MarketMetadata(MarketMetadataResponse {
+                        universe: vec![MarketMetadataAsset {
+                            name: asset.to_string(),
+                            size_decimals: 0,
+                        }],
+                        contexts: BTreeMap::new(),
+                    }),
+                    ReadRequestKind::ExchangeMetadata,
+                    1_000,
+                ),
+                1_000,
+            )
+            .unwrap();
+        let price_step = Decimal::new(1, 6);
+        let book = OrderBookResponse {
+            asset: asset.to_string(),
+            source_time_ms: 1_000,
+            bids: vec![BookLevel {
+                price: current_reference_price - price_step,
+                quantity: opening_quantity * Decimal::from(2),
+            }],
+            asks: vec![BookLevel {
+                price: current_reference_price + price_step,
+                quantity: opening_quantity * Decimal::from(2),
+            }],
+        };
+        engine
+            .ingest(
+                accepted(
+                    PublicPayload::OrderBook(book.clone()),
+                    ReadRequestKind::OrderBook,
+                    1_000,
+                ),
+                1_000,
+            )
+            .unwrap();
+        engine.construct_next_decision(1_001).unwrap().unwrap();
+        assert!(engine.pending[asset].action.reduce_only);
+        (engine, book)
+    }
+
+    fn replace_current_target(
+        engine: &mut LiveShadowEngine,
+        asset: &str,
+        desired: Decimal,
+        target_version: TargetVersion,
+        reference_price: Decimal,
+    ) {
+        let filled = engine.authoritative_position(asset) * reference_price;
+        let targets = BTreeMap::from([(asset.to_string(), desired)]);
+        engine
+            .target_ledger
+            .replace_absolute_targets(
+                &targets,
+                &targets,
+                &BTreeMap::from([(asset.to_string(), filled)]),
+                &BTreeMap::new(),
+                &BTreeMap::new(),
+                target_version,
+                SnapshotSetId([41; 32]),
+            )
+            .unwrap();
+    }
+
+    #[test]
+    fn r7_resolv_stale_reduce_only_is_canceled_without_fatal_or_unresolved_root() {
+        let fixture: R7ResolvStaleReduceOnlyFixture = serde_json::from_str(include_str!(
+            "../../../fixtures/su6r1-r7-resolv-stale-reduce-only.json"
+        ))
+        .unwrap();
+        assert_eq!(fixture.source_bundle_id, "1786293985564-314-1b7682138393");
+        assert_eq!(fixture.source_archive_sha256.len(), 64);
+        assert_eq!(fixture.source_journal_sha256.len(), 64);
+        assert_eq!(fixture.failure_event_sequence, 38_149);
+        assert_eq!(fixture.last_valid_snapshot_generation, 238);
+
+        let (mut engine, book) = pending_reduce_only_engine(
+            &fixture.asset,
+            fixture.opening_quantity,
+            fixture.opening_average_fill_price,
+            fixture.current_reference_price,
+        );
+        let original_position = engine.authoritative_position(&fixture.asset);
+        let pending_version = engine.pending[&fixture.asset].action.target_version;
+        assert_eq!(
+            fixture.pending_target_version + 1,
+            fixture.current_target_version
+        );
+        let current_destination = fixture.current_combined_target_fraction * Decimal::from(100);
+        let current_committed = original_position * fixture.current_reference_price;
+        assert!(current_destination > current_committed);
+        replace_current_target(
+            &mut engine,
+            &fixture.asset,
+            current_destination,
+            TargetVersion(pending_version.0 + 1),
+            fixture.current_reference_price,
+        );
+
+        let result = engine.try_execute_pending(&book, 10_000).unwrap();
+        assert_eq!(result, ExecutionRecompute::None);
+        assert!(!engine.pending.contains_key(&fixture.asset));
+        assert_eq!(
+            engine.authoritative_position(&fixture.asset),
+            original_position
+        );
+        assert!(engine.executions.is_empty());
+        assert_eq!(
+            engine.action_lifecycle_events.last().unwrap().outcome,
+            ActionAttemptOutcome::SupersededByNewTarget
+        );
+        let density = engine.executable_density_summary().unwrap();
+        assert_eq!(density.unresolved_actionable_targets, 0);
+        assert!(density.root_conservation_verified);
+    }
+
+    #[test]
+    fn stale_reduce_only_reversal_is_canceled_for_normal_crossing_replan() {
+        let (mut engine, book) = pending_reduce_only_engine(
+            "RESOLV",
+            Decimal::from(2_085),
+            Decimal::new(17_723_128_537_170_263, 18),
+            Decimal::new(17_698, 6),
+        );
+        let pending_version = engine.pending["RESOLV"].action.target_version;
+        replace_current_target(
+            &mut engine,
+            "RESOLV",
+            Decimal::from(-20),
+            TargetVersion(pending_version.0 + 1),
+            Decimal::new(17_698, 6),
+        );
+
+        assert_eq!(
+            engine.try_execute_pending(&book, 10_000).unwrap(),
+            ExecutionRecompute::None
+        );
+        assert!(!engine.pending.contains_key("RESOLV"));
+        assert!(engine.executions.is_empty());
+        assert_eq!(
+            engine.action_lifecycle_events.last().unwrap().outcome,
+            ActionAttemptOutcome::SupersededByNewTarget
+        );
+    }
+
+    #[test]
+    fn stale_reduce_only_that_is_already_satisfied_is_canceled_cleanly() {
+        let reference_price = Decimal::new(17_698, 6);
+        let (mut engine, book) = pending_reduce_only_engine(
+            "RESOLV",
+            Decimal::from(2_085),
+            Decimal::new(17_723_128_537_170_263, 18),
+            reference_price,
+        );
+        let pending_version = engine.pending["RESOLV"].action.target_version;
+        let committed = engine.authoritative_position("RESOLV") * reference_price;
+        replace_current_target(
+            &mut engine,
+            "RESOLV",
+            committed,
+            TargetVersion(pending_version.0 + 1),
+            reference_price,
+        );
+
+        assert_eq!(
+            engine.try_execute_pending(&book, 10_000).unwrap(),
+            ExecutionRecompute::None
+        );
+        assert!(!engine.pending.contains_key("RESOLV"));
+        assert!(engine.executions.is_empty());
+        assert_eq!(
+            engine.action_lifecycle_events.last().unwrap().outcome,
+            ActionAttemptOutcome::NoLongerRequired
+        );
+        let density = engine.executable_density_summary().unwrap();
+        assert_eq!(density.unresolved_actionable_targets, 0);
+        assert!(density.root_conservation_verified);
+    }
+
+    #[test]
+    fn stale_reduce_only_that_remains_a_reduction_is_resized_from_current_quantity() {
+        let reference_price = Decimal::new(17_698, 6);
+        let (mut engine, book) = pending_reduce_only_engine(
+            "RESOLV",
+            Decimal::from(2_085),
+            Decimal::new(17_723_128_537_170_263, 18),
+            reference_price,
+        );
+        let pending_version = engine.pending["RESOLV"].action.target_version;
+        let position_before = engine.authoritative_position("RESOLV");
+        let desired = position_before * reference_price / Decimal::from(2);
+        replace_current_target(
+            &mut engine,
+            "RESOLV",
+            desired,
+            TargetVersion(pending_version.0 + 1),
+            reference_price,
+        );
+
+        assert!(engine.pending["RESOLV"].action.reduce_only);
+        engine.try_execute_pending(&book, 10_000).unwrap();
+        let execution = engine.executions.last().unwrap();
+        assert_eq!(execution.side, "sell");
+        assert!(execution.filled_quantity > Decimal::ZERO);
+        assert!(execution.filled_quantity <= position_before);
+        let position_after = engine.authoritative_position("RESOLV");
+        assert!(position_after > Decimal::ZERO);
+        assert!(position_after < position_before);
+    }
+
+    #[test]
+    fn still_current_exposure_increasing_reduce_only_remains_a_hard_failure() {
+        let (mut engine, book) = pending_reduce_only_engine(
+            "RESOLV",
+            Decimal::from(2_085),
+            Decimal::new(17_723_128_537_170_263, 18),
+            Decimal::new(17_698, 6),
+        );
+        let pending_version = engine.pending["RESOLV"].action.target_version;
+        replace_current_target(
+            &mut engine,
+            "RESOLV",
+            Decimal::from(40),
+            pending_version,
+            Decimal::new(17_698, 6),
+        );
+
+        assert!(matches!(
+            engine.try_execute_pending(&book, 10_000),
+            Err(LiveShadowError::Core(message)) if message.contains("ExposureIncreasing")
+        ));
+        assert!(engine.pending.contains_key("RESOLV"));
+        assert!(engine.executions.is_empty());
     }
 
     #[test]

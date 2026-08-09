@@ -1,0 +1,17 @@
+{
+  "source_bundle_id": "1785202130363-303-91ab220e921d",
+  "source_journal_sha256": "4899f5a9eda495ec78df37d375aa59a20e4570152f82a3344f5a329b6439f35c",
+  "source_event_hash": "8933c915844c051046ae966a2f7d946c8f8bc798597b7254d6e1749a0f6d381e",
+  "candle": {
+    "asset": "ETH",
+    "interval": "fifteenminutes",
+    "open_time_ms": 1785179700000,
+    "close_time_ms": 1785180599999,
+    "open": "1947.6",
+    "high": "1951.3",
+    "low": "1946.8",
+    "close": "1949.7",
+    "base_volume": "4392.5768",
+    "trade_count": 1643
+  }
+}
