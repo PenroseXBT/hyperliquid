@@ -9,11 +9,13 @@ use crate::qualification_evidence::{
     LatencyEvidence, RunHeader, TerminalSummary,
 };
 use crate::replay::{verify_replay_event_chain, ReplayPayload};
+use crate::state_root::{StateRootStartup, UnsignedStateRoot};
+use crate::ObserverCoreState;
 use copytrade_core::decision::{derive_config_hash, derive_risk_policy_hash};
 use copytrade_core::scheduler::{
     BudgetClass, Clock, ExecutionOutcome, MonotonicClock, ReadOnlyDataSource,
     ReadOnlySchedulerConfig, ReadRequestKind, RequestKey, RequestPriority, RequestScheduler,
-    RequestSubject, ScheduleOutcome, ScheduledReadRequest, SourceTier,
+    RequestSubject, ScheduleOutcome, ScheduledReadRequest, SourceTier, Timestamp,
 };
 use copytrade_core::CopyTradeConfig;
 use rust_decimal::prelude::FromPrimitive;
@@ -29,9 +31,28 @@ use tokio::task::JoinSet;
 use tokio::time::{sleep, Duration};
 
 pub const MINIMUM_QUALIFICATION_SECONDS: u64 = 86_400;
+const MAX_ACTIVE_SOURCE_CANDIDATES: usize = 100;
+
+/// Nominal source polling capacity after the effective candidate universe has
+/// been assembled (including cohort-only scheduler additions). Both tier
+/// cadences remain fixed by the transport policy so the configured 75-second
+/// freshness deadline continues to include its queue and transport allowance.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+struct SourceDispatchPlan {
+    effective_candidate_count: usize,
+    active_candidate_count: usize,
+    inactive_candidate_count: usize,
+    active_cadence_ms: u64,
+    inactive_cadence_ms: u64,
+    source_call_capacity_per_window: u64,
+    active_dispatches_per_window: u64,
+    inactive_dispatches_per_window: u64,
+    combined_dispatches_per_window: u64,
+}
 
 pub struct QualificationOptions {
     pub config_path: PathBuf,
+    pub very_profitable_layer_path: Option<PathBuf>,
     pub request_policy_path: PathBuf,
     pub transport_policy_path: PathBuf,
     pub release_manifest_path: PathBuf,
@@ -47,14 +68,48 @@ pub struct QualificationOptions {
 
 fn persist_unsigned_state(
     engine: &mut LiveShadowEngine,
-    state_path: Option<&Path>,
-    identity: &UnsignedShadowStateIdentity,
+    state_root: &mut Option<UnsignedStateRoot>,
 ) -> Result<(), Box<dyn Error>> {
-    if let Some(path) = state_path {
-        engine
-            .persist_unsigned_state(path, identity)
-            .map_err(|error| error.to_string())?;
+    if let Some(state_root) = state_root {
+        state_root.persist(engine)?;
     }
+    Ok(())
+}
+
+fn append_new_cohort_records(
+    evidence: &mut EvidenceBundle,
+    engine: &LiveShadowEngine,
+    cursor: &mut usize,
+    observed_at_mono: Timestamp,
+) -> Result<(), Box<dyn Error>> {
+    let records = engine.cohort_indicator_records();
+    for indicator in records.get(*cursor..).unwrap_or_default() {
+        evidence.append_replay_event(
+            observed_at_mono,
+            ReplayPayload::CohortIndicatorSnapshot {
+                indicator: indicator.clone(),
+            },
+        )?;
+    }
+    *cursor = records.len();
+    Ok(())
+}
+
+fn append_new_technical_records(
+    evidence: &mut EvidenceBundle,
+    engine: &LiveShadowEngine,
+    cursor: &mut usize,
+) -> Result<(), Box<dyn Error>> {
+    let records = engine.technical_decision_records();
+    for decision in records.get(*cursor..).unwrap_or_default() {
+        evidence.append_replay_event(
+            decision.observed_at_mono,
+            ReplayPayload::TechnicalDecisionSnapshot {
+                decision: decision.clone(),
+            },
+        )?;
+    }
+    *cursor = records.len();
     Ok(())
 }
 
@@ -113,13 +168,34 @@ pub async fn run_qualification(options: QualificationOptions) -> Result<PathBuf,
     } else if options.duration_seconds < MINIMUM_QUALIFICATION_SECONDS {
         return Err("HL1K requires at least 86400 monotonic seconds".into());
     }
-    let config = CopyTradeConfig::from_path(&options.config_path)?;
+    let observer_state = ObserverCoreState::load_with_very_profitable_layer(
+        &options.config_path,
+        options.very_profitable_layer_path.as_ref(),
+    )?;
+    let config = observer_state.config().clone();
+    let very_profitable_layer = observer_state.very_profitable_layer().cloned();
     let scheduler_config = ReadOnlySchedulerConfig::from_path(&options.request_policy_path)?;
     let transport_policy: PublicTransportPolicy =
         serde_json::from_slice(&std::fs::read(&options.transport_policy_path)?)?;
     transport_policy
         .validate()
         .map_err(|error| format!("invalid transport policy: {error:?}"))?;
+    let active_freshness = transport_policy
+        .source_deadline_ms(SourceTier::Active)
+        .ok_or("active freshness overflow")?;
+    let inactive_freshness = transport_policy
+        .source_deadline_ms(SourceTier::Inactive)
+        .ok_or("inactive freshness overflow")?;
+    if config.global_risk.source_snapshot_max_age_ms != inactive_freshness
+        || scheduler_config.freshness.configured_max_age_ms != inactive_freshness
+    {
+        return Err("configured freshness must equal the maximum derived tier deadline".into());
+    }
+    let source_dispatch_plan = derive_source_dispatch_plan(
+        config.candidates.len(),
+        &scheduler_config,
+        &transport_policy,
+    )?;
     let manifest = load_release_manifest(&options.release_manifest_path)?;
     verify_isolation_report(&options.isolation_report_path)?;
     let production_manifest = manifest.qualification_stage == "PRODUCTION_RELEASE";
@@ -190,9 +266,18 @@ pub async fn run_qualification(options: QualificationOptions) -> Result<PathBuf,
         &header,
         &options.isolation_report_path,
     )?;
+    if let Some(layer_path) = &options.very_profitable_layer_path {
+        std::fs::copy(layer_path, output.join("very-profitable-layer.json"))?;
+        evidence.append_log(
+            false,
+            "very_profitable_layer=installed hyperdash_role=discovery_and_context hyperliquid_role=authoritative_state",
+        )?;
+    }
     evidence.append_replay_event(
         start,
         ReplayPayload::RunContext {
+            replay_chain_version: crate::replay::REPLAY_CHAIN_VERSION,
+            canonicalization: crate::replay::REPLAY_CANONICALIZATION.into(),
             binary_sha256: header.binary_sha256.clone(),
             configuration_sha256: header.configuration_sha256.clone(),
             risk_policy_sha256: header.risk_policy_sha256.clone(),
@@ -216,17 +301,20 @@ pub async fn run_qualification(options: QualificationOptions) -> Result<PathBuf,
     )?;
     let transport = HyperliquidPublicTransport::new(clock.clone(), transport_policy.clone())
         .map_err(|error| format!("transport: {error:?}"))?;
-    let active_freshness = transport_policy
-        .source_deadline_ms(SourceTier::Active)
-        .ok_or("active freshness overflow")?;
-    let inactive_freshness = transport_policy
-        .source_deadline_ms(SourceTier::Inactive)
-        .ok_or("inactive freshness overflow")?;
-    if config.global_risk.source_snapshot_max_age_ms != inactive_freshness
-        || scheduler_config.freshness.configured_max_age_ms != inactive_freshness
-    {
-        return Err("configured freshness must equal the maximum derived tier deadline".into());
-    }
+    evidence.write_summary("source-dispatch-plan.json", &source_dispatch_plan)?;
+    evidence.append_log(
+        false,
+        &format!(
+            "source_dispatch_plan=derived effective_candidates={} active={} inactive={} active_per_window={} inactive_per_window={} combined_per_window={} capacity_per_window={}",
+            source_dispatch_plan.effective_candidate_count,
+            source_dispatch_plan.active_candidate_count,
+            source_dispatch_plan.inactive_candidate_count,
+            source_dispatch_plan.active_dispatches_per_window,
+            source_dispatch_plan.inactive_dispatches_per_window,
+            source_dispatch_plan.combined_dispatches_per_window,
+            source_dispatch_plan.source_call_capacity_per_window,
+        ),
+    )?;
     let mut engine = LiveShadowEngine::new(
         config.clone(),
         manifest.binary_sha256.as_bytes(),
@@ -235,31 +323,44 @@ pub async fn run_qualification(options: QualificationOptions) -> Result<PathBuf,
         inactive_freshness,
     )
     .map_err(|error| error.to_string())?;
+    if let Some(layer) = very_profitable_layer {
+        engine
+            .install_very_profitable_layer(layer)
+            .map_err(|error| error.to_string())?;
+    }
+    let mut cohort_record_cursor = 0usize;
+    let mut technical_record_cursor = 0usize;
     let state_identity = UnsignedShadowStateIdentity {
         source_tree_sha256: manifest.source_tree_sha256.clone(),
         observer_binary_sha256: sha256_file(std::env::current_exe()?)?,
         configuration_sha256: manifest.configuration_sha256.clone(),
         risk_policy_sha256: manifest.risk_policy_sha256.clone(),
     };
-    let state_path = options
+    let mut state_root = options
         .state_root
         .as_ref()
-        .map(|root| root.join("unsigned-shadow-state.json"));
-    if let Some(path) = state_path.as_deref() {
-        if path.exists() {
-            engine
-                .restore_unsigned_state(path, &state_identity)
-                .map_err(|error| error.to_string())?;
-            evidence.append_log(
-                false,
-                "unsigned_shadow_state=restored identity_verified=true",
-            )?;
-        } else {
-            persist_unsigned_state(&mut engine, Some(path), &state_identity)?;
-            evidence.append_log(
-                false,
-                "unsigned_shadow_state=initialized identity_verified=true",
-            )?;
+        .map(|root| UnsignedStateRoot::acquire(root, &state_identity))
+        .transpose()?;
+    if let Some(state_root) = state_root.as_mut() {
+        match state_root.startup() {
+            StateRootStartup::Restore => {
+                let generation = state_root.restore(&mut engine)?;
+                evidence.append_log(
+                    false,
+                    &format!(
+                        "unsigned_shadow_state=restored identity_verified=true generation={generation}"
+                    ),
+                )?;
+            }
+            StateRootStartup::Initialize => {
+                let generation = state_root.initialize(&mut engine)?;
+                evidence.append_log(
+                    false,
+                    &format!(
+                        "unsigned_shadow_state=initialized identity_verified=true generation={generation}"
+                    ),
+                )?;
+            }
         }
     }
     if let Some(production) = &options.production {
@@ -278,7 +379,7 @@ pub async fn run_qualification(options: QualificationOptions) -> Result<PathBuf,
         .map(|(index, candidate)| {
             (
                 candidate.address.to_ascii_lowercase(),
-                if index < 100 {
+                if index < source_dispatch_plan.active_candidate_count {
                     SourceTier::Active
                 } else {
                     SourceTier::Inactive
@@ -286,7 +387,7 @@ pub async fn run_qualification(options: QualificationOptions) -> Result<PathBuf,
             )
         })
         .collect::<BTreeMap<_, _>>();
-    let mut source_due = phase_staggered_source_due(&config, start, 100)?;
+    let mut source_due = phase_staggered_source_due(&config, start, source_dispatch_plan)?;
     for (candidate, tier) in &candidate_tiers {
         engine.set_source_tier(candidate, *tier);
         evidence.append_replay_event(
@@ -322,7 +423,7 @@ pub async fn run_qualification(options: QualificationOptions) -> Result<PathBuf,
     if options.profitability_gate {
         engine.record_equity_boundary(start)?;
         evidence.append_replay_event(start, ReplayPayload::EquityBoundary)?;
-        persist_unsigned_state(&mut engine, state_path.as_deref(), &state_identity)?;
+        persist_unsigned_state(&mut engine, &mut state_root)?;
     }
     while clock.now_ms() < deadline {
         let now = clock.now_ms();
@@ -337,8 +438,11 @@ pub async fn run_qualification(options: QualificationOptions) -> Result<PathBuf,
                 .filter(|candidate| engine.latest_source_has_position(candidate))
                 .cloned()
                 .collect::<BTreeSet<_>>();
-            let next_tiers =
-                assign_source_tiers(&ordered_candidates, &candidates_with_positions, 100);
+            let next_tiers = assign_source_tiers(
+                &ordered_candidates,
+                &candidates_with_positions,
+                source_dispatch_plan.active_candidate_count,
+            );
             let promoted = next_tiers
                 .iter()
                 .filter(|(candidate, tier)| {
@@ -350,7 +454,12 @@ pub async fn run_qualification(options: QualificationOptions) -> Result<PathBuf,
             for (ordinal, candidate) in promoted.iter().enumerate() {
                 source_due.insert(
                     candidate.clone(),
-                    phase_deadline(now, 20_000, ordinal, promoted.len())?,
+                    phase_deadline(
+                        now,
+                        source_dispatch_plan.active_cadence_ms,
+                        ordinal,
+                        promoted.len(),
+                    )?,
                 );
             }
             for (candidate, tier) in &next_tiers {
@@ -373,8 +482,8 @@ pub async fn run_qualification(options: QualificationOptions) -> Result<PathBuf,
             if source_due[&id] <= now {
                 let tier = candidate_tiers[&id];
                 let interval = match tier {
-                    SourceTier::Active => 20_000,
-                    SourceTier::Inactive => 60_000,
+                    SourceTier::Active => source_dispatch_plan.active_cadence_ms,
+                    SourceTier::Inactive => source_dispatch_plan.inactive_cadence_ms,
                 };
                 enqueue(
                     &scheduler,
@@ -533,12 +642,19 @@ pub async fn run_qualification(options: QualificationOptions) -> Result<PathBuf,
                             options.production.as_ref(),
                         )
                         .await?;
+                        append_new_cohort_records(
+                            &mut evidence,
+                            &engine,
+                            &mut cohort_record_cursor,
+                            accepted_at,
+                        )?;
+                        append_new_technical_records(
+                            &mut evidence,
+                            &engine,
+                            &mut technical_record_cursor,
+                        )?;
                         if persist_after_ingest {
-                            persist_unsigned_state(
-                                &mut engine,
-                                state_path.as_deref(),
-                                &state_identity,
-                            )?;
+                            persist_unsigned_state(&mut engine, &mut state_root)?;
                         }
                     }
                 } else {
@@ -558,7 +674,9 @@ pub async fn run_qualification(options: QualificationOptions) -> Result<PathBuf,
                 .construct_next_decision(now)
                 .map_err(|e| e.to_string())?;
             dispatch_production_intents(&mut engine, options.production.as_ref()).await?;
-            persist_unsigned_state(&mut engine, state_path.as_deref(), &state_identity)?;
+            append_new_cohort_records(&mut evidence, &engine, &mut cohort_record_cursor, now)?;
+            append_new_technical_records(&mut evidence, &engine, &mut technical_record_cursor)?;
+            persist_unsigned_state(&mut engine, &mut state_root)?;
             decision_due = now + 20_000;
         }
         if (options.profitability_gate || options.micro_density_gate)
@@ -567,7 +685,7 @@ pub async fn run_qualification(options: QualificationOptions) -> Result<PathBuf,
             engine.record_equity_boundary(profitability_bucket_due)?;
             evidence
                 .append_replay_event(profitability_bucket_due, ReplayPayload::EquityBoundary)?;
-            persist_unsigned_state(&mut engine, state_path.as_deref(), &state_identity)?;
+            persist_unsigned_state(&mut engine, &mut state_root)?;
             profitability_bucket_due = profitability_bucket_due
                 .checked_add(300_000)
                 .ok_or("bucket deadline overflow")?;
@@ -618,7 +736,22 @@ pub async fn run_qualification(options: QualificationOptions) -> Result<PathBuf,
                 .persist_target_state(output.join("virtual-target-ledger.json"))
                 .map_err(|e| e.to_string())?;
             evidence.write_summary("shadow-actions.json", engine.executions())?;
-            evidence.write_summary("decision-plans.json", engine.plans())?;
+            evidence.write_summary(
+                "decision-plan-summary.json",
+                &engine.compact_decision_plan_summary(),
+            )?;
+            evidence.write_summary(
+                "cohort-indicator-records.json",
+                &engine.compact_cohort_decision_records(),
+            )?;
+            evidence.write_summary(
+                "cohort-decision-summary.json",
+                &engine.compact_cohort_decision_summary(),
+            )?;
+            evidence.write_summary(
+                "technical-decision-records.json",
+                engine.technical_decision_records(),
+            )?;
             evidence.write_summary(
                 "book-evaluation-events.json",
                 engine.book_evaluation_events(),
@@ -669,7 +802,14 @@ pub async fn run_qualification(options: QualificationOptions) -> Result<PathBuf,
                     .ingest(response, accepted_at)
                     .map_err(|e| e.to_string())?;
                 dispatch_production_intents(&mut engine, options.production.as_ref()).await?;
-                persist_unsigned_state(&mut engine, state_path.as_deref(), &state_identity)?;
+                append_new_cohort_records(
+                    &mut evidence,
+                    &engine,
+                    &mut cohort_record_cursor,
+                    accepted_at,
+                )?;
+                append_new_technical_records(&mut evidence, &engine, &mut technical_record_cursor)?;
+                persist_unsigned_state(&mut engine, &mut state_root)?;
             }
         } else {
             let _ = transport.take_accepted(&completed_request);
@@ -681,7 +821,7 @@ pub async fn run_qualification(options: QualificationOptions) -> Result<PathBuf,
             Some(last) if last < deadline => {
                 engine.record_equity_boundary(deadline)?;
                 evidence.append_replay_event(deadline, ReplayPayload::EquityBoundary)?;
-                persist_unsigned_state(&mut engine, state_path.as_deref(), &state_identity)?;
+                persist_unsigned_state(&mut engine, &mut state_root)?;
             }
             Some(_) => return Err("final equity boundary exceeds deadline".into()),
             None => return Err("initial equity boundary missing".into()),
@@ -694,7 +834,7 @@ pub async fn run_qualification(options: QualificationOptions) -> Result<PathBuf,
     engine
         .persist_target_state(output.join("virtual-target-ledger.json"))
         .map_err(|e| e.to_string())?;
-    persist_unsigned_state(&mut engine, state_path.as_deref(), &state_identity)?;
+    persist_unsigned_state(&mut engine, &mut state_root)?;
     let elapsed = (clock.now_ms() - start) / 1000;
     let chain = verify_checkpoint_chain(output.join("periodic-checkpoints.jsonl"))?;
     if std::fs::read_to_string(output.join("event-chain-head.txt"))?.trim() != chain {
@@ -747,7 +887,22 @@ pub async fn run_qualification(options: QualificationOptions) -> Result<PathBuf,
     evidence.write_summary("freshness-summary.json", m)?;
     evidence.write_summary("shadow-accounting-summary.json",&serde_json::json!({"executions":m.shadow_executions,"unreconciled":m.unreconciled_shadow_intents}))?;
     evidence.write_summary("shadow-actions.json", engine.executions())?;
-    evidence.write_summary("decision-plans.json", engine.plans())?;
+    evidence.write_summary(
+        "decision-plan-summary.json",
+        &engine.compact_decision_plan_summary(),
+    )?;
+    evidence.write_summary(
+        "cohort-indicator-records.json",
+        &engine.compact_cohort_decision_records(),
+    )?;
+    evidence.write_summary(
+        "cohort-decision-summary.json",
+        &engine.compact_cohort_decision_summary(),
+    )?;
+    evidence.write_summary(
+        "technical-decision-records.json",
+        engine.technical_decision_records(),
+    )?;
     evidence.write_summary(
         "book-evaluation-events.json",
         engine.book_evaluation_events(),
@@ -773,13 +928,11 @@ pub async fn run_qualification(options: QualificationOptions) -> Result<PathBuf,
         &serde_json::json!({"closed_portfolio_episodes":engine.ledger().portfolio_closed().len(),"closed_source_episodes":engine.ledger().total_source_closed()}),
     )?;
     evidence.write_terminal(&summary)?;
-    if interrupted {
-        return Err("HL1K interrupted; qualification clock reset".into());
-    }
     if options.transport_gate {
         let gate = evaluate_transport_gate(
             &output,
             &config,
+            source_dispatch_plan,
             &candidate_tiers,
             &engine,
             &scheduler.health(),
@@ -831,8 +984,16 @@ pub async fn run_qualification(options: QualificationOptions) -> Result<PathBuf,
                 return Err("short micro-density gate failed; diagnostic bundle preserved".into());
             }
         } else if !gate.passed {
+            if interrupted {
+                return Err(
+                    "four-hour profitability window interrupted; partial evidence retained".into(),
+                );
+            }
             return Err("four-hour profitability measurement gate failed; bundle retained".into());
         }
+    }
+    if interrupted {
+        return Err("HL1K interrupted; qualification clock reset".into());
     }
     println!(
         "hl1k_observation_complete=true provisional=true output={}",
@@ -881,6 +1042,96 @@ async fn dispatch_production_intents(
     Ok(())
 }
 
+fn derive_source_dispatch_plan(
+    candidate_count: usize,
+    scheduler: &ReadOnlySchedulerConfig,
+    transport: &PublicTransportPolicy,
+) -> Result<SourceDispatchPlan, Box<dyn Error>> {
+    if candidate_count == 0 {
+        return Err("effective source candidate universe must be nonempty".into());
+    }
+    let window_ms = scheduler.api.window_ms;
+    let active_cadence_ms = transport.active_source_interval_ms;
+    let inactive_cadence_ms = transport.inactive_source_interval_ms;
+    if window_ms % active_cadence_ms != 0 || window_ms % inactive_cadence_ms != 0 {
+        return Err("source cadences must divide the scheduler accounting window exactly".into());
+    }
+    let active_dispatches_per_candidate = window_ms / active_cadence_ms;
+    let inactive_dispatches_per_candidate = window_ms / inactive_cadence_ms;
+    if active_dispatches_per_candidate <= inactive_dispatches_per_candidate {
+        return Err("active source cadence must dispatch more often than inactive cadence".into());
+    }
+    let source_state_weight = scheduler
+        .api
+        .endpoint_weights
+        .get(&ReadRequestKind::SourceState)
+        .copied()
+        .ok_or("source-state endpoint weight missing")?;
+    if source_state_weight == 0 {
+        return Err("source-state endpoint weight must be positive".into());
+    }
+    let source_call_capacity_per_window =
+        u64::from(scheduler.api.source_polling_weight_per_window / source_state_weight);
+    let active_dispatch_target = u64::from(
+        scheduler
+            .api
+            .source_tier_dispatch_targets_per_window
+            .get(&SourceTier::Active)
+            .copied()
+            .ok_or("active source dispatch target missing")?,
+    );
+    let policy_active_capacity = active_dispatch_target
+        .checked_div(active_dispatches_per_candidate)
+        .ok_or("active source cadence must be positive")?;
+    let base_inactive_dispatches = u64::try_from(candidate_count)?
+        .checked_mul(inactive_dispatches_per_candidate)
+        .ok_or("inactive source demand overflow")?;
+    if base_inactive_dispatches > source_call_capacity_per_window {
+        return Err(format!(
+            "effective candidate count {candidate_count} cannot remain fresh: inactive source demand {base_inactive_dispatches} exceeds unchanged source-call capacity {source_call_capacity_per_window} per window"
+        )
+        .into());
+    }
+    let incremental_active_dispatches = active_dispatches_per_candidate
+        .checked_sub(inactive_dispatches_per_candidate)
+        .ok_or("active source dispatch increment underflow")?;
+    let budget_active_capacity = source_call_capacity_per_window
+        .checked_sub(base_inactive_dispatches)
+        .ok_or("source capacity underflow")?
+        .checked_div(incremental_active_dispatches)
+        .ok_or("active source dispatch increment must be positive")?;
+    let active_candidate_count =
+        candidate_count
+            .min(MAX_ACTIVE_SOURCE_CANDIDATES)
+            .min(usize::try_from(
+                policy_active_capacity.min(budget_active_capacity),
+            )?);
+    let inactive_candidate_count = candidate_count.saturating_sub(active_candidate_count);
+    let active_dispatches_per_window = u64::try_from(active_candidate_count)?
+        .checked_mul(active_dispatches_per_candidate)
+        .ok_or("active source demand overflow")?;
+    let inactive_dispatches_per_window = u64::try_from(inactive_candidate_count)?
+        .checked_mul(inactive_dispatches_per_candidate)
+        .ok_or("inactive source demand overflow")?;
+    let combined_dispatches_per_window = active_dispatches_per_window
+        .checked_add(inactive_dispatches_per_window)
+        .ok_or("combined source demand overflow")?;
+    if combined_dispatches_per_window > source_call_capacity_per_window {
+        return Err("derived source dispatch plan exceeds unchanged source budget".into());
+    }
+    Ok(SourceDispatchPlan {
+        effective_candidate_count: candidate_count,
+        active_candidate_count,
+        inactive_candidate_count,
+        active_cadence_ms,
+        inactive_cadence_ms,
+        source_call_capacity_per_window,
+        active_dispatches_per_window,
+        inactive_dispatches_per_window,
+        combined_dispatches_per_window,
+    })
+}
+
 fn assign_source_tiers(
     ordered_candidates: &[String],
     candidates_with_positions: &BTreeSet<String>,
@@ -916,19 +1167,26 @@ fn assign_source_tiers(
 fn phase_staggered_source_due(
     config: &CopyTradeConfig,
     start: u64,
-    active_capacity: usize,
+    plan: SourceDispatchPlan,
 ) -> Result<BTreeMap<String, u64>, Box<dyn Error>> {
-    let active_count = active_capacity.min(config.candidates.len());
-    let inactive_count = config.candidates.len().saturating_sub(active_count);
+    if config.candidates.len() != plan.effective_candidate_count {
+        return Err("source dispatch plan candidate cardinality mismatch".into());
+    }
+    let active_count = plan.active_candidate_count;
+    let inactive_count = plan.inactive_candidate_count;
     config
         .candidates
         .iter()
         .enumerate()
         .map(|(index, candidate)| {
             let (interval, ordinal, count) = if index < active_count {
-                (20_000, index, active_count)
+                (plan.active_cadence_ms, index, active_count)
             } else {
-                (60_000, index - active_count, inactive_count)
+                (
+                    plan.inactive_cadence_ms,
+                    index - active_count,
+                    inactive_count,
+                )
             };
             Ok((
                 candidate.address.to_ascii_lowercase(),
@@ -975,6 +1233,21 @@ fn next_cadence_deadline(
         .ok_or_else(|| "cadence deadline overflow".into())
 }
 
+fn required_dispatch_count(
+    candidate_count: usize,
+    elapsed_ms: u64,
+    cadence_ms: u64,
+) -> Result<u64, Box<dyn Error>> {
+    if cadence_ms == 0 {
+        return Err("source cadence must be positive".into());
+    }
+    let count = u128::from(u64::try_from(candidate_count)?)
+        .checked_mul(u128::from(elapsed_ms))
+        .and_then(|value| value.checked_div(u128::from(cadence_ms)))
+        .ok_or("required source dispatch arithmetic overflow")?;
+    Ok(count.try_into()?)
+}
+
 pub fn finalize_qualification(
     bundle: &Path,
     post_report: &Path,
@@ -1009,6 +1282,28 @@ pub fn finalize_qualification(
     {
         return Err("recorded configuration or policy hash mismatch".into());
     }
+    if let Some(identity) = &recorded_config.very_profitable_layer {
+        let artifact_path = bundle.join("very-profitable-layer.json");
+        let artifact = VeryProfitableLayerArtifact::from_path(&artifact_path)
+            .map_err(|error| format!("invalid retained cohort artifact: {error}"))?;
+        if artifact.canonical_sha256()? != identity.artifact_sha256
+            || artifact.membership.observed_at_ms != identity.cohort_snapshot_timestamp_ms
+        {
+            return Err("retained cohort artifact does not match the frozen identity".into());
+        }
+        let indicators: Vec<copytrade_core::cohort::CohortIndicatorRecord> =
+            serde_json::from_slice(&std::fs::read(
+                bundle.join("cohort-indicator-records.json"),
+            )?)?;
+        if indicators.iter().any(|indicator| {
+            indicator.cohort_snapshot_timestamp_ms != identity.cohort_snapshot_timestamp_ms
+                || indicator.membership_set_hash != identity.membership_set_hash
+        }) {
+            return Err("cohort indicator evidence does not match the frozen membership".into());
+        }
+    } else if bundle.join("very-profitable-layer.json").exists() {
+        return Err("unbound cohort artifact is present in the qualification bundle".into());
+    }
     let chain = verify_checkpoint_chain(bundle.join("periodic-checkpoints.jsonl"))?;
     if std::fs::read_to_string(bundle.join("event-chain-head.txt"))?.trim() != chain {
         return Err("event chain mismatch".into());
@@ -1020,6 +1315,7 @@ pub fn finalize_qualification(
     s.isolation_post_run_passed = true;
     s.evidence_verified = true;
     s.secondary_reason = None;
+    let mut incomplete_window = s.monotonic_elapsed_seconds < h.expected_minimum_duration_seconds;
     s.passed = s.unsigned
         && s.planned_only
         && !s.submission_capable
@@ -1060,6 +1356,10 @@ pub fn finalize_qualification(
             .get("sharpe_target_proven")
             .and_then(serde_json::Value::as_bool)
             == Some(true);
+        incomplete_window |= gate
+            .get("five_minute_bucket_count")
+            .and_then(serde_json::Value::as_u64)
+            != Some(48);
         s.passed = s.passed
             && s.profitability_gate_passed
             && gate
@@ -1081,7 +1381,9 @@ pub fn finalize_qualification(
         s.sharpe_target_proven = false;
         s.passed = s.passed && micro_passed;
     }
-    s.failure_reason = if s.passed {
+    s.failure_reason = if incomplete_window {
+        Some("incomplete_interrupted_window".into())
+    } else if s.passed {
         None
     } else if h.stage == "SU5R-MICRO-DENSITY" {
         Some("micro_density_gate_failed".into())
@@ -1220,6 +1522,12 @@ pub fn parse_duration_seconds(value: &str) -> Result<u64, Box<dyn Error>> {
 struct TransportGateSummary {
     passed: bool,
     all_candidates_accepted: bool,
+    effective_candidate_count: usize,
+    active_candidate_count: usize,
+    inactive_candidate_count: usize,
+    active_cadence_ms: u64,
+    inactive_cadence_ms: u64,
+    source_call_capacity_per_window: u64,
     active_dispatch_per_minute: f64,
     inactive_dispatch_per_minute: f64,
     combined_dispatch_per_minute: f64,
@@ -1396,12 +1704,26 @@ fn evaluate_profitability_gate(
 fn evaluate_transport_gate(
     bundle: &Path,
     config: &CopyTradeConfig,
+    source_dispatch_plan: SourceDispatchPlan,
     tiers: &BTreeMap<String, SourceTier>,
     engine: &LiveShadowEngine,
     health: &copytrade_core::scheduler::SchedulerHealth,
     counters: &Counters,
     rate_limited: u64,
 ) -> Result<TransportGateSummary, Box<dyn Error>> {
+    if config.candidates.len() != source_dispatch_plan.effective_candidate_count {
+        return Err("transport gate source dispatch plan cardinality mismatch".into());
+    }
+    let active_tier_count = tiers
+        .values()
+        .filter(|tier| **tier == SourceTier::Active)
+        .count();
+    let inactive_tier_count = tiers
+        .values()
+        .filter(|tier| **tier == SourceTier::Inactive)
+        .count();
+    let tier_cardinality_matches = active_tier_count == source_dispatch_plan.active_candidate_count
+        && inactive_tier_count == source_dispatch_plan.inactive_candidate_count;
     let lines = std::fs::read_to_string(bundle.join("periodic-checkpoints.jsonl"))?;
     let checkpoints = lines
         .lines()
@@ -1432,11 +1754,17 @@ fn evaluate_transport_gate(
         .payload
         .monotonic_elapsed_ms
         .saturating_sub(first.payload.monotonic_elapsed_ms);
-    let required_count = |per_minute: u64| -> u64 {
-        (u128::from(per_minute) * u128::from(elapsed_ms) / 60_000_u128) as u64
-    };
-    let required_active = required_count(300);
-    let required_inactive = required_count(69);
+    let required_active = required_dispatch_count(
+        source_dispatch_plan.active_candidate_count,
+        elapsed_ms,
+        source_dispatch_plan.active_cadence_ms,
+    )?;
+    let required_inactive = required_dispatch_count(
+        source_dispatch_plan.inactive_candidate_count,
+        elapsed_ms,
+        source_dispatch_plan.inactive_cadence_ms,
+    )?;
+    let required_combined = required_active.saturating_add(required_inactive);
     let all = config
         .candidates
         .iter()
@@ -1455,10 +1783,11 @@ fn evaluate_transport_gate(
         .copied()
         .max()
         .unwrap_or(0);
-    let passed = all
+    let passed = tier_cardinality_matches
+        && all
         && active_count >= required_active
         && inactive_count >= required_inactive
-        && active_count.saturating_add(inactive_count) >= required_count(369)
+        && active_count.saturating_add(inactive_count) >= required_combined
         && fresh == config.candidates.len()
         && health.pending <= health.queue_capacity.min(32)
         && health.in_flight <= counters.maximum_in_flight
@@ -1466,10 +1795,15 @@ fn evaluate_transport_gate(
         && rate_limited == 0
         && expired == 0
         && oldest < 5_000;
-    let _ = tiers;
     Ok(TransportGateSummary {
         passed,
         all_candidates_accepted: all,
+        effective_candidate_count: source_dispatch_plan.effective_candidate_count,
+        active_candidate_count: source_dispatch_plan.active_candidate_count,
+        inactive_candidate_count: source_dispatch_plan.inactive_candidate_count,
+        active_cadence_ms: source_dispatch_plan.active_cadence_ms,
+        inactive_cadence_ms: source_dispatch_plan.inactive_cadence_ms,
+        source_call_capacity_per_window: source_dispatch_plan.source_call_capacity_per_window,
         active_dispatch_per_minute: active,
         inactive_dispatch_per_minute: inactive,
         combined_dispatch_per_minute: active + inactive,
@@ -1490,6 +1824,18 @@ fn evaluate_transport_gate(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn source_policies() -> (ReadOnlySchedulerConfig, PublicTransportPolicy) {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let scheduler =
+            ReadOnlySchedulerConfig::from_path(root.join("config/read-api-policy.json")).unwrap();
+        let transport = serde_json::from_slice(
+            &std::fs::read(root.join("config/public-mainnet-transport.json")).unwrap(),
+        )
+        .unwrap();
+        (scheduler, transport)
+    }
+
     #[test]
     fn duration_is_exact() {
         assert_eq!(parse_duration_seconds("24h").unwrap(), 86_400);
@@ -1543,6 +1889,109 @@ mod tests {
     }
 
     #[test]
+    fn source_dispatch_plan_derives_gate_counts_from_effective_candidates() {
+        let (scheduler, transport) = source_policies();
+        let original = derive_source_dispatch_plan(169, &scheduler, &transport).unwrap();
+        assert_eq!(original.active_candidate_count, 100);
+        assert_eq!(original.inactive_candidate_count, 69);
+        assert_eq!(original.active_dispatches_per_window, 300);
+        assert_eq!(original.inactive_dispatches_per_window, 69);
+        assert_eq!(original.combined_dispatches_per_window, 369);
+        assert_eq!(original.source_call_capacity_per_window, 375);
+
+        let smaller = derive_source_dispatch_plan(150, &scheduler, &transport).unwrap();
+        assert_eq!(smaller.active_candidate_count, 100);
+        assert_eq!(smaller.inactive_candidate_count, 50);
+        assert_eq!(smaller.active_dispatches_per_window, 300);
+        assert_eq!(smaller.inactive_dispatches_per_window, 50);
+        assert_eq!(smaller.combined_dispatches_per_window, 350);
+    }
+
+    #[test]
+    fn source_dispatch_plan_trades_active_slots_for_expanded_fresh_coverage() {
+        let (scheduler, transport) = source_policies();
+        let full_active = derive_source_dispatch_plan(175, &scheduler, &transport).unwrap();
+        assert_eq!(full_active.active_candidate_count, 100);
+        assert_eq!(full_active.inactive_candidate_count, 75);
+        assert_eq!(full_active.combined_dispatches_per_window, 375);
+
+        let expanded = derive_source_dispatch_plan(200, &scheduler, &transport).unwrap();
+        assert_eq!(expanded.active_candidate_count, 87);
+        assert_eq!(expanded.inactive_candidate_count, 113);
+        assert_eq!(expanded.active_dispatches_per_window, 261);
+        assert_eq!(expanded.inactive_dispatches_per_window, 113);
+        assert_eq!(expanded.combined_dispatches_per_window, 374);
+        assert_eq!(expanded.active_cadence_ms, 20_000);
+        assert_eq!(expanded.inactive_cadence_ms, 60_000);
+    }
+
+    #[test]
+    fn source_dispatch_plan_fails_closed_beyond_unchanged_source_budget() {
+        let (scheduler, transport) = source_policies();
+        let boundary = derive_source_dispatch_plan(375, &scheduler, &transport).unwrap();
+        assert_eq!(boundary.active_candidate_count, 0);
+        assert_eq!(boundary.inactive_candidate_count, 375);
+        assert_eq!(boundary.combined_dispatches_per_window, 375);
+        assert!(derive_source_dispatch_plan(376, &scheduler, &transport).is_err());
+    }
+
+    #[test]
+    fn source_dispatch_plan_uses_policy_weight_capacity() {
+        let (mut scheduler, transport) = source_policies();
+        scheduler
+            .api
+            .endpoint_weights
+            .insert(ReadRequestKind::SourceState, 3);
+        let plan = derive_source_dispatch_plan(169, &scheduler, &transport).unwrap();
+        assert_eq!(plan.source_call_capacity_per_window, 250);
+        assert_eq!(plan.active_candidate_count, 40);
+        assert_eq!(plan.inactive_candidate_count, 129);
+        assert_eq!(plan.combined_dispatches_per_window, 249);
+    }
+
+    #[test]
+    fn transport_gate_dispatch_requirements_follow_the_derived_plan() {
+        let (scheduler, transport) = source_policies();
+        let elapsed_ms = 8 * 60_000;
+        let original = derive_source_dispatch_plan(169, &scheduler, &transport).unwrap();
+        assert_eq!(
+            required_dispatch_count(
+                original.active_candidate_count,
+                elapsed_ms,
+                original.active_cadence_ms,
+            )
+            .unwrap(),
+            2_400
+        );
+        assert_eq!(
+            required_dispatch_count(
+                original.inactive_candidate_count,
+                elapsed_ms,
+                original.inactive_cadence_ms,
+            )
+            .unwrap(),
+            552
+        );
+
+        let expanded = derive_source_dispatch_plan(200, &scheduler, &transport).unwrap();
+        let required_active = required_dispatch_count(
+            expanded.active_candidate_count,
+            elapsed_ms,
+            expanded.active_cadence_ms,
+        )
+        .unwrap();
+        let required_inactive = required_dispatch_count(
+            expanded.inactive_candidate_count,
+            elapsed_ms,
+            expanded.inactive_cadence_ms,
+        )
+        .unwrap();
+        assert_eq!(required_active, 2_088);
+        assert_eq!(required_inactive, 904);
+        assert_eq!(required_active + required_inactive, 2_992);
+    }
+
+    #[test]
     fn cadence_deadlines_do_not_drift_with_loop_latency() {
         assert_eq!(next_cadence_deadline(0, 37, 20_000).unwrap(), 20_000);
         assert_eq!(
@@ -1563,3 +2012,4 @@ mod tests {
         assert!(phase_deadline(0, 20_000, 0, 0).is_err());
     }
 }
+use crate::cohort_layer::VeryProfitableLayerArtifact;

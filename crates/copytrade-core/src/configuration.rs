@@ -1,6 +1,9 @@
+use crate::cohort::{MembershipCompleteness, WalletQualityPolicy, VERY_PROFITABLE_COHORT_ID};
 use crate::technical::TechnicalStrategyConfig;
+use rust_decimal::prelude::FromPrimitive;
+use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::error::Error;
 use std::fmt::{Display, Formatter};
 use std::fs;
@@ -84,6 +87,17 @@ pub struct CopyTradeConfig {
     pub performance: PerformanceConfig,
     #[serde(default)]
     pub technical: TechnicalStrategyConfig,
+    /// Runtime-derived identity for an installed discovery snapshot. The
+    /// artifact path is deliberately excluded; its content hash and immutable
+    /// membership identity are included in the strategy/configuration hash.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub very_profitable_layer: Option<VeryProfitableLayerIdentity>,
+    /// High-density source wallets retained as flow context even when the
+    /// ordinary quality gate rejects them. They may contribute only when an
+    /// independently active technical target agrees with their direction.
+    /// The value records cohort provenance without creating duplicate votes.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub technical_gated_high_density_wallets: BTreeMap<String, BTreeSet<String>>,
     pub candidates: Vec<TraderCandidate>,
 }
 
@@ -105,6 +119,16 @@ impl CopyTradeConfig {
         self.technical.validate().map_err(|error| {
             ConfigError::new(format!("invalid technical configuration: {error:?}"))
         })?;
+        if let Some(identity) = &self.very_profitable_layer {
+            identity.validate()?;
+            if (self.technical.source_budget_fraction - 0.35).abs() > 1e-12
+                || (self.technical.technical_budget_fraction - 0.65).abs() > 1e-12
+            {
+                return Err(ConfigError::new(
+                    "very_profitable SU6R1 requires the frozen 35% source / 65% technical split",
+                ));
+            }
+        }
         self.validate_numeric_fields()?;
         if self.candidates.is_empty() || self.candidates.iter().all(|candidate| !candidate.enabled)
         {
@@ -124,7 +148,26 @@ impl CopyTradeConfig {
                 )));
             }
         }
+        for (address, cohorts) in &self.technical_gated_high_density_wallets {
+            let normalized = address.to_ascii_lowercase();
+            if !valid_hyperliquid_address(address)
+                || !addresses.contains(&normalized)
+                || cohorts.is_empty()
+                || cohorts.iter().any(|cohort| {
+                    cohort != "extremely_profitable" && cohort != VERY_PROFITABLE_COHORT_ID
+                })
+            {
+                return Err(ConfigError::new(format!(
+                    "invalid technical-gated high-density wallet metadata: {address}"
+                )));
+            }
+        }
         Ok(())
+    }
+
+    pub fn is_technical_gated_high_density(&self, address: &str) -> bool {
+        self.technical_gated_high_density_wallets
+            .contains_key(&address.to_ascii_lowercase())
     }
 
     pub fn deterministic_fingerprint(&self) -> Result<String, ConfigError> {
@@ -135,6 +178,50 @@ impl CopyTradeConfig {
             hash = hash.wrapping_mul(0x100000001b3);
         }
         Ok(format!("fnv1a64:{hash:016x}"))
+    }
+
+    /// Projects the already-approved wallet cutoffs into the cohort filter.
+    /// No cohort-specific thresholds are introduced here.
+    pub fn cohort_wallet_quality_policy(&self) -> Result<WalletQualityPolicy, ConfigError> {
+        let maximum_recent_activity_age_ms = u64::try_from(
+            self.prune_inactive_trader_hours
+                .checked_mul(60 * 60 * 1_000)
+                .ok_or_else(|| ConfigError::new("cohort activity horizon overflow"))?,
+        )
+        .map_err(|_| ConfigError::new("cohort activity horizon must be positive"))?;
+        let decimal = |name: &str, value: f64| {
+            Decimal::from_f64(value)
+                .ok_or_else(|| ConfigError::new(format!("{name} is not representable")))
+        };
+        let policy = WalletQualityPolicy {
+            maximum_recent_activity_age_ms,
+            minimum_closed_trades: self.min_closed_trades,
+            minimum_realized_pnl_usd: decimal("minimum realized pnl", self.min_closed_pnl_usd)?,
+            minimum_annualized_sharpe: decimal(
+                "minimum annualized sharpe",
+                self.trader_sharpe_floor,
+            )?,
+            target_annualized_sharpe: decimal("target annualized sharpe", self.sharpe_target)?,
+            minimum_win_rate_pct: decimal("minimum win rate", self.min_win_rate_pct)?,
+            maximum_drawdown_pct: decimal(
+                "maximum account drawdown",
+                self.max_account_drawdown_pct,
+            )?,
+            minimum_account_equity_usd: Decimal::ZERO,
+            maximum_observed_leverage: decimal(
+                "maximum observed leverage",
+                self.max_total_leverage,
+            )?,
+            maximum_asset_concentration_pct: decimal(
+                "maximum asset concentration",
+                self.max_asset_notional_pct,
+            )?,
+            confidence_decay_lambda: self.confidence_decay_lambda,
+        };
+        policy
+            .validate()
+            .map_err(|_| ConfigError::new("approved cohort quality policy is invalid"))?;
+        Ok(policy)
     }
 
     fn validate_numeric_fields(&self) -> Result<(), ConfigError> {
@@ -235,6 +322,47 @@ impl CopyTradeConfig {
         }
         Ok(())
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct VeryProfitableLayerIdentity {
+    pub cohort_id: String,
+    pub cohort_snapshot_timestamp_ms: u64,
+    pub membership_completeness: MembershipCompleteness,
+    pub reported_member_count: usize,
+    pub captured_member_count: usize,
+    pub membership_set_hash: String,
+    pub artifact_sha256: String,
+}
+
+impl VeryProfitableLayerIdentity {
+    fn validate(&self) -> Result<(), ConfigError> {
+        if self.cohort_id != VERY_PROFITABLE_COHORT_ID
+            || self.cohort_snapshot_timestamp_ms == 0
+            || self.captured_member_count == 0
+            || self.reported_member_count < self.captured_member_count
+            || match self.membership_completeness {
+                MembershipCompleteness::Complete => {
+                    self.reported_member_count != self.captured_member_count
+                }
+                MembershipCompleteness::Partial => {
+                    self.reported_member_count <= self.captured_member_count
+                }
+            }
+            || !valid_sha256_hex(&self.membership_set_hash)
+            || !valid_sha256_hex(&self.artifact_sha256)
+        {
+            return Err(ConfigError::new(
+                "very_profitable layer identity is malformed",
+            ));
+        }
+        Ok(())
+    }
+}
+
+fn valid_sha256_hex(value: &str) -> bool {
+    value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit())
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -434,6 +562,51 @@ mod tests {
             config.deterministic_fingerprint().unwrap(),
             config.clone().deterministic_fingerprint().unwrap()
         );
+    }
+
+    #[test]
+    fn cohort_policy_reuses_only_approved_wallet_cutoffs() {
+        let config = production_config();
+        let policy = config.cohort_wallet_quality_policy().unwrap();
+        assert_eq!(policy.minimum_closed_trades, config.min_closed_trades);
+        assert_eq!(
+            policy.minimum_win_rate_pct,
+            Decimal::from_f64(config.min_win_rate_pct).unwrap()
+        );
+        assert_eq!(
+            policy.minimum_annualized_sharpe,
+            Decimal::from_f64(config.trader_sharpe_floor).unwrap()
+        );
+        assert_eq!(
+            policy.maximum_drawdown_pct,
+            Decimal::from_f64(config.max_account_drawdown_pct).unwrap()
+        );
+        assert_eq!(
+            policy.maximum_observed_leverage,
+            Decimal::from_f64(config.max_total_leverage).unwrap()
+        );
+        assert_eq!(
+            policy.maximum_asset_concentration_pct,
+            Decimal::from_f64(config.max_asset_notional_pct).unwrap()
+        );
+    }
+
+    #[test]
+    fn technical_gated_high_density_metadata_must_reference_a_candidate() {
+        let mut config = production_config();
+        let address = config.candidates[0].address.to_ascii_lowercase();
+        config.technical_gated_high_density_wallets.insert(
+            address,
+            ["extremely_profitable".to_string()].into_iter().collect(),
+        );
+        assert!(config.validate_production().is_ok());
+        config.technical_gated_high_density_wallets.insert(
+            "0x0000000000000000000000000000000000000001".into(),
+            [VERY_PROFITABLE_COHORT_ID.to_string()]
+                .into_iter()
+                .collect(),
+        );
+        assert!(config.validate_production().is_err());
     }
 
     #[test]

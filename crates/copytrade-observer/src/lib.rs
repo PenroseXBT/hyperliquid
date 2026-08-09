@@ -1,5 +1,6 @@
 #![forbid(unsafe_code)]
 
+pub mod cohort_layer;
 pub mod ingestion;
 pub mod ipc_client;
 pub mod live_shadow;
@@ -8,10 +9,13 @@ pub mod profitability;
 pub mod public_mainnet;
 pub mod qualification;
 pub mod qualification_evidence;
+pub mod railway_aggregate;
 // The legacy observer-side reconciliation journal is intentionally not part of
 // production. The signer owns the sole authoritative fill/funding ledger.
 pub mod replay;
+pub mod state_root;
 
+use cohort_layer::{PreparedVeryProfitableLayer, VeryProfitableLayerArtifact};
 use copytrade_core::CopyTradeConfig;
 use std::error::Error;
 use std::fmt::{Display, Formatter};
@@ -65,11 +69,34 @@ impl Display for ObserverBuildManifest {
 pub struct ObserverCoreState {
     config: CopyTradeConfig,
     build_manifest: ObserverBuildManifest,
+    very_profitable_layer: Option<PreparedVeryProfitableLayer>,
 }
 
 impl ObserverCoreState {
     pub fn load(config_path: impl AsRef<Path>) -> Result<Self, Box<dyn Error>> {
-        let config = CopyTradeConfig::from_path(config_path)?;
+        Self::load_with_very_profitable_layer(config_path, None::<&Path>)
+    }
+
+    pub fn load_with_very_profitable_layer(
+        config_path: impl AsRef<Path>,
+        layer_path: Option<impl AsRef<Path>>,
+    ) -> Result<Self, Box<dyn Error>> {
+        let mut config = CopyTradeConfig::from_path(config_path)?;
+        let very_profitable_layer = match layer_path {
+            Some(path) => {
+                let artifact = VeryProfitableLayerArtifact::from_path(path)?;
+                let prepared = PreparedVeryProfitableLayer::prepare(&artifact, &config)?;
+                prepared.merge_candidates(&mut config)?;
+                Some(prepared)
+            }
+            None if config.very_profitable_layer.is_some() => {
+                return Err(
+                    "configuration binds a very_profitable layer but no artifact was supplied"
+                        .into(),
+                );
+            }
+            None => None,
+        };
         let build_manifest = ObserverBuildManifest {
             architecture_version: OBSERVER_ARCHITECTURE_VERSION,
             package_name: env!("CARGO_PKG_NAME"),
@@ -81,6 +108,7 @@ impl ObserverCoreState {
         Ok(Self {
             config,
             build_manifest,
+            very_profitable_layer,
         })
     }
 
@@ -90,6 +118,10 @@ impl ObserverCoreState {
 
     pub fn build_manifest(&self) -> &ObserverBuildManifest {
         &self.build_manifest
+    }
+
+    pub fn very_profitable_layer(&self) -> Option<&PreparedVeryProfitableLayer> {
+        self.very_profitable_layer.as_ref()
     }
 }
 

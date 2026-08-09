@@ -3,3 +3,21 @@
 config/agent.env
 config/ledger.json
 config/secrets/
+
+# Generated data, logs, text output, and checksums
+*.json
+*.log
+*.lock
+*.txt
+*.sha256
+fixtures/railway-window1-closed-candle.json
+fixtures/railway-window1-first-accounting-divergence.json
+fixtures/su6r1-r4-aave-crossing-accounting-failure.json
+fixtures/su6r1-r6-eigen-source-signal-lifecycles.json
+fixtures/su6r1-r2-first-replay-hash-mismatch.jsonl
+local-diagnostic-evidence/su6r1-r5/aggregate/aggregate/windows.tsv
+local-diagnostic-evidence/su6r1-r5/evidence/archives/archives/1786228790624-314-98ec5854531c.tar.gz
+local-diagnostic-evidence/su6r1-r5/evidence/diagnostic-journals/diagnostic-journals/failed-1786228790624-314-98ec5854531c.replay-events.jsonl.gz
+local-diagnostic-evidence/su6r1-r5/state/state/.observer-state.lock
+local-diagnostic-evidence/su6r1-r5/state/state/unsigned-observer-state.msgpack
+Cargo.lock

@@ -1,4 +1,6 @@
-use crate::replay::{derive_replay_event_hash, replay_hash_hex, ReplayEvent, ReplayPayload};
+use crate::replay::{
+    derive_replay_event_hash_v2, replay_event_preimage_v2, replay_hash_hex, ReplayPayload,
+};
 use copytrade_core::release::ReleaseManifest;
 use copytrade_core::scheduler::{ReadRequestKind, SourceTier};
 use serde::{Deserialize, Serialize};
@@ -269,21 +271,22 @@ impl EvidenceBundle {
         observed_at_mono: u64,
         payload: ReplayPayload,
     ) -> Result<(), EvidenceError> {
-        let current = derive_replay_event_hash(
-            self.replay_chain_head,
+        let previous_hash = replay_hash_hex(self.replay_chain_head);
+        let payload = serde_json::to_value(payload)
+            .map_err(|error| EvidenceError::Serialize(error.to_string()))?;
+        let mut persisted = replay_event_preimage_v2(
             self.next_replay_sequence,
             observed_at_mono,
-            &payload,
-        )
-        .map_err(|error| EvidenceError::Serialize(error.to_string()))?;
-        let event = ReplayEvent {
-            sequence: self.next_replay_sequence,
-            observed_at_mono,
             payload,
-            previous_hash: replay_hash_hex(self.replay_chain_head),
-            event_hash: replay_hash_hex(current),
-        };
-        serde_json::to_writer(&mut self.replay_events, &event)
+            previous_hash,
+        );
+        let current = derive_replay_event_hash_v2(&persisted)
+            .map_err(|error| EvidenceError::Serialize(error.to_string()))?;
+        persisted
+            .as_object_mut()
+            .ok_or(EvidenceError::InvalidChain)?
+            .insert("event_hash".into(), replay_hash_hex(current).into());
+        serde_json::to_writer(&mut self.replay_events, &persisted)
             .map_err(|error| EvidenceError::Serialize(error.to_string()))?;
         self.replay_events
             .write_all(b"\n")
@@ -429,5 +432,41 @@ mod tests {
         std::fs::write(&path, text).unwrap();
         assert!(verify_checkpoint_chain(&path).is_err());
         std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn v2_hashes_stored_json_without_typed_round_trip() {
+        let raw: serde_json::Value = serde_json::from_str(
+            include_str!("../../../fixtures/su6r1-r2-first-replay-hash-mismatch.jsonl")
+                .lines()
+                .nth(1)
+                .unwrap(),
+        )
+        .unwrap();
+        let payload = raw["payload"].clone();
+        assert_eq!(payload["indicator"]["cohort_score"], "-0");
+        let mut persisted = replay_event_preimage_v2(0, 51_874, payload, replay_hash_hex([0; 32]));
+        let expected = replay_hash_hex(derive_replay_event_hash_v2(&persisted).unwrap());
+        persisted
+            .as_object_mut()
+            .unwrap()
+            .insert("event_hash".into(), expected.clone().into());
+
+        let typed: crate::replay::ReplayEvent = serde_json::from_value(persisted.clone()).unwrap();
+        let ReplayPayload::CohortIndicatorSnapshot { indicator } = typed.payload else {
+            panic!("semantic decode changed event type");
+        };
+        assert_eq!(indicator.cohort_score.to_string(), "0");
+
+        let stored = persisted
+            .as_object_mut()
+            .unwrap()
+            .remove("event_hash")
+            .unwrap();
+        assert_eq!(stored, expected);
+        assert_eq!(
+            replay_hash_hex(derive_replay_event_hash_v2(&persisted).unwrap()),
+            expected
+        );
     }
 }

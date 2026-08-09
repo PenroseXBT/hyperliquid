@@ -70,7 +70,19 @@ pub struct ClosedCandle {
 
 impl ClosedCandle {
     pub fn payload_hash(&self) -> [u8; 32] {
-        let bytes = serde_json::to_vec(self).expect("closed candle is serializable");
+        let bytes = serde_json::to_vec(&(
+            &self.asset,
+            self.interval,
+            self.open_time_ms,
+            self.close_time_ms,
+            self.open.normalize(),
+            self.high.normalize(),
+            self.low.normalize(),
+            self.close.normalize(),
+            self.base_volume.normalize(),
+            self.trade_count,
+        ))
+        .expect("closed candle is serializable");
         Sha256::digest(bytes).into()
     }
 
@@ -118,6 +130,7 @@ impl MarketRegime {
 #[serde(rename_all = "snake_case")]
 pub enum SignalArchetype {
     TrendPullback,
+    RangeMeanReversion,
     RegimeBreakout,
 }
 
@@ -125,6 +138,7 @@ impl SignalArchetype {
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::TrendPullback => "trend_pullback",
+            Self::RangeMeanReversion => "range_mean_reversion",
             Self::RegimeBreakout => "regime_breakout",
         }
     }
@@ -308,10 +322,29 @@ pub enum CandleAcceptance {
     Duplicate,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CandleFieldDifference {
+    pub field: String,
+    pub accepted: String,
+    pub conflicting: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CandleConflict {
+    pub asset: String,
+    pub interval: CandleInterval,
+    pub open_time_ms: u64,
+    pub close_time_ms: u64,
+    pub accepted_payload_sha256: String,
+    pub conflicting_payload_sha256: String,
+    pub field_differences: Vec<CandleFieldDifference>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TechnicalError {
     InvalidCandle,
-    ConflictingCandle,
+    ConflictingCandle(CandleConflict),
+    NonMonotonicCandle,
     InvalidConfiguration,
     InvalidCost,
     Arithmetic,
@@ -322,7 +355,6 @@ struct CandleIdentity {
     interval: CandleInterval,
     open_time_ms: u64,
     close_time_ms: u64,
-    payload_hash: [u8; 32],
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -339,10 +371,28 @@ struct AssetCandles {
     current_score: Decimal,
 }
 
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TechnicalFunnel {
+    pub closed_candles_accepted: u64,
+    pub identical_candle_duplicates: u64,
+    pub conflicting_candles: u64,
+    pub evaluations: u64,
+    pub indicators_ready: u64,
+    pub regime_classifications: u64,
+    pub scores_crossing_entry_threshold: u64,
+    pub primary_trigger_candidates: u64,
+    pub secondary_trigger_confirmations: u64,
+    pub trigger_confirmations: u64,
+    pub nonzero_targets_before_cost: u64,
+    pub targets_surviving_cost_admission: u64,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TechnicalEngine {
     config: TechnicalStrategyConfig,
     assets: BTreeMap<String, AssetCandles>,
+    #[serde(default)]
+    funnel: TechnicalFunnel,
 }
 
 impl TechnicalEngine {
@@ -351,6 +401,7 @@ impl TechnicalEngine {
         Ok(Self {
             config,
             assets: BTreeMap::new(),
+            funnel: TechnicalFunnel::default(),
         })
     }
 
@@ -367,31 +418,48 @@ impl TechnicalEngine {
             interval: candle.interval,
             open_time_ms: candle.open_time_ms,
             close_time_ms: candle.close_time_ms,
-            payload_hash: candle.payload_hash(),
         };
         let asset = self.assets.entry(candle.asset.clone()).or_default();
         if asset.accepted.contains(&identity) {
-            return Ok(CandleAcceptance::Duplicate);
-        }
-        if asset.accepted.iter().any(|existing| {
-            existing.interval == identity.interval
-                && existing.open_time_ms == identity.open_time_ms
-                && existing.close_time_ms == identity.close_time_ms
-        }) {
-            return Err(TechnicalError::ConflictingCandle);
+            let accepted = asset
+                .intervals
+                .get(&candle.interval)
+                .and_then(|candles| {
+                    candles.iter().find(|accepted| {
+                        accepted.open_time_ms == candle.open_time_ms
+                            && accepted.close_time_ms == candle.close_time_ms
+                    })
+                })
+                .expect("accepted candle identity must retain its canonical payload");
+            if accepted == &candle {
+                self.funnel.identical_candle_duplicates =
+                    self.funnel.identical_candle_duplicates.saturating_add(1);
+                return Ok(CandleAcceptance::Duplicate);
+            }
+            self.funnel.conflicting_candles = self.funnel.conflicting_candles.saturating_add(1);
+            return Err(TechnicalError::ConflictingCandle(candle_conflict(
+                accepted, &candle,
+            )));
         }
         let candles = asset.intervals.entry(candle.interval).or_default();
         if candles
             .back()
             .is_some_and(|last| candle.open_time_ms <= last.open_time_ms)
         {
-            return Err(TechnicalError::ConflictingCandle);
+            return Err(TechnicalError::NonMonotonicCandle);
         }
-        candles.push_back(candle);
+        candles.push_back(candle.clone());
         while candles.len() > 500 {
-            candles.pop_front();
+            if let Some(expired) = candles.pop_front() {
+                asset.accepted.remove(&CandleIdentity {
+                    interval: expired.interval,
+                    open_time_ms: expired.open_time_ms,
+                    close_time_ms: expired.close_time_ms,
+                });
+            }
         }
         asset.accepted.insert(identity);
+        self.funnel.closed_candles_accepted = self.funnel.closed_candles_accepted.saturating_add(1);
         Ok(CandleAcceptance::Accepted)
     }
 
@@ -401,6 +469,7 @@ impl TechnicalEngine {
         available_gross: Decimal,
         costs: CostEstimate,
     ) -> Result<Option<TechnicalTarget>, TechnicalError> {
+        self.funnel.evaluations = self.funnel.evaluations.saturating_add(1);
         let Some(candles) = self.assets.get_mut(asset) else {
             return Ok(None);
         };
@@ -408,11 +477,19 @@ impl TechnicalEngine {
         else {
             return Ok(None);
         };
-        let raw_score = 0.40 * f64::from(state.regime_12h.direction)
-            + 0.25 * f64::from(state.trend_4h.score())
-            + 0.20 * f64::from(state.trend_1h.score())
-            + 0.10 * f64::from(state.trigger_30m.score())
-            + 0.05 * f64::from(state.trigger_15m.score());
+        self.funnel.indicators_ready = self.funnel.indicators_ready.saturating_add(1);
+        self.funnel.regime_classifications = self.funnel.regime_classifications.saturating_add(1);
+        if state.trigger_30m != TriggerState::Neutral {
+            self.funnel.primary_trigger_candidates =
+                self.funnel.primary_trigger_candidates.saturating_add(1);
+        }
+        if state.trigger_30m != TriggerState::Neutral && state.trigger_30m == state.trigger_15m {
+            self.funnel.secondary_trigger_confirmations = self
+                .funnel
+                .secondary_trigger_confirmations
+                .saturating_add(1);
+        }
+        let raw_score = technical_score(&state, archetype, self.config.enter_threshold);
         let mut candidate = Decimal::from_f64_retain(raw_score.clamp(-1.0, 1.0))
             .ok_or(TechnicalError::Arithmetic)?;
         let current = candles.current_score;
@@ -423,17 +500,18 @@ impl TechnicalEngine {
         let is_new_side =
             current.is_zero() || (current_sign != candidate_sign && !candidate.is_zero());
         if is_new_side {
-            let confirmed = match candidate_sign.to_i8().unwrap_or_default() {
-                1 => {
-                    state.trigger_30m == TriggerState::Bullish
-                        && state.trigger_15m == TriggerState::Bullish
-                }
-                -1 => {
-                    state.trigger_30m == TriggerState::Bearish
-                        && state.trigger_15m == TriggerState::Bearish
-                }
-                _ => false,
-            };
+            if abs >= self.config.enter_threshold {
+                self.funnel.scores_crossing_entry_threshold = self
+                    .funnel
+                    .scores_crossing_entry_threshold
+                    .saturating_add(1);
+            }
+            let confirmed = confirmed_trigger_direction(&state)
+                .is_some_and(|direction| direction == candidate_sign.to_i8().unwrap_or_default());
+            if confirmed {
+                self.funnel.trigger_confirmations =
+                    self.funnel.trigger_confirmations.saturating_add(1);
+            }
             if abs < self.config.enter_threshold || !confirmed {
                 candidate = Decimal::ZERO;
             }
@@ -464,11 +542,21 @@ impl TechnicalEngine {
             ExitTiming::Hold | ExitTiming::Reduce => candidate,
         };
         if !candidate.is_zero() {
+            self.funnel.nonzero_targets_before_cost =
+                self.funnel.nonzero_targets_before_cost.saturating_add(1);
+        }
+        if !candidate.is_zero() {
             let expected = self.config.expected_atr_fraction * atr_fraction;
             let round_trip = costs.round_trip(self.config.expected_holding_hours)?;
             if expected < self.config.minimum_cost_multiple * round_trip {
                 candidate = Decimal::ZERO;
             }
+        }
+        if !candidate.is_zero() {
+            self.funnel.targets_surviving_cost_admission = self
+                .funnel
+                .targets_surviving_cost_admission
+                .saturating_add(1);
         }
         candles.current_score = candidate;
         let desired_notional = available_gross
@@ -490,6 +578,132 @@ impl TechnicalEngine {
 
     pub fn tracked_assets(&self) -> impl Iterator<Item = &String> {
         self.assets.keys()
+    }
+
+    /// Latest authoritative one-hour ATR in price units. This is exposed so
+    /// source-entry chase distance can use the same retained market history as
+    /// the technical engine instead of introducing a cohort-specific scale.
+    pub fn latest_atr(&self, asset: &str) -> Result<Option<Decimal>, TechnicalError> {
+        let Some(candles) = self
+            .assets
+            .get(asset)
+            .and_then(|asset| asset.intervals.get(&CandleInterval::OneHour))
+        else {
+            return Ok(None);
+        };
+        let Some(value) = atr(candles, 14) else {
+            return Ok(None);
+        };
+        Decimal::from_f64_retain(value)
+            .map(Some)
+            .ok_or(TechnicalError::Arithmetic)
+    }
+
+    /// Expected move under the already-approved technical ATR fraction.
+    pub fn expected_move_fraction(&self, asset: &str) -> Result<Option<Decimal>, TechnicalError> {
+        let Some(candles) = self
+            .assets
+            .get(asset)
+            .and_then(|asset| asset.intervals.get(&CandleInterval::OneHour))
+        else {
+            return Ok(None);
+        };
+        let (Some(value), Some(last)) = (atr(candles, 14), candles.back()) else {
+            return Ok(None);
+        };
+        let price = f64_close(last)?;
+        Decimal::from_f64_retain(self.config.expected_atr_fraction * value / price)
+            .map(Some)
+            .ok_or(TechnicalError::Arithmetic)
+    }
+
+    pub fn funnel(&self) -> &TechnicalFunnel {
+        &self.funnel
+    }
+
+    pub fn reset_funnel(&mut self) {
+        self.funnel = TechnicalFunnel::default();
+    }
+}
+
+fn candle_conflict(accepted: &ClosedCandle, conflicting: &ClosedCandle) -> CandleConflict {
+    let mut field_differences = Vec::new();
+    let mut record = |field: &str, left: String, right: String| {
+        if left != right {
+            field_differences.push(CandleFieldDifference {
+                field: field.to_string(),
+                accepted: left,
+                conflicting: right,
+            });
+        }
+    };
+    record(
+        "open",
+        accepted.open.to_string(),
+        conflicting.open.to_string(),
+    );
+    record(
+        "high",
+        accepted.high.to_string(),
+        conflicting.high.to_string(),
+    );
+    record("low", accepted.low.to_string(), conflicting.low.to_string());
+    record(
+        "close",
+        accepted.close.to_string(),
+        conflicting.close.to_string(),
+    );
+    record(
+        "base_volume",
+        accepted.base_volume.to_string(),
+        conflicting.base_volume.to_string(),
+    );
+    record(
+        "trade_count",
+        accepted.trade_count.to_string(),
+        conflicting.trade_count.to_string(),
+    );
+    CandleConflict {
+        asset: accepted.asset.clone(),
+        interval: accepted.interval,
+        open_time_ms: accepted.open_time_ms,
+        close_time_ms: accepted.close_time_ms,
+        accepted_payload_sha256: hex_sha256(accepted.payload_hash()),
+        conflicting_payload_sha256: hex_sha256(conflicting.payload_hash()),
+        field_differences,
+    }
+}
+
+fn hex_sha256(hash: [u8; 32]) -> String {
+    hash.iter().map(|byte| format!("{byte:02x}")).collect()
+}
+
+fn technical_score(
+    state: &TechnicalState,
+    _archetype: SignalArchetype,
+    enter_threshold: f64,
+) -> f64 {
+    let contextual = 0.40 * f64::from(state.regime_12h.direction)
+        + 0.25 * f64::from(state.trend_4h.score())
+        + 0.20 * f64::from(state.trend_1h.score())
+        + 0.10 * f64::from(state.trigger_30m.score())
+        + 0.05 * f64::from(state.trigger_15m.score());
+    let Some(direction) = confirmed_trigger_direction(state) else {
+        return contextual;
+    };
+    let direction = f64::from(direction);
+    if contextual * direction >= enter_threshold {
+        contextual
+    } else {
+        direction * enter_threshold
+    }
+}
+
+fn confirmed_trigger_direction(state: &TechnicalState) -> Option<i8> {
+    match (state.trigger_30m, state.trigger_15m) {
+        (TriggerState::Bullish, TriggerState::Bullish) => Some(1),
+        (TriggerState::Bearish, TriggerState::Bearish) => Some(-1),
+        _ => None,
     }
 }
 
@@ -557,7 +771,7 @@ fn classify(
     let trend4 = trend_4h(h4)?;
     let trend1 = trend_1h(h1)?;
     let (trigger30, archetype) = trigger_30m(m30, &regime, trend4, trend1, config)?;
-    let trigger15 = trigger_15m(m15, trigger30, config)?;
+    let trigger15 = trigger_15m(m15, trigger30)?;
     let atr = atr(h1, 14).ok_or(TechnicalError::Arithmetic)?;
     let price = f64_close(h1.back().ok_or(TechnicalError::Arithmetic)?)?;
     Ok(Some((
@@ -727,38 +941,37 @@ fn trigger_30m(
     let ma21 = sma(&closes, 21).ok_or(TechnicalError::Arithmetic)?;
     let ma50 = sma(&closes, 50).ok_or(TechnicalError::Arithmetic)?;
     let volume_z = volume_z(candles)?;
-    let bull_context = matches!(
-        regime.regime,
-        MarketRegime::StrongBull | MarketRegime::TransitionUp
-    ) && trend4 == TrendState::Bullish
-        && trend1 == TrendState::Bullish;
-    let bear_context = matches!(
-        regime.regime,
-        MarketRegime::StrongBear | MarketRegime::TransitionDown
-    ) && trend4 == TrendState::Bearish
-        && trend1 == TrendState::Bearish;
-    if bull_context
-        && previous_rsi.iter().any(|value| *value < 45.0)
-        && rsi_now > 50.0
-        && close > ma7
-        && volume_z >= config.pullback_volume_z
-    {
-        return Ok((TriggerState::Bullish, SignalArchetype::TrendPullback));
-    }
-    if bear_context
-        && previous_rsi.iter().any(|value| *value > 55.0)
-        && rsi_now < 50.0
-        && close < ma7
-        && volume_z >= config.pullback_volume_z
-    {
-        return Ok((TriggerState::Bearish, SignalArchetype::TrendPullback));
-    }
     let previous = &closes[..closes.len() - 1];
     let previous_close = *previous.last().ok_or(TechnicalError::Arithmetic)?;
+    let previous_ma7 = sma(previous, 7).ok_or(TechnicalError::Arithmetic)?;
     let previous_ma21 = sma(previous, 21).ok_or(TechnicalError::Arithmetic)?;
     let previous_ma50 = sma(previous, 50).ok_or(TechnicalError::Arithmetic)?;
-    if regime.regime == MarketRegime::TransitionUp
-        && trend4 == TrendState::Bullish
+    // Trend activation is a majority vote among the independently sampled
+    // slow horizons. Requiring all three to agree made a valid timed pullback
+    // depend on universal confluence and left entry-grade contextual scores
+    // permanently inert.
+    let regime_bullish = regime.direction > 0;
+    let regime_bearish = regime.direction < 0;
+    let trend4_bullish = trend4 == TrendState::Bullish;
+    let trend4_bearish = trend4 == TrendState::Bearish;
+    let trend1_bullish = trend1 == TrendState::Bullish;
+    let trend1_bearish = trend1 == TrendState::Bearish;
+    let bull_context = (regime_bullish && (trend4_bullish || trend1_bullish))
+        || (trend4_bullish && trend1_bullish);
+    let bear_context = (regime_bearish && (trend4_bearish || trend1_bearish))
+        || (trend4_bearish && trend1_bearish);
+    let bullish_momentum_washout = previous_rsi.iter().any(|value| *value < 45.0);
+    let bearish_momentum_washout = previous_rsi.iter().any(|value| *value > 55.0);
+    let bullish_price_pullback = previous_close <= previous_ma7;
+    let bearish_price_pullback = previous_close >= previous_ma7;
+    let pullback_participation = volume_z >= config.pullback_volume_z;
+    // A full medium-term structure break is more specific than a fast-MA
+    // reclaim, so classify it before the pullback archetypes.
+    let breakout_up_context = regime.regime == MarketRegime::TransitionUp
+        || (regime.regime == MarketRegime::Range && trend4_bullish);
+    let breakout_down_context = regime.regime == MarketRegime::TransitionDown
+        || (regime.regime == MarketRegime::Range && trend4_bearish);
+    if breakout_up_context
         && previous_close <= previous_ma21.max(previous_ma50)
         && close > ma21
         && close > ma50
@@ -766,8 +979,7 @@ fn trigger_30m(
     {
         return Ok((TriggerState::Bullish, SignalArchetype::RegimeBreakout));
     }
-    if regime.regime == MarketRegime::TransitionDown
-        && trend4 == TrendState::Bearish
+    if breakout_down_context
         && previous_close >= previous_ma21.min(previous_ma50)
         && close < ma21
         && close < ma50
@@ -775,31 +987,57 @@ fn trigger_30m(
     {
         return Ok((TriggerState::Bearish, SignalArchetype::RegimeBreakout));
     }
+    if bull_context
+        && (bullish_momentum_washout || (bullish_price_pullback && pullback_participation))
+        && rsi_now > 50.0
+        && close > ma7
+    {
+        return Ok((TriggerState::Bullish, SignalArchetype::TrendPullback));
+    }
+    if bear_context
+        && (bearish_momentum_washout || (bearish_price_pullback && pullback_participation))
+        && rsi_now < 50.0
+        && close < ma7
+    {
+        return Ok((TriggerState::Bearish, SignalArchetype::TrendPullback));
+    }
+    // A 12-hour range is its own archetype. Requiring both subordinate trends
+    // to be neutral prevented the reversal itself from changing either vote.
+    let range_context = regime.regime == MarketRegime::Range;
+    if range_context
+        && (bullish_momentum_washout || pullback_participation)
+        && rsi_now > 50.0
+        && previous_close <= previous_ma7
+        && close > ma7
+    {
+        return Ok((TriggerState::Bullish, SignalArchetype::RangeMeanReversion));
+    }
+    if range_context
+        && (bearish_momentum_washout || pullback_participation)
+        && rsi_now < 50.0
+        && previous_close >= previous_ma7
+        && close < ma7
+    {
+        return Ok((TriggerState::Bearish, SignalArchetype::RangeMeanReversion));
+    }
     Ok((TriggerState::Neutral, SignalArchetype::TrendPullback))
 }
 
 fn trigger_15m(
     candles: &VecDeque<ClosedCandle>,
     primary: TriggerState,
-    config: &TechnicalStrategyConfig,
 ) -> Result<TriggerState, TechnicalError> {
     let closes = closes(candles)?;
     let close = *closes.last().ok_or(TechnicalError::Arithmetic)?;
     let ma7 = sma(&closes, 7).ok_or(TechnicalError::Arithmetic)?;
-    let ma21 = sma(&closes, 21).ok_or(TechnicalError::Arithmetic)?;
     let rsi = rsi(&closes, 14).ok_or(TechnicalError::Arithmetic)?;
-    let volume = volume_z(candles)?;
+    // The primary setup has already enforced its archetype-specific structure
+    // and participation. The faster interval confirms only direction; making
+    // it repeat the volume gate and a full MA stack recreated an excessive-
+    // confluence veto rather than an independent timing check.
     Ok(match primary {
-        TriggerState::Bullish
-            if close > ma7 && ma7 > ma21 && rsi >= 50.0 && volume >= config.pullback_volume_z =>
-        {
-            TriggerState::Bullish
-        }
-        TriggerState::Bearish
-            if close < ma7 && ma7 < ma21 && rsi <= 50.0 && volume >= config.pullback_volume_z =>
-        {
-            TriggerState::Bearish
-        }
+        TriggerState::Bullish if close > ma7 && rsi >= 50.0 => TriggerState::Bullish,
+        TriggerState::Bearish if close < ma7 && rsi <= 50.0 => TriggerState::Bearish,
         _ => TriggerState::Neutral,
     })
 }
@@ -899,6 +1137,14 @@ fn volume_z(candles: &VecDeque<ClosedCandle>) -> Result<f64, TechnicalError> {
 mod tests {
     use super::*;
 
+    #[derive(Deserialize)]
+    struct RailwayCandleFixture {
+        source_bundle_id: String,
+        source_journal_sha256: String,
+        source_event_hash: String,
+        candle: ClosedCandle,
+    }
+
     fn candle(interval: CandleInterval, index: u64, close: i64) -> ClosedCandle {
         ClosedCandle {
             asset: "BTC".into(),
@@ -912,6 +1158,111 @@ mod tests {
             base_volume: Decimal::from(100 + index),
             trade_count: 10,
         }
+    }
+
+    fn candle_with_volume(
+        interval: CandleInterval,
+        index: u64,
+        close: i64,
+        base_volume: i64,
+    ) -> ClosedCandle {
+        ClosedCandle {
+            base_volume: Decimal::from(base_volume),
+            ..candle(interval, index, close)
+        }
+    }
+
+    fn reversal_closes(bullish: bool) -> Vec<i64> {
+        let mut closes = (0..45)
+            .map(|index| if index % 2 == 0 { 99 } else { 101 })
+            .collect::<Vec<_>>();
+        closes.extend([100, 99, 96, 92, 90, 106]);
+        if !bullish {
+            for close in &mut closes {
+                *close = 200 - *close;
+            }
+        }
+        closes
+    }
+
+    fn confirmation_closes(bullish: bool) -> Vec<i64> {
+        let mut closes = (0..15)
+            .map(|index| if index % 2 == 0 { 99 } else { 101 })
+            .collect::<Vec<_>>();
+        closes.extend([96, 97, 98, 100, 102, 105, 110]);
+        if !bullish {
+            for close in &mut closes {
+                *close = 200 - *close;
+            }
+        }
+        closes
+    }
+
+    fn series(interval: CandleInterval, closes: &[i64]) -> VecDeque<ClosedCandle> {
+        let last = closes.len().saturating_sub(1);
+        closes
+            .iter()
+            .enumerate()
+            .map(|(index, close)| {
+                candle_with_volume(
+                    interval,
+                    u64::try_from(index).unwrap(),
+                    *close,
+                    if index == last {
+                        10_000
+                    } else {
+                        100 + i64::try_from(index % 3).unwrap()
+                    },
+                )
+            })
+            .collect()
+    }
+
+    fn zero_costs() -> CostEstimate {
+        CostEstimate {
+            entry_fee_fraction: 0.0,
+            exit_fee_fraction: 0.0,
+            entry_slippage_fraction: 0.0,
+            exit_slippage_fraction: 0.0,
+            hourly_funding_fraction: 0.0,
+        }
+    }
+
+    fn accept_series(engine: &mut TechnicalEngine, candles: VecDeque<ClosedCandle>) {
+        for candle in candles {
+            assert_eq!(
+                engine.accept_closed_candle(candle).unwrap(),
+                CandleAcceptance::Accepted
+            );
+        }
+    }
+
+    fn range_engine(bullish: bool) -> TechnicalEngine {
+        let mut engine = TechnicalEngine::new(TechnicalStrategyConfig {
+            enabled: true,
+            ..TechnicalStrategyConfig::default()
+        })
+        .unwrap();
+        for (interval, count) in [
+            (CandleInterval::TwelveHours, 201),
+            (CandleInterval::FourHours, 101),
+            (CandleInterval::OneHour, 51),
+        ] {
+            let closes = vec![100; count];
+            accept_series(&mut engine, series(interval, &closes));
+        }
+        accept_series(
+            &mut engine,
+            series(CandleInterval::ThirtyMinutes, &reversal_closes(bullish)),
+        );
+        accept_series(
+            &mut engine,
+            series(
+                CandleInterval::FifteenMinutes,
+                &confirmation_closes(bullish),
+            ),
+        );
+        engine
     }
 
     #[test]
@@ -928,9 +1279,66 @@ mod tests {
         );
         let mut conflict = accepted;
         conflict.close = Decimal::from(101);
+        let error = engine.accept_closed_candle(conflict).unwrap_err();
+        let TechnicalError::ConflictingCandle(conflict) = error else {
+            panic!("expected conflicting candle");
+        };
+        assert_ne!(
+            conflict.accepted_payload_sha256,
+            conflict.conflicting_payload_sha256
+        );
+        assert_eq!(conflict.field_differences.len(), 1);
+        assert_eq!(conflict.field_differences[0].field, "close");
+        assert_eq!(engine.funnel().conflicting_candles, 1);
+    }
+
+    #[test]
+    fn real_railway_candle_is_canonical_idempotent_and_conflicts_once() {
+        let fixture: RailwayCandleFixture = serde_json::from_str(include_str!(
+            "../../../fixtures/railway-window1-closed-candle.json"
+        ))
+        .unwrap();
+        assert_eq!(fixture.source_bundle_id, "1785202130363-303-91ab220e921d");
         assert_eq!(
-            engine.accept_closed_candle(conflict),
-            Err(TechnicalError::ConflictingCandle)
+            fixture.source_journal_sha256,
+            "4899f5a9eda495ec78df37d375aa59a20e4570152f82a3344f5a329b6439f35c"
+        );
+        assert_eq!(
+            fixture.source_event_hash,
+            "8933c915844c051046ae966a2f7d946c8f8bc798597b7254d6e1749a0f6d381e"
+        );
+        let mut engine = TechnicalEngine::new(TechnicalStrategyConfig::default()).unwrap();
+        assert_eq!(
+            engine.accept_closed_candle(fixture.candle.clone()).unwrap(),
+            CandleAcceptance::Accepted
+        );
+
+        // A different textual Decimal scale has the same canonical value.
+        let mut canonical_duplicate = fixture.candle.clone();
+        canonical_duplicate.open = Decimal::from_str_exact("1947.60").unwrap();
+        assert_eq!(
+            canonical_duplicate.payload_hash(),
+            fixture.candle.payload_hash()
+        );
+        assert_eq!(
+            engine.accept_closed_candle(canonical_duplicate).unwrap(),
+            CandleAcceptance::Duplicate
+        );
+
+        let mut conflict = fixture.candle;
+        conflict.base_volume += Decimal::new(1, 4);
+        let first = engine.accept_closed_candle(conflict.clone()).unwrap_err();
+        let second = engine.accept_closed_candle(conflict).unwrap_err();
+        assert_eq!(first, second);
+        let TechnicalError::ConflictingCandle(details) = first else {
+            panic!("expected conflicting candle");
+        };
+        assert_eq!(details.asset, "ETH");
+        assert_eq!(details.field_differences.len(), 1);
+        assert_eq!(details.field_differences[0].field, "base_volume");
+        assert_ne!(
+            details.accepted_payload_sha256,
+            details.conflicting_payload_sha256
         );
     }
 
@@ -952,6 +1360,253 @@ mod tests {
             .round_trip(6)
             .unwrap(),
             0.0023
+        );
+    }
+
+    #[test]
+    fn range_mean_reversion_activates_without_trend_votes() {
+        for bullish in [true, false] {
+            let mut engine = range_engine(bullish);
+            let target = engine
+                .evaluate("BTC", Decimal::from(1_000), zero_costs())
+                .unwrap()
+                .expect("warmed range indicators must produce a target");
+            assert_eq!(target.regime, MarketRegime::Range);
+            assert_eq!(target.archetype, SignalArchetype::RangeMeanReversion);
+            assert_eq!(target.score.is_sign_positive(), bullish);
+            assert_eq!(target.score.abs().to_f64().unwrap(), 0.65);
+            assert_eq!(target.desired_notional.is_sign_positive(), bullish);
+            assert!((target.desired_notional.abs().to_f64().unwrap() - 422.5).abs() < 1e-9);
+            assert_eq!(engine.funnel().trigger_confirmations, 1);
+            assert_eq!(engine.funnel().targets_surviving_cost_admission, 1);
+        }
+    }
+
+    #[test]
+    fn each_confirmed_archetype_reaches_the_existing_entry_threshold_independently() {
+        let config = TechnicalStrategyConfig::default();
+        for bullish in [true, false] {
+            let direction = if bullish { 1 } else { -1 };
+            let trigger = if bullish {
+                TriggerState::Bullish
+            } else {
+                TriggerState::Bearish
+            };
+            let trend = if bullish {
+                TrendState::Bullish
+            } else {
+                TrendState::Bearish
+            };
+            let cases = [
+                (
+                    SignalArchetype::TrendPullback,
+                    trend,
+                    trend,
+                    "trend pullback",
+                ),
+                (
+                    SignalArchetype::RangeMeanReversion,
+                    TrendState::Neutral,
+                    TrendState::Neutral,
+                    "range mean reversion",
+                ),
+                (
+                    SignalArchetype::RegimeBreakout,
+                    trend,
+                    TrendState::Neutral,
+                    "regime breakout",
+                ),
+            ];
+            for (archetype, trend4, trend1, label) in cases {
+                let state = TechnicalState {
+                    regime_12h: RegimeState {
+                        regime: MarketRegime::Range,
+                        direction: 0,
+                        ma50_normalized_slope: Decimal::ZERO,
+                        ma100_normalized_slope: Decimal::ZERO,
+                    },
+                    trend_4h: trend4,
+                    trend_1h: trend1,
+                    trigger_30m: trigger,
+                    trigger_15m: trigger,
+                };
+                assert_eq!(confirmed_trigger_direction(&state), Some(direction));
+                let score = technical_score(&state, archetype, config.enter_threshold);
+                assert!(
+                    (score - f64::from(direction) * config.enter_threshold).abs() < 1e-12,
+                    "{label} did not independently reach entry"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn primary_archetypes_do_not_require_universal_or_duplicate_confluence() {
+        let mut no_volume_fallback = TechnicalStrategyConfig {
+            pullback_volume_z: 1_000_000.0,
+            breakout_volume_z: 1_000_000.0,
+            ..TechnicalStrategyConfig::default()
+        };
+        for bullish in [true, false] {
+            let regime = RegimeState {
+                regime: if bullish {
+                    MarketRegime::StrongBull
+                } else {
+                    MarketRegime::StrongBear
+                },
+                direction: if bullish { 1 } else { -1 },
+                ma50_normalized_slope: Decimal::from(if bullish { 1 } else { -1 }),
+                ma100_normalized_slope: Decimal::from(if bullish { 1 } else { -1 }),
+            };
+            let trend4 = if bullish {
+                TrendState::Bullish
+            } else {
+                TrendState::Bearish
+            };
+            let expected = if bullish {
+                TriggerState::Bullish
+            } else {
+                TriggerState::Bearish
+            };
+            assert_eq!(
+                trigger_30m(
+                    &series(CandleInterval::ThirtyMinutes, &reversal_closes(bullish)),
+                    &regime,
+                    trend4,
+                    TrendState::Neutral,
+                    &no_volume_fallback,
+                )
+                .unwrap(),
+                (expected, SignalArchetype::TrendPullback)
+            );
+
+            let range = RegimeState {
+                regime: MarketRegime::Range,
+                direction: 0,
+                ma50_normalized_slope: Decimal::ZERO,
+                ma100_normalized_slope: Decimal::ZERO,
+            };
+            assert_eq!(
+                trigger_30m(
+                    &series(CandleInterval::ThirtyMinutes, &reversal_closes(bullish)),
+                    &range,
+                    trend4,
+                    TrendState::Neutral,
+                    &no_volume_fallback,
+                )
+                .unwrap(),
+                (expected, SignalArchetype::RangeMeanReversion)
+            );
+            assert_eq!(
+                trigger_15m(
+                    &series(
+                        CandleInterval::FifteenMinutes,
+                        &confirmation_closes(bullish),
+                    ),
+                    expected,
+                )
+                .unwrap(),
+                expected
+            );
+        }
+
+        no_volume_fallback.breakout_volume_z = TechnicalStrategyConfig::default().breakout_volume_z;
+        for bullish in [true, false] {
+            let mut breakout_closes = vec![100; 50];
+            breakout_closes.push(if bullish { 120 } else { 80 });
+            let trend4 = if bullish {
+                TrendState::Bullish
+            } else {
+                TrendState::Bearish
+            };
+            let expected = if bullish {
+                TriggerState::Bullish
+            } else {
+                TriggerState::Bearish
+            };
+            assert_eq!(
+                trigger_30m(
+                    &series(CandleInterval::ThirtyMinutes, &breakout_closes),
+                    &RegimeState {
+                        regime: MarketRegime::Range,
+                        direction: 0,
+                        ma50_normalized_slope: Decimal::ZERO,
+                        ma100_normalized_slope: Decimal::ZERO,
+                    },
+                    trend4,
+                    TrendState::Neutral,
+                    &no_volume_fallback,
+                )
+                .unwrap(),
+                (expected, SignalArchetype::RegimeBreakout)
+            );
+        }
+    }
+
+    #[test]
+    fn entry_grade_slow_context_still_requires_a_timed_archetype() {
+        let state = TechnicalState {
+            regime_12h: RegimeState {
+                regime: MarketRegime::StrongBull,
+                direction: 1,
+                ma50_normalized_slope: Decimal::ONE,
+                ma100_normalized_slope: Decimal::ONE,
+            },
+            trend_4h: TrendState::Bullish,
+            trend_1h: TrendState::Bullish,
+            trigger_30m: TriggerState::Neutral,
+            trigger_15m: TriggerState::Neutral,
+        };
+        let config = TechnicalStrategyConfig::default();
+        assert!(
+            technical_score(
+                &state,
+                SignalArchetype::TrendPullback,
+                config.enter_threshold
+            ) >= config.enter_threshold
+        );
+        assert_eq!(confirmed_trigger_direction(&state), None);
+    }
+
+    #[test]
+    fn trend_pullback_and_regime_breakout_triggers_remain_distinct() {
+        let config = TechnicalStrategyConfig::default();
+        let bullish_regime = RegimeState {
+            regime: MarketRegime::StrongBull,
+            direction: 1,
+            ma50_normalized_slope: Decimal::ONE,
+            ma100_normalized_slope: Decimal::ONE,
+        };
+        assert_eq!(
+            trigger_30m(
+                &series(CandleInterval::ThirtyMinutes, &reversal_closes(true)),
+                &bullish_regime,
+                TrendState::Bullish,
+                TrendState::Bullish,
+                &config,
+            )
+            .unwrap(),
+            (TriggerState::Bullish, SignalArchetype::TrendPullback)
+        );
+
+        let mut breakout_closes = vec![100; 50];
+        breakout_closes.push(120);
+        let transition = RegimeState {
+            regime: MarketRegime::TransitionUp,
+            direction: 1,
+            ma50_normalized_slope: Decimal::ONE,
+            ma100_normalized_slope: Decimal::ZERO,
+        };
+        assert_eq!(
+            trigger_30m(
+                &series(CandleInterval::ThirtyMinutes, &breakout_closes),
+                &transition,
+                TrendState::Bullish,
+                TrendState::Neutral,
+                &config,
+            )
+            .unwrap(),
+            (TriggerState::Bullish, SignalArchetype::RegimeBreakout)
         );
     }
 

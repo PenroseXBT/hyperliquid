@@ -16,7 +16,9 @@ use copytrade_observer::qualification::{
     finalize_qualification, parse_duration_seconds, run_qualification, ProductionObserverRuntime,
     QualificationOptions,
 };
-use copytrade_observer::replay::replay_density_rungs;
+use copytrade_observer::railway_aggregate::aggregate_railway_window;
+use copytrade_observer::replay::replay_density_rungs_with_layer;
+use copytrade_observer::state_root::unsigned_persistence_schema_sha256;
 use copytrade_observer::{ObserverCoreState, FORBIDDEN_DEPENDENCY_PACKAGES};
 use std::env;
 use std::error::Error;
@@ -27,6 +29,7 @@ use std::sync::Arc;
 #[derive(Debug, PartialEq, Eq)]
 struct Arguments {
     config: PathBuf,
+    very_profitable_layer: Option<PathBuf>,
     request_policy: PathBuf,
     fixture: PathBuf,
     test_report: PathBuf,
@@ -35,10 +38,14 @@ struct Arguments {
     source_tree_sha256: Option<String>,
     transport_policy: PathBuf,
     release_manifest: PathBuf,
+    release_binary: Option<PathBuf>,
     isolation_report: PathBuf,
     output: PathBuf,
     state_root: Option<PathBuf>,
     duration_seconds: Option<u64>,
+    minimum_observation_seconds: Option<u64>,
+    minimum_closed_episodes: Option<usize>,
+    frozen_identity_sha256: Option<String>,
     bundle: Option<PathBuf>,
     journal: Option<PathBuf>,
     signer_socket: PathBuf,
@@ -53,8 +60,10 @@ struct Arguments {
 enum Operation {
     Initialize,
     ValidateConfig,
+    PrintEffectiveConfig,
     PrintBuildManifest,
     CheckDependencyPolicy,
+    PrintPersistenceSchemaHash,
     Observe,
     Plan,
     Shadow,
@@ -64,6 +73,7 @@ enum Operation {
     QualifyProfitability,
     QualifyMicroDensity,
     FinalizeQualification,
+    AggregateQualification,
     ReplayDensity,
     AuditCandidates,
     Production,
@@ -79,7 +89,10 @@ async fn main() {
 
 async fn run() -> Result<(), Box<dyn Error>> {
     let arguments = parse_arguments(env::args().skip(1))?;
-    let state = ObserverCoreState::load(&arguments.config)?;
+    let state = ObserverCoreState::load_with_very_profitable_layer(
+        &arguments.config,
+        arguments.very_profitable_layer.as_ref(),
+    )?;
     match arguments.operation {
         Operation::Initialize => println!(
             "HL1 signer-free observer initialized: {}",
@@ -91,11 +104,17 @@ async fn run() -> Result<(), Box<dyn Error>> {
             state.config().candidates.len(),
             state.build_manifest().configuration_fingerprint
         ),
+        Operation::PrintEffectiveConfig => {
+            println!("{}", serde_json::to_string_pretty(state.config())?)
+        }
         Operation::PrintBuildManifest => println!("{}", state.build_manifest()),
         Operation::CheckDependencyPolicy => println!(
             "observer dependency denylist loaded: {}",
             FORBIDDEN_DEPENDENCY_PACKAGES.join(",")
         ),
+        Operation::PrintPersistenceSchemaHash => {
+            println!("{}", unsigned_persistence_schema_sha256())
+        }
         Operation::Observe => run_read_only_observation(&state, &arguments.request_policy)?,
         Operation::Plan => run_inert_plan(&state, &arguments.fixture)?,
         Operation::Shadow => run_deterministic_shadow(&state, &arguments.fixture)?,
@@ -105,10 +124,12 @@ async fn run() -> Result<(), Box<dyn Error>> {
             arguments.git_commit.as_deref(),
             arguments.git_tree_state.as_deref(),
             arguments.source_tree_sha256.as_deref(),
+            arguments.release_binary.as_deref(),
         )?,
         Operation::QualifyMainnet => {
             run_qualification(QualificationOptions {
                 config_path: arguments.config,
+                very_profitable_layer_path: arguments.very_profitable_layer,
                 request_policy_path: arguments.request_policy,
                 transport_policy_path: arguments.transport_policy,
                 release_manifest_path: arguments.release_manifest,
@@ -126,6 +147,7 @@ async fn run() -> Result<(), Box<dyn Error>> {
         Operation::QualifyTransport => {
             run_qualification(QualificationOptions {
                 config_path: arguments.config,
+                very_profitable_layer_path: arguments.very_profitable_layer,
                 request_policy_path: arguments.request_policy,
                 transport_policy_path: arguments.transport_policy,
                 release_manifest_path: arguments.release_manifest,
@@ -143,6 +165,7 @@ async fn run() -> Result<(), Box<dyn Error>> {
         Operation::QualifyProfitability => {
             run_qualification(QualificationOptions {
                 config_path: arguments.config,
+                very_profitable_layer_path: arguments.very_profitable_layer,
                 request_policy_path: arguments.request_policy,
                 transport_policy_path: arguments.transport_policy,
                 release_manifest_path: arguments.release_manifest,
@@ -160,6 +183,7 @@ async fn run() -> Result<(), Box<dyn Error>> {
         Operation::QualifyMicroDensity => {
             run_qualification(QualificationOptions {
                 config_path: arguments.config,
+                very_profitable_layer_path: arguments.very_profitable_layer,
                 request_policy_path: arguments.request_policy,
                 transport_policy_path: arguments.transport_policy,
                 release_manifest_path: arguments.release_manifest,
@@ -184,9 +208,27 @@ async fn run() -> Result<(), Box<dyn Error>> {
                 summary.passed, summary.monotonic_elapsed_seconds
             );
         }
+        Operation::AggregateQualification => {
+            let summary = aggregate_railway_window(
+                &arguments.bundle.ok_or("--bundle is required")?,
+                &arguments.output,
+                arguments
+                    .frozen_identity_sha256
+                    .as_deref()
+                    .ok_or("--frozen-identity-sha256 is required")?,
+                arguments
+                    .minimum_observation_seconds
+                    .ok_or("--minimum-observation-seconds is required")?,
+                arguments
+                    .minimum_closed_episodes
+                    .ok_or("--minimum-closed-episodes is required")?,
+            )?;
+            println!("{}", serde_json::to_string_pretty(&summary)?);
+        }
         Operation::ReplayDensity => {
-            let report = replay_density_rungs(
+            let report = replay_density_rungs_with_layer(
                 &arguments.config,
+                arguments.very_profitable_layer.as_deref(),
                 &arguments.transport_policy,
                 arguments.journal.as_ref().ok_or("--journal is required")?,
             )?;
@@ -211,6 +253,7 @@ async fn run() -> Result<(), Box<dyn Error>> {
 
 fn parse_arguments(arguments: impl Iterator<Item = String>) -> Result<Arguments, Box<dyn Error>> {
     let mut config = PathBuf::from("config/copytrade.json");
+    let mut very_profitable_layer = None;
     let mut request_policy = PathBuf::from("config/read-api-policy.json");
     let mut fixture = PathBuf::from("fixtures/accepted-snapshots.json");
     let mut test_report = PathBuf::from("target/hl1j-test-report.txt");
@@ -219,10 +262,14 @@ fn parse_arguments(arguments: impl Iterator<Item = String>) -> Result<Arguments,
     let mut source_tree_sha256 = None;
     let mut transport_policy = PathBuf::from("config/public-mainnet-transport.json");
     let mut release_manifest = PathBuf::from("target/hl1j/release-manifest.json");
+    let mut release_binary = None;
     let mut isolation_report = PathBuf::from("target/hl1c/isolation-report.txt");
     let mut output = PathBuf::from("target/hl1k");
     let mut state_root = None;
     let mut duration_seconds = None;
+    let mut minimum_observation_seconds = None;
+    let mut minimum_closed_episodes = None;
+    let mut frozen_identity_sha256 = None;
     let mut bundle = None;
     let mut journal = None;
     let mut signer_socket = PathBuf::from("/run/hype-arb/signer.sock");
@@ -237,6 +284,13 @@ fn parse_arguments(arguments: impl Iterator<Item = String>) -> Result<Arguments,
             "--config" => {
                 let path = arguments.next().ok_or("--config requires a path")?;
                 config = PathBuf::from(path);
+            }
+            "--very-profitable-layer" => {
+                very_profitable_layer = Some(PathBuf::from(
+                    arguments
+                        .next()
+                        .ok_or("--very-profitable-layer requires a path")?,
+                ));
             }
             "--request-policy" => {
                 let path = arguments.next().ok_or("--request-policy requires a path")?;
@@ -281,6 +335,11 @@ fn parse_arguments(arguments: impl Iterator<Item = String>) -> Result<Arguments,
                         .ok_or("--release-manifest requires a path")?,
                 )
             }
+            "--release-binary" => {
+                release_binary = Some(PathBuf::from(
+                    arguments.next().ok_or("--release-binary requires a path")?,
+                ))
+            }
             "--isolation-report" => {
                 isolation_report = PathBuf::from(
                     arguments
@@ -300,6 +359,29 @@ fn parse_arguments(arguments: impl Iterator<Item = String>) -> Result<Arguments,
                 duration_seconds = Some(parse_duration_seconds(
                     &arguments.next().ok_or("--duration requires a value")?,
                 )?)
+            }
+            "--minimum-observation-seconds" => {
+                minimum_observation_seconds = Some(
+                    arguments
+                        .next()
+                        .ok_or("--minimum-observation-seconds requires a value")?
+                        .parse()?,
+                )
+            }
+            "--minimum-closed-episodes" => {
+                minimum_closed_episodes = Some(
+                    arguments
+                        .next()
+                        .ok_or("--minimum-closed-episodes requires a value")?
+                        .parse()?,
+                )
+            }
+            "--frozen-identity-sha256" => {
+                frozen_identity_sha256 = Some(
+                    arguments
+                        .next()
+                        .ok_or("--frozen-identity-sha256 requires a value")?,
+                )
             }
             "--bundle" => {
                 bundle = Some(PathBuf::from(
@@ -353,21 +435,34 @@ fn parse_arguments(arguments: impl Iterator<Item = String>) -> Result<Arguments,
             "finalize-qualification" => {
                 set_operation(&mut operation, Operation::FinalizeQualification)?
             }
+            "aggregate-qualification" => {
+                set_operation(&mut operation, Operation::AggregateQualification)?
+            }
             "replay-density" => set_operation(&mut operation, Operation::ReplayDensity)?,
             "audit-candidates" => set_operation(&mut operation, Operation::AuditCandidates)?,
             "production" => set_operation(&mut operation, Operation::Production)?,
             "--validate-config" => set_operation(&mut operation, Operation::ValidateConfig)?,
+            "--print-effective-config" => {
+                set_operation(&mut operation, Operation::PrintEffectiveConfig)?
+            }
             "--print-build-manifest" => {
                 set_operation(&mut operation, Operation::PrintBuildManifest)?
             }
             "--check-dependency-policy" => {
                 set_operation(&mut operation, Operation::CheckDependencyPolicy)?
             }
+            "--print-persistence-schema-hash" => {
+                set_operation(&mut operation, Operation::PrintPersistenceSchemaHash)?
+            }
             _ => return Err(format!("unsupported observer argument: {argument}").into()),
         }
     }
+    if release_binary.is_some() && operation != Operation::ReleaseManifest {
+        return Err("--release-binary is supported only by release-manifest".into());
+    }
     Ok(Arguments {
         config,
+        very_profitable_layer,
         request_policy,
         fixture,
         test_report,
@@ -376,10 +471,14 @@ fn parse_arguments(arguments: impl Iterator<Item = String>) -> Result<Arguments,
         source_tree_sha256,
         transport_policy,
         release_manifest,
+        release_binary,
         isolation_report,
         output,
         state_root,
         duration_seconds,
+        minimum_observation_seconds,
+        minimum_closed_episodes,
+        frozen_identity_sha256,
         bundle,
         journal,
         signer_socket,
@@ -397,13 +496,17 @@ fn run_release_manifest(
     git_commit: Option<&str>,
     git_tree_state: Option<&str>,
     source_tree_sha256: Option<&str>,
+    release_binary: Option<&std::path::Path>,
 ) -> Result<(), Box<dyn Error>> {
     let git_commit = git_commit.ok_or("--git-commit is required for release-manifest")?;
     let git_tree_state =
         git_tree_state.ok_or("--git-tree-state is required for release-manifest")?;
     let source_tree_sha256 =
         source_tree_sha256.ok_or("--source-tree-sha256 is required for release-manifest")?;
-    let executable = std::env::current_exe()?;
+    let executable = match release_binary {
+        Some(path) => path.to_path_buf(),
+        None => std::env::current_exe()?,
+    };
     let manifest = create_release_manifest(
         state.config(),
         executable,
@@ -554,6 +657,7 @@ async fn run_production_observer(arguments: &Arguments) -> Result<(), Box<dyn Er
     };
     run_qualification(QualificationOptions {
         config_path: arguments.config.clone(),
+        very_profitable_layer_path: arguments.very_profitable_layer.clone(),
         request_policy_path: arguments.request_policy.clone(),
         transport_policy_path: arguments.transport_policy.clone(),
         release_manifest_path: arguments.release_manifest.clone(),
@@ -807,6 +911,29 @@ mod tests {
     }
 
     #[test]
+    fn parser_accepts_versioned_very_profitable_layer() {
+        let parsed = parse_arguments(
+            [
+                "--very-profitable-layer".to_string(),
+                "data/very-profitable-layer.json".to_string(),
+                "--validate-config".to_string(),
+            ]
+            .into_iter(),
+        )
+        .unwrap();
+        assert_eq!(
+            parsed.very_profitable_layer,
+            Some(PathBuf::from("data/very-profitable-layer.json"))
+        );
+    }
+
+    #[test]
+    fn parser_accepts_effective_config_export_for_release_tooling() {
+        let parsed = parse_arguments(["--print-effective-config".to_string()].into_iter()).unwrap();
+        assert_eq!(parsed.operation, Operation::PrintEffectiveConfig);
+    }
+
+    #[test]
     fn observer_accepts_only_modeled_read_only_observation() {
         let parsed = parse_arguments(
             [
@@ -897,5 +1024,34 @@ mod tests {
         assert!(parsed.git_commit.is_some());
         assert_eq!(parsed.git_tree_state.as_deref(), Some("dirty"));
         assert!(parsed.source_tree_sha256.is_some());
+        assert!(parsed.release_binary.is_none());
+    }
+
+    #[test]
+    fn release_manifest_accepts_only_an_explicit_release_binary_override() {
+        let parsed = parse_arguments(
+            [
+                "release-manifest".to_string(),
+                "--release-binary".to_string(),
+                "target/linux-release/copytrade-observer".to_string(),
+            ]
+            .into_iter(),
+        )
+        .unwrap();
+        assert_eq!(parsed.operation, Operation::ReleaseManifest);
+        assert_eq!(
+            parsed.release_binary,
+            Some(PathBuf::from("target/linux-release/copytrade-observer"))
+        );
+
+        assert!(parse_arguments(
+            [
+                "qualify-profitability".to_string(),
+                "--release-binary".to_string(),
+                "target/linux-release/copytrade-observer".to_string(),
+            ]
+            .into_iter(),
+        )
+        .is_err());
     }
 }

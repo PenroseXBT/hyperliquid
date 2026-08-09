@@ -6,6 +6,7 @@ publish = false
 
 [dependencies]
 copytrade-core = { path = "../copytrade-core" }
+fs2 = "0.4"
 futures-util = "0.3"
 reqwest = { version = "0.11", default-features = false, features = ["json", "rustls-tls"] }
 rust_decimal = { version = "=1.36.0", default-features = false, features = ["std", "serde"] }

@@ -24,6 +24,8 @@ pub struct PortfolioEpisode {
     pub fees: Decimal,
     pub funding: Decimal,
     pub slippage: Decimal,
+    #[serde(default)]
+    pub attribution_residual: Decimal,
     pub net_pnl: Decimal,
 }
 
@@ -38,6 +40,8 @@ pub struct SourceEpisode {
     pub modeled_funding: Decimal,
     pub modeled_slippage: Decimal,
     pub modeled_gross_pnl: Decimal,
+    #[serde(default)]
+    pub attribution_residual: Decimal,
     pub modeled_net_pnl: Decimal,
     pub net_return: Decimal,
 }
@@ -178,6 +182,7 @@ impl DualLedger {
                 modeled_funding: episode.funding,
                 modeled_slippage: episode.slippage,
                 modeled_gross_pnl: episode.realized_pnl,
+                attribution_residual: episode.attribution_residual,
                 modeled_net_pnl: episode.net_pnl,
                 net_return: if episode.entry_notional.is_zero() {
                     Decimal::ZERO
@@ -211,6 +216,112 @@ impl DualLedger {
             .map_or(0, |book| book.closed.len())
     }
 
+    pub fn assign_source_attribution_residual(
+        &mut self,
+        candidate_id: &str,
+        episode_id: EpisodeId,
+        residual: Decimal,
+    ) -> Result<SourceEpisode, LedgerError> {
+        let episode = self
+            .sources
+            .get_mut(candidate_id)
+            .and_then(|book| book.closed.last_mut())
+            .filter(|episode| episode.episode_id == episode_id)
+            .ok_or(LedgerError::PositionDivergence)?;
+        episode.attribution_residual = episode
+            .attribution_residual
+            .checked_add(residual)
+            .ok_or(LedgerError::ArithmeticOverflow("attribution residual"))?;
+        episode.net_pnl =
+            episode
+                .net_pnl
+                .checked_add(residual)
+                .ok_or(LedgerError::ArithmeticOverflow(
+                    "attribution residual net pnl",
+                ))?;
+        Ok(SourceEpisode {
+            candidate_id: candidate_id.to_string(),
+            source_episode_id: episode.episode_id,
+            asset: episode.asset.clone(),
+            modeled_entry: episode.entry_notional,
+            modeled_exit: episode.exit_notional,
+            modeled_fees: episode.fees,
+            modeled_funding: episode.funding,
+            modeled_slippage: episode.slippage,
+            modeled_gross_pnl: episode.realized_pnl,
+            attribution_residual: episode.attribution_residual,
+            modeled_net_pnl: episode.net_pnl,
+            net_return: if episode.entry_notional.is_zero() {
+                Decimal::ZERO
+            } else {
+                episode
+                    .net_pnl
+                    .checked_div(episode.entry_notional)
+                    .unwrap_or(Decimal::ZERO)
+            },
+        })
+    }
+
+    pub fn assign_source_episode_economic_residuals(
+        &mut self,
+        candidate_id: &str,
+        episode_id: EpisodeId,
+        gross_residual: Decimal,
+        fees_residual: Decimal,
+        funding_residual: Decimal,
+        slippage_residual: Decimal,
+    ) -> Result<SourceEpisode, LedgerError> {
+        let episode = self
+            .sources
+            .get_mut(candidate_id)
+            .and_then(|book| book.closed.last_mut())
+            .filter(|episode| episode.episode_id == episode_id)
+            .ok_or(LedgerError::PositionDivergence)?;
+        episode.realized_pnl = episode.realized_pnl.checked_add(gross_residual).ok_or(
+            LedgerError::ArithmeticOverflow("gross attribution residual"),
+        )?;
+        episode.fees = episode
+            .fees
+            .checked_add(fees_residual)
+            .ok_or(LedgerError::ArithmeticOverflow("fee attribution residual"))?;
+        episode.funding = episode.funding.checked_add(funding_residual).ok_or(
+            LedgerError::ArithmeticOverflow("funding attribution residual"),
+        )?;
+        episode.slippage = episode.slippage.checked_add(slippage_residual).ok_or(
+            LedgerError::ArithmeticOverflow("slippage attribution residual"),
+        )?;
+        episode.net_pnl = episode
+            .realized_pnl
+            .checked_sub(episode.fees)
+            .and_then(|value| value.checked_sub(episode.funding))
+            .and_then(|value| value.checked_sub(episode.slippage))
+            .and_then(|value| value.checked_add(episode.attribution_residual))
+            .ok_or(LedgerError::ArithmeticOverflow(
+                "economic attribution residual net pnl",
+            ))?;
+        Ok(SourceEpisode {
+            candidate_id: candidate_id.to_string(),
+            source_episode_id: episode.episode_id,
+            asset: episode.asset.clone(),
+            modeled_entry: episode.entry_notional,
+            modeled_exit: episode.exit_notional,
+            modeled_fees: episode.fees,
+            modeled_funding: episode.funding,
+            modeled_slippage: episode.slippage,
+            modeled_gross_pnl: episode.realized_pnl,
+            attribution_residual: episode.attribution_residual,
+            modeled_net_pnl: episode.net_pnl,
+            net_return: if episode.entry_notional.is_zero() {
+                Decimal::ZERO
+            } else {
+                episode
+                    .net_pnl
+                    .checked_div(episode.entry_notional)
+                    .unwrap_or(Decimal::ZERO)
+            },
+        })
+    }
+
     pub fn source_position(&self, candidate_id: &str, asset: &str) -> Decimal {
         self.sources
             .get(candidate_id)
@@ -224,6 +335,10 @@ impl DualLedger {
             .get(candidate_id)
             .map(|book| book.positions.keys().cloned().collect())
             .unwrap_or_default()
+    }
+
+    pub fn source_ids(&self) -> Vec<String> {
+        self.sources.keys().cloned().collect()
     }
 
     pub fn total_source_closed(&self) -> usize {
@@ -248,6 +363,7 @@ impl DualLedger {
                     modeled_funding: episode.funding,
                     modeled_slippage: episode.slippage,
                     modeled_gross_pnl: episode.realized_pnl,
+                    attribution_residual: episode.attribution_residual,
                     modeled_net_pnl: episode.net_pnl,
                     net_return: if episode.entry_notional.is_zero() {
                         Decimal::ZERO
@@ -647,6 +763,7 @@ impl EpisodeBook {
             fees: open.fees,
             funding: open.funding,
             slippage: open.slippage,
+            attribution_residual: Decimal::ZERO,
             net_pnl,
         });
         Ok(())
@@ -792,6 +909,45 @@ mod tests {
         assert_eq!(ledger.source_closed_count("source-a"), 1);
         assert_eq!(ledger.portfolio_closed().len(), 0);
         assert!(closed.net_return > Decimal::ZERO);
+    }
+
+    #[test]
+    fn synthetic_component_books_are_discoverable_for_equity_accounting() {
+        let mut ledger = DualLedger::default();
+        ledger
+            .apply_source_execution(
+                "technical:trend_pullback:trending",
+                &execution(Side::Buy, "1", "100", "0"),
+                1,
+            )
+            .unwrap();
+
+        assert_eq!(
+            ledger.source_ids(),
+            vec!["technical:trend_pullback:trending".to_string()]
+        );
+    }
+
+    #[test]
+    fn source_attribution_residual_is_explicit_and_changes_only_net_pnl() {
+        let mut ledger = DualLedger::default();
+        ledger
+            .apply_source_execution("source-a", &execution(Side::Buy, "1", "100", "0"), 1)
+            .unwrap();
+        let before = ledger
+            .apply_source_execution("source-a", &execution(Side::Sell, "1", "110", "1"), 2)
+            .unwrap()
+            .unwrap();
+        let residual = Decimal::new(1, 28);
+        let after = ledger
+            .assign_source_attribution_residual("source-a", before.source_episode_id, residual)
+            .unwrap();
+        assert_eq!(after.attribution_residual, residual);
+        assert_eq!(after.modeled_net_pnl, before.modeled_net_pnl + residual);
+        assert_eq!(after.modeled_gross_pnl, before.modeled_gross_pnl);
+        assert_eq!(after.modeled_fees, before.modeled_fees);
+        assert_eq!(after.modeled_funding, before.modeled_funding);
+        assert_eq!(after.modeled_slippage, before.modeled_slippage);
     }
 
     #[test]

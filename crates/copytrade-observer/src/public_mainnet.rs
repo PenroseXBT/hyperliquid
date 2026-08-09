@@ -22,6 +22,7 @@ use std::time::Duration;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 const APPROVED_INFO_URL: &str = "https://api.hyperliquid.xyz/info";
+const CLOSED_CANDLE_FINALITY_DELAY_MS: u64 = 5_000;
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -70,6 +71,14 @@ pub struct SourceAssetPosition {
     pub asset: String,
     pub signed_size: Decimal,
     pub signed_notional: Decimal,
+    /// Hyperliquid clearinghouse-state entry price. Older retained replay
+    /// records may omit it; cohort entries fail closed when it is unavailable.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub entry_price: Option<Decimal>,
+    /// Hyperliquid clearinghouse-state unrealized PnL, retained for stale-profit
+    /// and chase diagnostics rather than sourced from Hyperdash.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub unrealized_pnl: Option<Decimal>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -107,6 +116,10 @@ struct PositionWire {
     coin: String,
     szi: String,
     position_value: String,
+    #[serde(default)]
+    entry_px: Option<String>,
+    #[serde(default)]
+    unrealized_pnl: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -206,9 +219,43 @@ const TECHNICAL_BATCH_INTERVAL_MS: u64 = 5_000;
 
 #[derive(Debug, Default)]
 struct TechnicalCandleFetchState {
-    assets: BTreeSet<String>,
+    technical_assets: BTreeSet<String>,
+    source_assets_by_candidate: BTreeMap<String, BTreeSet<String>>,
     requested_buckets: BTreeMap<(String, CandleInterval), u64>,
     last_batch_started_ms: Option<u64>,
+}
+
+impl TechnicalCandleFetchState {
+    fn replace_technical_assets(&mut self, assets: impl IntoIterator<Item = String>) {
+        self.technical_assets = assets.into_iter().collect();
+        self.prune_inactive_buckets();
+    }
+
+    fn replace_candidate_assets(
+        &mut self,
+        candidate_id: &str,
+        positions: &BTreeMap<String, SourceAssetPosition>,
+    ) {
+        self.source_assets_by_candidate.insert(
+            candidate_id.to_ascii_lowercase(),
+            positions.keys().cloned().collect(),
+        );
+        self.prune_inactive_buckets();
+    }
+
+    fn all_assets(&self) -> BTreeSet<String> {
+        let mut assets = self.technical_assets.clone();
+        for source_assets in self.source_assets_by_candidate.values() {
+            assets.extend(source_assets.iter().cloned());
+        }
+        assets
+    }
+
+    fn prune_inactive_buckets(&mut self) {
+        let active_assets = self.all_assets();
+        self.requested_buckets
+            .retain(|(asset, _), _| active_assets.contains(asset));
+    }
 }
 
 impl<C: Clock> HyperliquidPublicTransport<C> {
@@ -314,6 +361,7 @@ impl<C: Clock> HyperliquidPublicTransport<C> {
 
     async fn fetch_due_source_candles(
         &self,
+        candidate_id: &str,
         positions: &BTreeMap<String, SourceAssetPosition>,
         now_ms: u64,
     ) -> Vec<ClosedCandle> {
@@ -322,23 +370,20 @@ impl<C: Clock> HyperliquidPublicTransport<C> {
                 .technical_fetch
                 .lock()
                 .expect("technical candle fetch mutex poisoned");
-            for asset in positions.keys() {
-                if state.assets.len() >= TECHNICAL_UNIVERSE_LIMIT {
-                    break;
-                }
-                state.assets.insert(asset.clone());
-            }
+            state.replace_candidate_assets(candidate_id, positions);
             if state
                 .last_batch_started_ms
                 .is_some_and(|last| now_ms.saturating_sub(last) < TECHNICAL_BATCH_INTERVAL_MS)
             {
                 None
             } else {
-                let due = state.assets.iter().find_map(|asset| {
+                let assets = state.all_assets();
+                let due = assets.iter().find_map(|asset| {
                     let intervals = CandleInterval::ALL
                         .into_iter()
                         .filter(|interval| {
-                            let bucket = now_ms / interval.duration_ms();
+                            let bucket = now_ms.saturating_sub(CLOSED_CANDLE_FINALITY_DELAY_MS)
+                                / interval.duration_ms();
                             state
                                 .requested_buckets
                                 .get(&(asset.clone(), *interval))
@@ -350,9 +395,11 @@ impl<C: Clock> HyperliquidPublicTransport<C> {
                 if let Some((asset, intervals)) = &due {
                     state.last_batch_started_ms = Some(now_ms);
                     for interval in intervals {
-                        state
-                            .requested_buckets
-                            .insert((asset.clone(), *interval), now_ms / interval.duration_ms());
+                        state.requested_buckets.insert(
+                            (asset.clone(), *interval),
+                            now_ms.saturating_sub(CLOSED_CANDLE_FINALITY_DELAY_MS)
+                                / interval.duration_ms(),
+                        );
                     }
                 }
                 due
@@ -543,8 +590,9 @@ impl<C: Clock> HyperliquidPublicTransport<C> {
             }
         }
         if let PublicPayload::SourceState(state) = &mut payload {
+            let candidate_id = state.candidate_id.clone();
             state.closed_candles = self
-                .fetch_due_source_candles(&state.positions, wall_clock_ms())
+                .fetch_due_source_candles(&candidate_id, &state.positions, wall_clock_ms())
                 .await;
         }
         let received_at_mono = self.clock.now_ms();
@@ -598,7 +646,8 @@ impl<C: Clock> HyperliquidPublicTransport<C> {
                 .map(PublicPayload::MarketSnapshot)
                 .map_err(generic_decode_failure),
             ReadRequestKind::ExchangeMetadata => {
-                let metadata = parse_metadata(bytes).map_err(generic_decode_failure)?;
+                let (metadata, technical_assets) = parse_metadata_with_technical_universe(bytes)
+                    .map_err(generic_decode_failure)?;
                 *self
                     .market_assets
                     .lock()
@@ -607,6 +656,10 @@ impl<C: Clock> HyperliquidPublicTransport<C> {
                     .iter()
                     .map(|asset| asset.name.clone())
                     .collect();
+                self.technical_fetch
+                    .lock()
+                    .expect("technical candle fetch mutex poisoned")
+                    .replace_technical_assets(technical_assets);
                 Ok(PublicPayload::MarketMetadata(metadata))
             }
             ReadRequestKind::OrderBook => parse_book(subject, bytes)
@@ -696,7 +749,14 @@ fn parse_candle_snapshot(
         .iter()
         .map(|value| parse_candle_value(value, Some(asset), Some(interval)))
         .filter_map(|result| match result {
-            Ok(candle) if candle.close_time_ms <= now_ms => Some(Ok(candle)),
+            Ok(candle)
+                if candle
+                    .close_time_ms
+                    .checked_add(CLOSED_CANDLE_FINALITY_DELAY_MS)
+                    .is_some_and(|finalized_at| finalized_at <= now_ms) =>
+            {
+                Some(Ok(candle))
+            }
             Ok(_) => None,
             Err(error) => Some(Err(error)),
         })
@@ -885,6 +945,25 @@ fn parse_source_state_with_metadata(
         } else {
             notional.abs()
         };
+        let entry_price = position
+            .entry_px
+            .as_deref()
+            .filter(|value| !value.is_empty())
+            .map(|value| parse_wire_decimal(value, "entryPx"))
+            .transpose()?;
+        let unrealized_pnl = position
+            .unrealized_pnl
+            .as_deref()
+            .filter(|value| !value.is_empty())
+            .map(|value| parse_wire_decimal(value, "unrealizedPnl"))
+            .transpose()?;
+        if entry_price.is_some_and(|value| value <= Decimal::ZERO) {
+            return Err(IngestionFailure::new(
+                IngestionFailureClassification::InvalidNumericValue,
+                DecodeStage::NumericsValidated,
+                "entryPx must be positive when supplied",
+            ));
+        }
         if !signed_size.is_zero() {
             parsed.insert(
                 asset.clone(),
@@ -892,6 +971,8 @@ fn parse_source_state_with_metadata(
                     asset,
                     signed_size,
                     signed_notional,
+                    entry_price,
+                    unrealized_pnl,
                 },
             );
         }
@@ -968,7 +1049,14 @@ fn parse_mids(bytes: &[u8]) -> Result<MarketSnapshotResponse, PublicReadError> {
     Ok(MarketSnapshotResponse { mids })
 }
 
+#[cfg(test)]
 fn parse_metadata(bytes: &[u8]) -> Result<MarketMetadataResponse, PublicReadError> {
+    parse_metadata_with_technical_universe(bytes).map(|(metadata, _)| metadata)
+}
+
+fn parse_metadata_with_technical_universe(
+    bytes: &[u8],
+) -> Result<(MarketMetadataResponse, Vec<String>), PublicReadError> {
     let value: Value =
         serde_json::from_slice(bytes).map_err(|_| PublicReadError::InvalidPayload)?;
     let (metadata, raw_contexts) = match value.as_array() {
@@ -1004,12 +1092,19 @@ fn parse_metadata(bytes: &[u8]) -> Result<MarketMetadataResponse, PublicReadErro
         return Err(PublicReadError::InvalidPayload);
     }
     let mut contexts = BTreeMap::new();
+    let mut day_notionals = BTreeMap::new();
     if let Some(raw_contexts) = raw_contexts {
         if raw_contexts.len() != parsed.len() {
             return Err(PublicReadError::InvalidPayload);
         }
         for (asset, context) in parsed.iter().zip(raw_contexts) {
             let funding_rate_hourly = decimal_at(context, &["funding"])?;
+            if let Some(day_notional) = optional_decimal_at(context, "dayNtlVlm")? {
+                if day_notional < Decimal::ZERO {
+                    return Err(PublicReadError::InvalidPayload);
+                }
+                day_notionals.insert(asset.name.clone(), day_notional);
+            }
             contexts.insert(
                 asset.name.clone(),
                 MarketAssetContext {
@@ -1018,10 +1113,36 @@ fn parse_metadata(bytes: &[u8]) -> Result<MarketMetadataResponse, PublicReadErro
             );
         }
     }
-    Ok(MarketMetadataResponse {
-        universe: parsed,
-        contexts,
-    })
+    let technical_assets = ranked_technical_assets(&parsed, &day_notionals);
+    Ok((
+        MarketMetadataResponse {
+            universe: parsed,
+            contexts,
+        },
+        technical_assets,
+    ))
+}
+
+fn ranked_technical_assets(
+    universe: &[MarketMetadataAsset],
+    day_notionals: &BTreeMap<String, Decimal>,
+) -> Vec<String> {
+    let mut ranked = universe
+        .iter()
+        .map(|asset| asset.name.clone())
+        .collect::<Vec<_>>();
+    ranked.sort_by(
+        |left, right| match (day_notionals.get(left), day_notionals.get(right)) {
+            (Some(left_volume), Some(right_volume)) => {
+                right_volume.cmp(left_volume).then_with(|| left.cmp(right))
+            }
+            (Some(_), None) => std::cmp::Ordering::Less,
+            (None, Some(_)) => std::cmp::Ordering::Greater,
+            (None, None) => left.cmp(right),
+        },
+    );
+    ranked.truncate(TECHNICAL_UNIVERSE_LIMIT);
+    ranked
 }
 
 fn parse_book(asset: &str, bytes: &[u8]) -> Result<OrderBookResponse, PublicReadError> {
@@ -1074,6 +1195,10 @@ fn decimal_at(value: &Value, path: &[&str]) -> Result<Decimal, PublicReadError> 
         current = current.get(*part).ok_or(PublicReadError::InvalidPayload)?;
     }
     parse_decimal_value(current)
+}
+
+fn optional_decimal_at(value: &Value, field: &str) -> Result<Option<Decimal>, PublicReadError> {
+    value.get(field).map(parse_decimal_value).transpose()
 }
 
 fn parse_decimal_value(value: &Value) -> Result<Decimal, PublicReadError> {
@@ -1148,10 +1273,18 @@ mod tests {
 
     #[test]
     fn public_payload_parsers_reject_malformed_and_accept_documented_shapes() {
-        let state = br#"{"marginSummary":{"accountValue":"100"},"assetPositions":[{"position":{"coin":"BTC","szi":"-0.01","positionValue":"650"}}],"time":1}"#;
+        let state = br#"{"marginSummary":{"accountValue":"100"},"assetPositions":[{"position":{"coin":"BTC","szi":"-0.01","positionValue":"650","entryPx":"64000","unrealizedPnl":"10.5"}}],"time":1}"#;
         let address = "0x1111111111111111111111111111111111111111";
         let parsed = parse_source_state(address, state).unwrap();
         assert_eq!(parsed.positions["BTC"].signed_notional, Decimal::from(-650));
+        assert_eq!(
+            parsed.positions["BTC"].entry_price,
+            Some(Decimal::from(64_000))
+        );
+        assert_eq!(
+            parsed.positions["BTC"].unrealized_pnl,
+            Some(Decimal::new(105, 1))
+        );
         assert!(parse_source_state(address, b"{}").is_err());
         let zero = br#"{"marginSummary":{"accountValue":"0"},"assetPositions":[],"time":1}"#;
         let parsed_zero = parse_source_state(address, zero).unwrap();
@@ -1173,6 +1306,72 @@ mod tests {
     }
 
     #[test]
+    fn metadata_day_notional_selects_a_deterministic_bounded_technical_universe() {
+        let universe = (0..27)
+            .map(|index| {
+                json!({
+                    "name": format!("A{index:02}"),
+                    "szDecimals": 2
+                })
+            })
+            .collect::<Vec<_>>();
+        let contexts = (0..27)
+            .map(|index| {
+                let day_notional = if index < 2 { 1_000 } else { 1_000 - index };
+                json!({
+                    "funding": "0",
+                    "dayNtlVlm": day_notional.to_string()
+                })
+            })
+            .collect::<Vec<_>>();
+        let payload = serde_json::to_vec(&json!([
+            { "universe": universe },
+            contexts
+        ]))
+        .unwrap();
+
+        let (_, technical_assets) = parse_metadata_with_technical_universe(&payload).unwrap();
+
+        assert_eq!(technical_assets.len(), TECHNICAL_UNIVERSE_LIMIT);
+        assert_eq!(&technical_assets[..3], &["A00", "A01", "A02"]);
+        assert_eq!(technical_assets.last().map(String::as_str), Some("A24"));
+        assert!(!technical_assets.contains(&"A25".to_string()));
+        assert!(!technical_assets.contains(&"A26".to_string()));
+    }
+
+    #[test]
+    fn source_held_assets_are_unioned_outside_the_ranked_technical_limit() {
+        let mut state = TechnicalCandleFetchState::default();
+        state.replace_technical_assets(
+            (0..TECHNICAL_UNIVERSE_LIMIT).map(|index| format!("TECH{index:02}")),
+        );
+        let source_asset = SourceAssetPosition {
+            asset: "EXIT_ONLY".to_string(),
+            signed_size: Decimal::ONE,
+            signed_notional: Decimal::from(100),
+            entry_price: Some(Decimal::from(100)),
+            unrealized_pnl: Some(Decimal::ZERO),
+        };
+        state.replace_candidate_assets(
+            "0x1111111111111111111111111111111111111111",
+            &BTreeMap::from([(source_asset.asset.clone(), source_asset)]),
+        );
+
+        let assets = state.all_assets();
+        assert_eq!(assets.len(), TECHNICAL_UNIVERSE_LIMIT + 1);
+        assert!(assets.contains("EXIT_ONLY"));
+
+        state.replace_technical_assets(["ROTATED".to_string()]);
+        assert!(state.all_assets().contains("EXIT_ONLY"));
+
+        state.replace_candidate_assets(
+            "0x1111111111111111111111111111111111111111",
+            &BTreeMap::new(),
+        );
+        assert!(!state.all_assets().contains("EXIT_ONLY"));
+    }
+
+    #[test]
     fn candle_parser_accepts_every_required_interval_and_only_closed_rows() {
         for interval in CandleInterval::ALL {
             let payload = format!(
@@ -1180,10 +1379,27 @@ mod tests {
                 interval.api_name(),
                 interval.api_name()
             );
-            let candles = parse_candle_snapshot("BTC", interval, payload.as_bytes(), 200).unwrap();
+            let candles = parse_candle_snapshot(
+                "BTC",
+                interval,
+                payload.as_bytes(),
+                99 + CLOSED_CANDLE_FINALITY_DELAY_MS,
+            )
+            .unwrap();
             assert_eq!(candles.len(), 1);
             assert_eq!(candles[0].interval, interval);
         }
+    }
+
+    #[test]
+    fn candle_parser_does_not_accept_a_just_closed_row_as_final() {
+        let payload = br#"[{"t":1,"T":99,"s":"BTC","i":"15m","o":"100","c":"101","h":"102","l":"99","v":"12","n":3}]"#;
+        let before_finality =
+            parse_candle_snapshot("BTC", CandleInterval::FifteenMinutes, payload, 5_098).unwrap();
+        assert!(before_finality.is_empty());
+        let finalized =
+            parse_candle_snapshot("BTC", CandleInterval::FifteenMinutes, payload, 5_099).unwrap();
+        assert_eq!(finalized.len(), 1);
     }
 
     #[test]

@@ -2,6 +2,7 @@
 
 pub mod allocation;
 pub mod authorized_intent;
+pub mod cohort;
 pub mod confidence;
 pub mod configuration;
 pub mod consensus;
@@ -25,9 +26,21 @@ pub use allocation::{
     allocate_sparse_portfolio, AllocationError, SparseAllocation, SparseAllocationInput,
 };
 
+pub use cohort::{
+    aggregate_authoritative_positions, apply_wallet_quality_policy, classify_attribution,
+    resolve_very_profitable_membership, ActiveTwapContext, AttributionTag,
+    AuthoritativeWalletPosition, CohortAssetAggregate, CohortDecisionReason, CohortError,
+    CohortIndicatorRecord, CohortMembershipResolution, CohortPenalties, CohortRiskFlags,
+    CohortSignalInput, FilteredCohortWallet, HyperdashMembershipSnapshot, MembershipCompleteness,
+    VeryProfitableCohortEngine, WalletFilterReason, WalletQualificationPathway,
+    WalletQualityDecision, WalletQualityObservation, WalletQualityPolicy, COHORT_ACTIVATION_SCORE,
+    COHORT_CHASE_LIMIT_R, HIGH_DENSITY_RETAINED_FILL_COUNT, VERY_PROFITABLE_COHORT_ID,
+    VERY_PROFITABLE_COHORT_URL, VERY_PROFITABLE_MAX_ALL_TIME_PNL_USD,
+    VERY_PROFITABLE_MIN_ALL_TIME_PNL_USD,
+};
 pub use configuration::{
     CopyTradeConfig, GlobalRiskConfig, LeverageCurvePoint, TraderCandidate,
-    LIVE_CONFIG_SCHEMA_VERSION,
+    VeryProfitableLayerIdentity, LIVE_CONFIG_SCHEMA_VERSION,
 };
 pub use consensus::{
     accept_source_exposure_state, bounded_additive_consensus, ConsensusInput, ConsensusResult,
@@ -40,6 +53,7 @@ pub use execution_floor::{
 };
 pub use target_state::{TargetStateError, VirtualTargetLedger, VirtualTargetState};
 pub use technical::{
-    CandleAcceptance, CandleInterval, ClosedCandle, CostEstimate, MarketRegime, SignalArchetype,
-    TechnicalEngine, TechnicalError, TechnicalState, TechnicalStrategyConfig, TechnicalTarget,
+    CandleAcceptance, CandleConflict, CandleFieldDifference, CandleInterval, ClosedCandle,
+    CostEstimate, MarketRegime, SignalArchetype, TechnicalEngine, TechnicalError, TechnicalFunnel,
+    TechnicalState, TechnicalStrategyConfig, TechnicalTarget,
 };

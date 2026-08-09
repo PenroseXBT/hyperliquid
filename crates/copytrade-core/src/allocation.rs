@@ -115,12 +115,17 @@ pub fn allocate_sparse_portfolio(
             retained.insert(asset, residual);
             continue;
         }
-        // A direction flip is a deterministic close-first transition. The
-        // opposite residual remains represented by the raw absolute target.
+        // A direction flip is normally a deterministic close-first
+        // transition. If the destination itself is below the opening floor,
+        // splitting the executable residual into two exchange orders would
+        // make the second leg invalid. Preserve that narrow reversal as one
+        // crossing order: the execution ledger still closes the old
+        // attribution before opening the new one.
         let staged_desired = if class == 1
             && !current.is_zero()
             && !desired.is_zero()
             && current.is_sign_positive() != desired.is_sign_positive()
+            && desired.abs() >= floor.minimum_opening_notional
         {
             Decimal::ZERO
         } else {
@@ -442,6 +447,27 @@ mod tests {
         ))
         .unwrap();
         assert_eq!(result.admitted_targets["ETH"], Decimal::ZERO);
+    }
+
+    #[test]
+    fn executable_reversal_delta_is_not_lost_to_subminimum_destination() {
+        let raw: BTreeMap<String, Decimal> = [("PENDLE".into(), d("6.34"))].into_iter().collect();
+        let filled = [("PENDLE".into(), d("-30.61"))].into_iter().collect();
+        let floors = floors(raw.keys().cloned());
+        let result = allocate_sparse_portfolio(&input(
+            &raw,
+            &BTreeMap::new(),
+            &filled,
+            &BTreeMap::new(),
+            &floors,
+        ))
+        .unwrap();
+        assert_eq!(result.admitted_targets["PENDLE"], d("6.34"));
+        assert!(result.retained_below_minimum.is_empty());
+        assert_eq!(
+            result.admitted_targets["PENDLE"] - filled["PENDLE"],
+            d("36.95")
+        );
     }
 
     #[test]

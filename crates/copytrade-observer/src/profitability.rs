@@ -1,4 +1,4 @@
-use crate::live_shadow::{EquityReturnBucket, ShadowActionAccounting};
+use crate::live_shadow::{EconomicAttribution, EquityReturnBucket, ShadowActionAccounting};
 use copytrade_core::ledger::{DualLedger, PortfolioEpisode, SourceEpisode};
 use rust_decimal::prelude::ToPrimitive;
 use rust_decimal::Decimal;
@@ -7,9 +7,20 @@ use std::collections::BTreeMap;
 
 #[derive(Debug, Clone, Serialize)]
 pub struct ProfitabilitySummary {
+    pub realized_pnl_scope: &'static str,
+    pub turnover_scope: &'static str,
+    pub settled_equity_scope: &'static str,
+    pub total_net_pnl_formula: &'static str,
+    pub execution_slippage_sign_convention: &'static str,
+    pub all_action_cost_scope: &'static str,
     pub starting_equity: Decimal,
     pub ending_equity: Decimal,
     pub equity_change_including_open_positions: Decimal,
+    pub ending_settled_equity: Decimal,
+    pub settled_equity_growth: Decimal,
+    pub settled_equity_return_on_starting_equity: Decimal,
+    pub gross_turnover: Decimal,
+    pub gross_turnover_multiple_on_starting_equity: Decimal,
     pub total_gross_pnl: Decimal,
     pub total_net_pnl: Decimal,
     pub fees: Decimal,
@@ -26,6 +37,8 @@ pub struct ProfitabilitySummary {
     pub maximum_drawdown: Decimal,
     pub pnl_by_asset: BTreeMap<String, Decimal>,
     pub pnl_by_source: BTreeMap<String, Decimal>,
+    pub execution_net_pnl_by_attribution: BTreeMap<EconomicAttribution, Decimal>,
+    pub settled_equity_return_by_attribution: BTreeMap<EconomicAttribution, Decimal>,
     pub maximum_asset_pnl_concentration: Decimal,
     pub maximum_source_pnl_concentration: Decimal,
     pub portfolio_annualized_sharpe_5m: f64,
@@ -53,6 +66,27 @@ pub fn summarize_profitability(
     let equity_change_including_open_positions = ending_equity
         .checked_sub(starting_equity)
         .ok_or("equity change overflow")?;
+    let ending_settled_equity = executions
+        .last()
+        .map_or(starting_equity, |execution| execution.settled_equity);
+    let settled_equity_growth = ending_settled_equity
+        .checked_sub(starting_equity)
+        .ok_or("settled equity growth overflow")?;
+    let settled_equity_return_on_starting_equity = if starting_equity.is_zero() {
+        Decimal::ZERO
+    } else {
+        settled_equity_growth
+            .checked_div(starting_equity)
+            .ok_or("settled equity return overflow")?
+    };
+    let gross_turnover = sum(executions.iter().map(|execution| execution.filled_notional))?;
+    let gross_turnover_multiple_on_starting_equity = if starting_equity.is_zero() {
+        Decimal::ZERO
+    } else {
+        gross_turnover
+            .checked_div(starting_equity)
+            .ok_or("turnover multiple overflow")?
+    };
     let all_action_fees = sum(executions.iter().map(|execution| execution.fees))?;
     let all_action_funding = sum(executions.iter().map(|execution| execution.funding))?;
     let all_action_slippage = sum(executions
@@ -90,6 +124,29 @@ pub fn summarize_profitability(
         .transpose()?;
     let pnl_by_asset = group_portfolio(episodes)?;
     let pnl_by_source = group_sources(&source_episodes)?;
+    let mut execution_net_pnl_by_attribution = BTreeMap::new();
+    for execution in executions {
+        let entry = execution_net_pnl_by_attribution
+            .entry(execution.economic_attribution)
+            .or_insert(Decimal::ZERO);
+        *entry = entry
+            .checked_add(execution.net_pnl_delta)
+            .ok_or("execution attribution PnL overflow")?;
+    }
+    let settled_equity_return_by_attribution = execution_net_pnl_by_attribution
+        .iter()
+        .map(|(attribution, pnl)| {
+            Ok((
+                *attribution,
+                if starting_equity.is_zero() {
+                    Decimal::ZERO
+                } else {
+                    pnl.checked_div(starting_equity)
+                        .ok_or("execution attribution return overflow")?
+                },
+            ))
+        })
+        .collect::<Result<BTreeMap<_, _>, String>>()?;
     let episode_cost_formula_verified = episodes.iter().all(cost_formula_holds);
     let portfolio_closed_net = sum(episodes.iter().map(|episode| episode.net_pnl))?;
     let source_closed_net = sum(source_episodes
@@ -128,9 +185,22 @@ pub fn summarize_profitability(
         && total_net_pnl > Decimal::ZERO
         && profit_factor.is_some_and(|value| value > Decimal::ONE);
     Ok(ProfitabilitySummary {
+        realized_pnl_scope: "closed_portfolio_episodes",
+        turnover_scope: "all_modeled_execution_filled_notional_in_window",
+        settled_equity_scope: "realized_execution_state_only_excluding_open_mark_to_market",
+        total_net_pnl_formula:
+            "total_gross_pnl - fees - funding - execution_slippage = total_net_pnl",
+        execution_slippage_sign_convention:
+            "signed_cost_subtracted_from_gross; negative values improve total_net_pnl",
+        all_action_cost_scope: "all_modeled_executions_including_open_positions",
         starting_equity,
         ending_equity,
         equity_change_including_open_positions,
+        ending_settled_equity,
+        settled_equity_growth,
+        settled_equity_return_on_starting_equity,
+        gross_turnover,
+        gross_turnover_multiple_on_starting_equity,
         total_gross_pnl,
         total_net_pnl,
         fees,
@@ -147,6 +217,8 @@ pub fn summarize_profitability(
         maximum_drawdown,
         pnl_by_asset,
         pnl_by_source,
+        execution_net_pnl_by_attribution,
+        settled_equity_return_by_attribution,
         maximum_asset_pnl_concentration,
         maximum_source_pnl_concentration,
         portfolio_annualized_sharpe_5m: annualized_sharpe_5m(&portfolio_returns),
@@ -445,7 +517,10 @@ mod tests {
             source_attributed_returns: BTreeMap::new(),
             position_before: Decimal::ZERO,
             position_after: Decimal::ONE,
+            component_close_quantities: BTreeMap::new(),
+            component_open_quantities: BTreeMap::new(),
             source_filled_quantities: BTreeMap::new(),
+            economic_attribution: EconomicAttribution::TechnicalOnly,
         };
         let summary =
             summarize_profitability(Decimal::from(1_000), &[accounting], &buckets, &ledger)
@@ -457,6 +532,11 @@ mod tests {
         assert_eq!(summary.total_net_pnl, Decimal::ZERO);
         assert_eq!(summary.fees, Decimal::ZERO);
         assert_eq!(summary.all_action_fees, Decimal::ONE);
+        assert_eq!(summary.gross_turnover, Decimal::from(100));
+        assert_eq!(
+            summary.execution_net_pnl_by_attribution[&EconomicAttribution::TechnicalOnly],
+            Decimal::from(-3)
+        );
         assert!(!summary.positive_edge_signal);
     }
 }

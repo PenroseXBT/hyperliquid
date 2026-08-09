@@ -530,6 +530,7 @@ name = "copytrade-observer"
 version = "0.1.0"
 dependencies = [
  "copytrade-core",
+ "fs2",
  "futures-util",
  "reqwest",
  "rmp-serde",

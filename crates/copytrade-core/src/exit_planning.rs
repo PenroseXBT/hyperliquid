@@ -102,9 +102,27 @@ pub fn plan_risk_reducing_ioc(
         ResidualClass::RiskReduction => residual.abs().min(input.filled_notional.abs()),
         _ => return Err(ExitPlanningBlock::ExposureIncreasing),
     };
-    let raw_quantity = intended_notional
-        .checked_div(input.reference_price)
-        .ok_or(ExitPlanningBlock::ArithmeticOverflow("exit quantity"))?;
+    let raw_quantity = match class {
+        ResidualClass::FullExit | ResidualClass::DirectionFlipCloseLeg => {
+            input.filled_quantity.abs()
+        }
+        ResidualClass::RiskReduction => {
+            let destination_quantity = input
+                .desired_target_notional
+                .abs()
+                .checked_div(input.reference_price)
+                .ok_or(ExitPlanningBlock::ArithmeticOverflow(
+                    "destination quantity",
+                ))?;
+            input
+                .filled_quantity
+                .abs()
+                .checked_sub(destination_quantity)
+                .ok_or(ExitPlanningBlock::ArithmeticOverflow("reduction quantity"))?
+                .max(Decimal::ZERO)
+        }
+        _ => return Err(ExitPlanningBlock::ExposureIncreasing),
+    };
     let quantity =
         round_down(raw_quantity, input.market_rules.size_step)?.min(input.filled_quantity.abs());
     let floor = execution_floor_for_asset(side, input.market_rules, input.execution_floor_policy)
@@ -246,6 +264,65 @@ mod tests {
     }
 
     #[test]
+    fn reductions_are_quantity_based_for_both_sides() {
+        let cases = [
+            (
+                Decimal::from(20),
+                Decimal::new(2, 1),
+                Decimal::ZERO,
+                Side::Sell,
+                Decimal::new(2, 1),
+            ),
+            (
+                Decimal::from(-20),
+                Decimal::new(-2, 1),
+                Decimal::ZERO,
+                Side::Buy,
+                Decimal::new(2, 1),
+            ),
+            (
+                Decimal::from(40),
+                Decimal::new(4, 1),
+                Decimal::from(20),
+                Side::Sell,
+                Decimal::new(2, 1),
+            ),
+            (
+                Decimal::from(-40),
+                Decimal::new(-4, 1),
+                Decimal::from(-20),
+                Side::Buy,
+                Decimal::new(2, 1),
+            ),
+        ];
+        for (filled_notional, filled_quantity, desired, side, expected_quantity) in cases {
+            let mut value = input(desired);
+            value.filled_notional = filled_notional;
+            value.filled_quantity = filled_quantity;
+            let plan = plan_risk_reducing_ioc(&value).unwrap();
+            assert!(plan.reduce_only);
+            assert_eq!(plan.side, side);
+            assert_eq!(plan.quantity, expected_quantity);
+            assert!(plan.quantity <= filled_quantity.abs());
+        }
+    }
+
+    #[test]
+    fn size_rounding_cannot_overshoot_a_partial_reduction() {
+        let mut value = input(Decimal::from(5));
+        value.filled_notional = Decimal::new(205, 1);
+        value.filled_quantity = Decimal::new(205, 3);
+        value.market_rules = Box::leak(Box::new(MarketRules {
+            size_step: Decimal::new(1, 2),
+            ..rules()
+        }));
+        let plan = plan_risk_reducing_ioc(&value).unwrap();
+        assert_eq!(plan.quantity, Decimal::new(15, 2));
+        assert!(plan.quantity <= value.filled_quantity.abs());
+        assert!(value.filled_quantity - plan.quantity > Decimal::ZERO);
+    }
+
+    #[test]
     fn outstanding_unknown_blocks_another_exit_order() {
         let mut value = input(Decimal::ZERO);
         value.unknown_result_notional = Decimal::from(-10);
@@ -264,5 +341,43 @@ mod tests {
             plan_risk_reducing_ioc(&value),
             Err(ExitPlanningBlock::BelowExchangeMinimum { .. })
         ));
+    }
+
+    #[test]
+    fn flatten_quantity_is_committed_quantity_despite_price_drift() {
+        let rules = Box::leak(Box::new(MarketRules {
+            mark_price: Decimal::new(1464, 4),
+            price_tick: Decimal::new(1, 4),
+            size_step: Decimal::new(1, 2),
+        }));
+        let snapshot = Box::leak(Box::new(ShadowMarketSnapshot {
+            snapshot_id: MarketSnapshotId([2; 32]),
+            observed_at_mono: 1,
+            midpoint: Decimal::new(1464, 4),
+            bids: vec![DepthLevel {
+                price: Decimal::new(1463, 4),
+                quantity: Decimal::from(100),
+            }],
+            asks: vec![],
+        }));
+        let plan = plan_risk_reducing_ioc(&ExitPlanningInput {
+            asset: Box::leak(Box::new("ACE".to_string())),
+            desired_target_notional: Decimal::ZERO,
+            filled_notional: Decimal::new(1_302_667_2, 6),
+            filled_quantity: Decimal::new(8_898, 2),
+            acknowledged_open_notional: Decimal::ZERO,
+            unknown_result_notional: Decimal::ZERO,
+            continuation_notional: Decimal::ZERO,
+            reference_price: Decimal::new(1464, 4),
+            market_rules: rules,
+            market_snapshot: snapshot,
+            execution_floor_policy: policy(),
+            execution_cushion: Decimal::new(1, 3),
+            maximum_slippage: Decimal::new(1, 2),
+        })
+        .unwrap();
+
+        assert!(plan.reduce_only);
+        assert_eq!(plan.quantity, Decimal::new(8_898, 2));
     }
 }

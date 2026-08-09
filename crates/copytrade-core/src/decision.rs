@@ -669,12 +669,23 @@ pub fn construct_planned_actions(
 ) -> Result<Vec<PlannedAction>, IdentityError> {
     let mut actions = Vec::new();
     for (asset, delta) in &decision.projection.rounded_deltas {
-        if delta.is_zero() {
+        let reduce_only = reduce_only_by_asset.get(asset).copied().unwrap_or(false);
+        let actionable_delta = if delta.is_zero() && reduce_only {
+            decision
+                .projection
+                .proposed_deltas
+                .get(asset)
+                .copied()
+                .unwrap_or_default()
+        } else {
+            *delta
+        };
+        if actionable_delta.is_zero() {
             continue;
         }
         let action_ordinal = u32::try_from(actions.len())
             .map_err(|_| IdentityError::ArithmeticOverflow("action ordinal"))?;
-        let side = if *delta > Decimal::ZERO {
+        let side = if actionable_delta > Decimal::ZERO {
             Side::Buy
         } else {
             Side::Sell
@@ -686,7 +697,7 @@ pub fn construct_planned_actions(
             target_version: decision.target_version,
             asset: asset.clone(),
             side,
-            reduce_only: reduce_only_by_asset.get(asset).copied().unwrap_or(false),
+            reduce_only,
             action_ordinal,
             retry_generation,
         };
@@ -695,7 +706,10 @@ pub fn construct_planned_actions(
             target_version: decision.target_version,
             asset: asset.clone(),
             side,
-            rounded_notional: delta.abs(),
+            // For a reduction rounded to zero at target projection this is a
+            // trigger notional. The existing reduce-only book-time planner
+            // derives the exact closable quantity from committed quantity.
+            rounded_notional: actionable_delta.abs(),
             reduce_only: cloid_input.reduce_only,
             action_ordinal,
             retry_generation,
@@ -991,6 +1005,44 @@ mod tests {
     }
 
     #[test]
+    fn anime_technical_neutralization_emits_existing_reduce_only_flatten() {
+        let mut input = construction_input();
+        input.consensus_inputs = BTreeMap::from([(
+            "ANIME".to_string(),
+            vec![consensus_input("candidate-001", 0.0)],
+        )]);
+        input.projection_input.filled_positions =
+            BTreeMap::from([("ANIME".to_string(), decimal("36.97484"))]);
+        input.projection_input.market_rules = BTreeMap::from([(
+            "ANIME".to_string(),
+            MarketRules {
+                mark_price: decimal("0.00259"),
+                price_tick: decimal("0.000001"),
+                size_step: decimal("1"),
+            },
+        )]);
+
+        let decision = construct_decision(input).unwrap();
+        assert_eq!(
+            decision.micro_slots["ANIME"].admitted_notional,
+            Decimal::ZERO
+        );
+        assert_eq!(
+            decision.projection.rounded_deltas["ANIME"],
+            decimal("-36.97484")
+        );
+        let actions = construct_planned_actions(
+            EngineInstanceId([1; 16]),
+            &decision,
+            &BTreeMap::from([("ANIME".to_string(), true)]),
+        )
+        .unwrap();
+        assert_eq!(actions.len(), 1);
+        assert_eq!(actions[0].side, Side::Sell);
+        assert!(actions[0].reduce_only);
+    }
+
+    #[test]
     fn planned_cloids_are_replayable_and_sensitive_to_every_action_dimension() {
         let decision = construct_decision(construction_input()).unwrap();
         let base = PlannedCloidInput {
@@ -1026,6 +1078,36 @@ mod tests {
         assert!(variants
             .iter()
             .all(|variant| derive_planned_cloid(variant).unwrap() != first));
+    }
+
+    #[test]
+    fn projection_rounding_cannot_erase_a_reduce_only_trigger() {
+        let mut decision = construct_decision(construction_input()).unwrap();
+        decision
+            .projection
+            .proposed_deltas
+            .insert("BTC".into(), decimal("-0.09"));
+        decision
+            .projection
+            .rounded_deltas
+            .insert("BTC".into(), Decimal::ZERO);
+
+        let actions = construct_planned_actions(
+            EngineInstanceId([1; 16]),
+            &decision,
+            &BTreeMap::from([("BTC".to_string(), true)]),
+        )
+        .unwrap();
+        assert_eq!(actions.len(), 1);
+        assert_eq!(actions[0].side, Side::Sell);
+        assert!(actions[0].reduce_only);
+        assert_eq!(actions[0].rounded_notional, decimal("0.09"));
+
+        assert!(
+            construct_planned_actions(EngineInstanceId([1; 16]), &decision, &BTreeMap::new(),)
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[test]
