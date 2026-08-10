@@ -122,6 +122,7 @@ pub fn summarize_profitability(
     let profit_factor = (!losses.is_zero())
         .then(|| gains.checked_div(losses).ok_or("profit factor overflow"))
         .transpose()?;
+    let profit_factor_pass = profit_factor_pass(episodes.len(), gains, losses, profit_factor);
     let pnl_by_asset = group_portfolio(episodes)?;
     let pnl_by_source = group_sources(&source_episodes)?;
     let mut execution_net_pnl_by_attribution = BTreeMap::new();
@@ -148,11 +149,13 @@ pub fn summarize_profitability(
         })
         .collect::<Result<BTreeMap<_, _>, String>>()?;
     let episode_cost_formula_verified = episodes.iter().all(cost_formula_holds);
-    let portfolio_closed_net = sum(episodes.iter().map(|episode| episode.net_pnl))?;
-    let source_closed_net = sum(source_episodes
-        .iter()
-        .map(|episode| episode.modeled_net_pnl))?;
-    let portfolio_source_books_reconcile = portfolio_closed_net == source_closed_net;
+    let portfolio_source_books_reconcile =
+        exact_decimal_sum(episodes.iter().map(|episode| episode.net_pnl))?
+            == exact_decimal_sum(
+                source_episodes
+                    .iter()
+                    .map(|episode| episode.modeled_net_pnl),
+            )?;
     let portfolio_returns = buckets
         .iter()
         .map(|bucket| bucket.return_fraction)
@@ -181,9 +184,8 @@ pub fn summarize_profitability(
         && portfolio_source_books_reconcile
         && bucket_structure_verified
         && buckets.len() == 48;
-    let positive_edge_signal = engineering_measurement_complete
-        && total_net_pnl > Decimal::ZERO
-        && profit_factor.is_some_and(|value| value > Decimal::ONE);
+    let positive_edge_signal =
+        engineering_measurement_complete && total_net_pnl > Decimal::ZERO && profit_factor_pass;
     Ok(ProfitabilitySummary {
         realized_pnl_scope: "closed_portfolio_episodes",
         turnover_scope: "all_modeled_execution_filled_notional_in_window",
@@ -256,6 +258,20 @@ fn cost_formula_holds(episode: &PortfolioEpisode) -> bool {
         .and_then(|value| value.checked_sub(episode.funding))
         .and_then(|value| value.checked_sub(episode.slippage))
         == Some(episode.net_pnl)
+}
+
+fn profit_factor_pass(
+    closed_episode_count: usize,
+    gains: Decimal,
+    losses: Decimal,
+    displayed_profit_factor: Option<Decimal>,
+) -> bool {
+    closed_episode_count > 0
+        && if losses.is_zero() {
+            !gains.is_zero()
+        } else {
+            displayed_profit_factor.is_some_and(|value| value > Decimal::ONE)
+        }
 }
 
 fn group_portfolio(episodes: &[PortfolioEpisode]) -> Result<BTreeMap<String, Decimal>, String> {
@@ -349,6 +365,25 @@ fn sum(mut values: impl Iterator<Item = Decimal>) -> Result<Decimal, String> {
     })
 }
 
+// Compare ledger totals in Decimal's full persisted value space. Repeated
+// Decimal addition can shed low-order digits once an intermediate coefficient
+// no longer fits the 96-bit representation, making mathematically identical
+// books differ solely because their episode order/partition differs.
+pub(crate) fn exact_decimal_sum(mut values: impl Iterator<Item = Decimal>) -> Result<i128, String> {
+    const MAX_SCALE: u32 = 28;
+    values.try_fold(0_i128, |sum, value| {
+        let scale_factor = 10_i128
+            .checked_pow(MAX_SCALE - value.scale())
+            .ok_or_else(|| "exact decimal scale overflow".to_string())?;
+        let scaled = value
+            .mantissa()
+            .checked_mul(scale_factor)
+            .ok_or_else(|| "exact decimal value overflow".to_string())?;
+        sum.checked_add(scaled)
+            .ok_or_else(|| "exact decimal sum overflow".to_string())
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -356,6 +391,34 @@ mod tests {
         DecisionId, MarketSnapshotId, PlannedAction, PlannedCloid, Side, TargetVersion,
     };
     use copytrade_core::shadow::{LatencyScenario, ShadowExecution, ShadowExecutionId};
+    use std::str::FromStr;
+
+    #[test]
+    fn reconciliation_is_independent_of_decimal_addition_order() {
+        let tiny = Decimal::from_str("0.0000000000000000000000000001").unwrap();
+        let portfolio = [Decimal::from(50), Decimal::from(-50), tiny];
+        let components = [Decimal::from(50), tiny, Decimal::from(-50)];
+
+        assert_ne!(
+            sum(portfolio.into_iter()).unwrap(),
+            sum(components.into_iter()).unwrap()
+        );
+        assert_eq!(
+            exact_decimal_sum(portfolio.into_iter()).unwrap(),
+            exact_decimal_sum(components.into_iter()).unwrap()
+        );
+    }
+
+    #[test]
+    fn all_winner_profit_factor_representation_passes_economically() {
+        let gains = Decimal::from(10);
+        let losses = Decimal::ZERO;
+        let profit_factor: Option<Decimal> = None;
+
+        assert!(profit_factor_pass(2, gains, losses, profit_factor));
+        assert_eq!(profit_factor, None);
+        assert!(!profit_factor_pass(0, Decimal::ZERO, Decimal::ZERO, None));
+    }
 
     #[test]
     fn zero_trade_buckets_remain_in_sharpe_sample() {

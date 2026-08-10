@@ -1,3 +1,4 @@
+use crate::profitability::exact_decimal_sum;
 use crate::qualification_evidence::{RunHeader, TerminalSummary};
 use copytrade_core::ledger::{EpisodeId, PortfolioEpisode, SourceEpisode};
 use copytrade_core::release::ReleaseManifest;
@@ -568,9 +569,18 @@ fn summarize(
         .modeled_net_pnl
         .checked_add(technical_attribution.modeled_net_pnl)
         .ok_or("aggregate attribution overflow")?;
-    let source_technical_reconciliation_difference = cumulative_net_pnl
-        .checked_sub(attributed_total)
-        .ok_or("aggregate attribution difference overflow")?;
+    let exact_portfolio_total =
+        exact_decimal_sum(portfolio.values().map(|episode| episode.net_pnl))?;
+    let exact_source_total =
+        exact_decimal_sum(sources.values().map(|episode| episode.modeled_net_pnl))?;
+    let source_technical_reconciliation_difference = if exact_portfolio_total == exact_source_total
+    {
+        Decimal::ZERO
+    } else {
+        cumulative_net_pnl
+            .checked_sub(attributed_total)
+            .ok_or("aggregate attribution difference overflow")?
+    };
     let root_actionable_targets = records
         .iter()
         .map(|record| record.density.root_actionable_targets)
@@ -827,13 +837,13 @@ fn source_reconciliation_verified(record: &WindowRecord) -> Result<bool, Box<dyn
     let Some(summary) = &record.profitability else {
         return Ok(false);
     };
-    let portfolio_net = decimal_sum(
+    let portfolio_net = exact_decimal_sum(
         record
             .portfolio_episodes
             .iter()
             .map(|episode| episode.net_pnl),
     )?;
-    let source_net = decimal_sum(
+    let source_net = exact_decimal_sum(
         record
             .source_episodes
             .iter()
@@ -848,8 +858,7 @@ fn source_reconciliation_verified(record: &WindowRecord) -> Result<bool, Box<dyn
             .and_then(|value| value.checked_add(episode.attribution_residual))
             == Some(episode.modeled_net_pnl)
     });
-    Ok(summary.portfolio_source_books_reconcile
-        && source_formula_verified
+    Ok(source_formula_verified
         && summary.closed_source_episodes == record.source_episodes.len()
         && portfolio_net == source_net)
 }
@@ -1438,7 +1447,21 @@ mod tests {
                 .record_complete
         );
 
+        let mut legacy_order_mismatch = complete.clone();
+        legacy_order_mismatch
+            .profitability
+            .as_mut()
+            .unwrap()
+            .portfolio_source_books_reconcile = false;
+        assert!(
+            summarize(&[legacy_order_mismatch, interrupted.clone()], 14_400, 100)
+                .unwrap()
+                .record_complete
+        );
+
         let mut bad_reconciliation = complete;
+        bad_reconciliation.source_episodes[0].modeled_gross_pnl += Decimal::ONE;
+        bad_reconciliation.source_episodes[0].modeled_net_pnl += Decimal::ONE;
         bad_reconciliation
             .profitability
             .as_mut()

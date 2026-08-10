@@ -206,20 +206,6 @@ fn include_held_assets_in_target_universe(
     }
 }
 
-fn technical_gated_source_exposure(
-    high_density_source: Decimal,
-    technical_target: Decimal,
-) -> Decimal {
-    if high_density_source.is_zero()
-        || technical_target.is_zero()
-        || high_density_source.is_sign_positive() != technical_target.is_sign_positive()
-    {
-        Decimal::ZERO
-    } else {
-        high_density_source
-    }
-}
-
 fn source_target_adds_risk(current: Decimal, desired: Decimal) -> bool {
     !desired.is_zero()
         && (current.is_zero()
@@ -263,6 +249,7 @@ struct ActiveSourceObservation {
     entry_midpoint: Decimal,
     entry_timestamp: Timestamp,
     direction: SourceSignalDirection,
+    proposed_target: Decimal,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -322,9 +309,10 @@ fn update_source_expectancy(
     Ok(())
 }
 
-fn observe_source_signal(
+fn observe_source_transition(
     states: &mut BTreeMap<String, SourceExpectancyState>,
     asset: &str,
+    current_target: Decimal,
     desired_target: Decimal,
     midpoint: Decimal,
     now: Timestamp,
@@ -338,7 +326,10 @@ fn observe_source_signal(
     }
     let state = states.entry(asset.to_string()).or_default();
     if state.active.as_ref().is_some_and(|active| {
-        desired_direction.map_or(true, |direction| direction != active.direction)
+        desired_direction.map_or(true, |direction| {
+            direction != active.direction
+                || !source_target_adds_risk(current_target, desired_target)
+        })
     }) {
         let active = state
             .active
@@ -363,11 +354,12 @@ fn observe_source_signal(
         )?;
     }
     if let Some(direction) = desired_direction {
-        if state.active.is_none() {
+        if state.active.is_none() && source_target_adds_risk(current_target, desired_target) {
             state.active = Some(ActiveSourceObservation {
                 entry_midpoint: midpoint,
                 entry_timestamp: now,
                 direction,
+                proposed_target: desired_target,
             });
         }
         Ok(state.estimate(direction).clone())
@@ -1346,7 +1338,7 @@ pub struct LiveShadowEngine {
     snapshot_generation: Option<u64>,
 }
 
-pub const UNSIGNED_SNAPSHOT_SCHEMA_VERSION: u32 = 5;
+pub const UNSIGNED_SNAPSHOT_SCHEMA_VERSION: u32 = 6;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -2139,7 +2131,9 @@ impl LiveShadowEngine {
                 aggregate: aggregate.clone(),
                 filtered_wallet_consensus,
                 active_twap: active_twap.cloned(),
-                market_confirmation: technical_score,
+                // Preserve the observed technical target on the record below,
+                // but do not let it influence source activation or sizing.
+                market_confirmation: Decimal::ZERO,
                 penalties: CohortPenalties {
                     chase: chase_penalty,
                     crowding: crowding_penalty,
@@ -2376,8 +2370,7 @@ impl LiveShadowEngine {
         let mut eligibility = SourceEligibilitySummary::default();
         let mut members = Vec::new();
         let mut consensus_inputs: BTreeMap<String, Vec<ConsensusInput>> = BTreeMap::new();
-        let mut technical_gated_high_density_inputs: BTreeMap<String, Vec<ConsensusInput>> =
-            BTreeMap::new();
+        let mut high_density_source_inputs: BTreeMap<String, Vec<ConsensusInput>> = BTreeMap::new();
         let mut source_contributions: BTreeMap<String, BTreeMap<String, Decimal>> = BTreeMap::new();
         let mut existing_wallet_consensus = BTreeMap::new();
         let mut fresh_source_states = Vec::new();
@@ -2444,7 +2437,7 @@ impl LiveShadowEngine {
                     // direction, but cannot independently create exposure.
                     // Their vote is admitted only after the technical engine
                     // has produced a same-direction target for this asset.
-                    technical_gated_high_density_inputs
+                    high_density_source_inputs
                         .entry(asset.clone())
                         .or_default()
                         .push(input);
@@ -2615,54 +2608,22 @@ impl LiveShadowEngine {
                         ))
                     })?
                 {
-                    let score = target.score.to_f64().ok_or(LiveShadowError::Arithmetic)?;
-                    let component_id = format!(
-                        "technical:{}:{}",
-                        target.archetype.as_str(),
-                        target.regime.as_str()
-                    );
-                    consensus_inputs
-                        .entry(asset.clone())
-                        .or_default()
-                        .push(ConsensusInput {
-                            candidate_id: component_id.clone(),
-                            allocation_weight: self.config.technical.technical_budget_fraction,
-                            confidence_modifier: 1.0,
-                            source_exposure: score,
-                            enabled: true,
-                            quarantined: false,
-                            snapshot_age_ms: 0,
-                        });
-                    source_contributions
-                        .entry(asset.clone())
-                        .or_default()
-                        .insert(
-                            component_id,
-                            Decimal::from_f64(
-                                self.config.technical.technical_budget_fraction * score,
-                            )
-                            .ok_or(LiveShadowError::Arithmetic)?,
-                        );
+                    // Technical state is context for source-led exposure. It is
+                    // deliberately not an independent consensus input, so its
+                    // budget remains a ceiling rather than a turnover quota.
                     self.technical_targets.insert(asset, target);
                 }
             }
         }
-        for (asset, high_density_inputs) in technical_gated_high_density_inputs {
+        for (asset, high_density_inputs) in high_density_source_inputs {
             let high_density = bounded_additive_consensus(
                 &high_density_inputs,
                 self.config.global_risk.max_source_exposure,
                 self.config.global_risk.source_snapshot_max_age_ms,
             )
             .map_err(|error| LiveShadowError::Core(error.to_string()))?;
-            let technical_score = self
-                .technical_targets
-                .get(&asset)
-                .map(|target| target.score)
-                .unwrap_or_default();
-            let admitted_high_density = technical_gated_source_exposure(
-                Decimal::from_f64(high_density.exposure).ok_or(LiveShadowError::Arithmetic)?,
-                technical_score,
-            );
+            let admitted_high_density =
+                Decimal::from_f64(high_density.exposure).ok_or(LiveShadowError::Arithmetic)?;
             let regular_source = existing_wallet_consensus
                 .get(&asset)
                 .copied()
@@ -2751,7 +2712,7 @@ impl LiveShadowEngine {
                 self.config.global_risk.source_snapshot_max_age_ms,
             )
             .map_err(|error| LiveShadowError::Core(error.to_string()))?;
-            let desired_source_target = available_gross
+            let raw_desired_source_target = available_gross
                 .checked_mul(
                     Decimal::from_f64(desired_source.exposure)
                         .ok_or(LiveShadowError::Arithmetic)?,
@@ -2778,14 +2739,15 @@ impl LiveShadowEngine {
                 .values()
                 .try_fold(Decimal::ZERO, |sum, target| sum.checked_add(*target))
                 .ok_or(LiveShadowError::Arithmetic)?;
-            let source_expectancy = observe_source_signal(
+            let source_expectancy = observe_source_transition(
                 &mut self.source_expectancy,
                 asset,
-                desired_source_target,
+                current_source_target,
+                raw_desired_source_target,
                 mark,
                 source_expectancy_now,
             )?;
-            if !source_target_adds_risk(current_source_target, desired_source_target) {
+            if !source_target_adds_risk(current_source_target, raw_desired_source_target) {
                 continue;
             }
             let holding_hours = source_expectancy
@@ -2820,7 +2782,7 @@ impl LiveShadowEngine {
                 continue;
             }
 
-            inputs.retain(|input| input.candidate_id.starts_with("technical:"));
+            inputs.clear();
             if !current_source_target.is_zero() && !source_budget_decimal.is_zero() {
                 let source_capacity = available_gross
                     .checked_mul(source_budget_decimal)
@@ -2843,8 +2805,7 @@ impl LiveShadowEngine {
                 }
             }
             let contributions = source_contributions.entry(asset.clone()).or_default();
-            contributions.retain(|component, _| component.starts_with("technical:"));
-            contributions.extend(current_source_targets);
+            *contributions = current_source_targets;
             self.micro_density
                 .source_risk_increases_suppressed_below_cost_edge = self
                 .micro_density
@@ -4133,6 +4094,9 @@ impl LiveShadowEngine {
             }
             if source_state.active.as_ref().is_some_and(|active| {
                 active.entry_midpoint <= Decimal::ZERO
+                    || active.proposed_target.is_zero()
+                    || SourceSignalDirection::from_target(active.proposed_target)
+                        != Some(active.direction)
                     || active.entry_timestamp > state.source_expectancy_time_high_watermark
             }) {
                 return Err(LiveShadowError::Core(
@@ -5003,26 +4967,6 @@ mod tests {
     use std::path::Path;
 
     #[test]
-    fn high_density_source_requires_same_direction_technical_activation() {
-        assert_eq!(
-            technical_gated_source_exposure(Decimal::new(6, 1), Decimal::new(7, 1)),
-            Decimal::new(6, 1)
-        );
-        assert_eq!(
-            technical_gated_source_exposure(Decimal::new(-6, 1), Decimal::new(-7, 1)),
-            Decimal::new(-6, 1)
-        );
-        assert_eq!(
-            technical_gated_source_exposure(Decimal::new(6, 1), Decimal::ZERO),
-            Decimal::ZERO
-        );
-        assert_eq!(
-            technical_gated_source_exposure(Decimal::new(6, 1), Decimal::new(-7, 1)),
-            Decimal::ZERO
-        );
-    }
-
-    #[test]
     fn source_cost_gate_blocks_only_unproven_risk_increases() {
         assert!(source_target_adds_risk(Decimal::ZERO, Decimal::from(20)));
         assert!(source_target_adds_risk(
@@ -5084,15 +5028,29 @@ mod tests {
         let mut now = 0_u64;
         let mut admitted = 0_u64;
         for (entry, exit, lifetime_ms) in fixture.samples {
-            let expected =
-                observe_source_signal(&mut states, "EIGEN", -Decimal::ONE, entry, now).unwrap();
+            let expected = observe_source_transition(
+                &mut states,
+                "EIGEN",
+                Decimal::ZERO,
+                -Decimal::ONE,
+                entry,
+                now,
+            )
+            .unwrap();
             admitted += u64::from(expected_move_covers_round_trip_cost(
                 expected.ewma_gross_return_bps / BPS_PER_UNIT_RETURN,
                 threshold,
                 Decimal::ONE,
             ));
-            observe_source_signal(&mut states, "EIGEN", Decimal::ZERO, exit, now + lifetime_ms)
-                .unwrap();
+            observe_source_transition(
+                &mut states,
+                "EIGEN",
+                Decimal::ZERO,
+                Decimal::ZERO,
+                exit,
+                now + lifetime_ms,
+            )
+            .unwrap();
             now += lifetime_ms + 1;
         }
         let eigen = &states["EIGEN"].short;
@@ -5108,26 +5066,29 @@ mod tests {
         let threshold = Decimal::new(34, 4);
         for sample in 0..8_u64 {
             let opened_at = sample * 20_000;
-            observe_source_signal(
+            observe_source_transition(
                 &mut states,
                 "RECOVERY",
+                Decimal::ZERO,
                 Decimal::ONE,
                 Decimal::from(1_000),
                 opened_at,
             )
             .unwrap();
-            observe_source_signal(
+            observe_source_transition(
                 &mut states,
                 "RECOVERY",
+                Decimal::ZERO,
                 Decimal::ZERO,
                 Decimal::from(1_010),
                 opened_at + 10_000,
             )
             .unwrap();
         }
-        let expected = observe_source_signal(
+        let expected = observe_source_transition(
             &mut states,
             "RECOVERY",
+            Decimal::ZERO,
             Decimal::ONE,
             Decimal::from(1_000),
             200_000,
@@ -5138,6 +5099,61 @@ mod tests {
             threshold,
             Decimal::ONE,
         ));
+    }
+
+    #[test]
+    fn aggregate_transition_is_one_lifecycle_across_rejected_target_wiggles() {
+        let mut states = BTreeMap::new();
+        observe_source_transition(
+            &mut states,
+            "BTC",
+            Decimal::ZERO,
+            Decimal::from(31),
+            Decimal::from(100),
+            1_000,
+        )
+        .unwrap();
+        observe_source_transition(
+            &mut states,
+            "BTC",
+            Decimal::ZERO,
+            Decimal::from(34),
+            Decimal::from(101),
+            2_000,
+        )
+        .unwrap();
+        observe_source_transition(
+            &mut states,
+            "BTC",
+            Decimal::ZERO,
+            Decimal::from(30),
+            Decimal::from(102),
+            3_000,
+        )
+        .unwrap();
+        observe_source_transition(
+            &mut states,
+            "BTC",
+            Decimal::ZERO,
+            Decimal::from(36),
+            Decimal::from(103),
+            4_000,
+        )
+        .unwrap();
+        assert_eq!(states["BTC"].long.count, 0);
+        assert!(states["BTC"].active.is_some());
+
+        observe_source_transition(
+            &mut states,
+            "BTC",
+            Decimal::ZERO,
+            Decimal::ZERO,
+            Decimal::from(104),
+            5_000,
+        )
+        .unwrap();
+        assert_eq!(states["BTC"].long.count, 1);
+        assert!(states["BTC"].active.is_none());
     }
 
     #[test]
@@ -7081,6 +7097,10 @@ mod tests {
         let mut config = CopyTradeConfig::from_path(path).unwrap();
         let candidate = config.candidates[0].address.to_ascii_lowercase();
         config.candidates.truncate(1);
+        // This fixture exercises book retention, partial execution, and
+        // snapshot continuity. Keep technical demand out of the economic
+        // decision now that it cannot independently authorize risk.
+        config.technical.enabled = false;
         let mut engine =
             LiveShadowEngine::new(config, b"partial-fixture", "run", 40_000, 80_000).unwrap();
         engine.set_source_tier(&candidate, SourceTier::Active);
@@ -7136,13 +7156,12 @@ mod tests {
         technical_state["assets"]["BTC"]["current_score"] =
             serde_json::to_value(expected_hysteresis).unwrap();
         engine.technical_engine = serde_json::from_value(technical_state).unwrap();
-
         let positions = [(
             "BTC".to_string(),
             SourceAssetPosition {
                 asset: "BTC".to_string(),
-                signed_size: Decimal::from(5),
-                signed_notional: Decimal::from(500),
+                signed_size: Decimal::from(10),
+                signed_notional: Decimal::from(1_000),
                 entry_price: Some(Decimal::from(100)),
                 unrealized_pnl: Some(Decimal::ZERO),
             },
