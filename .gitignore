@@ -16,6 +16,7 @@ config/secrets/
 !fixtures/su6r1-r6-eigen-source-signal-lifecycles.json
 !fixtures/su6r1-r2-first-replay-hash-mismatch.jsonl
 !fixtures/su6r1-r7-resolv-stale-reduce-only.json
+!fixtures/su6r1-r7-baby-same-version-price-drift.json
 local-diagnostic-evidence/su6r1-r5/aggregate/aggregate/windows.tsv
 local-diagnostic-evidence/su6r1-r5/evidence/archives/archives/1786228790624-314-98ec5854531c.tar.gz
 local-diagnostic-evidence/su6r1-r5/evidence/diagnostic-journals/diagnostic-journals/failed-1786228790624-314-98ec5854531c.replay-events.jsonl.gz

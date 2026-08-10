@@ -3344,13 +3344,11 @@ impl LiveShadowEngine {
             let filled_notional = filled_quantity
                 .checked_mul(reference_price)
                 .ok_or(LiveShadowError::Arithmetic)?;
-            let (desired, current_target_version) = self
+            let desired = self
                 .target_ledger
                 .get(&book.asset)
-                .map(|state| (state.admitted_target_notional, Some(state.target_version)))
-                .unwrap_or((Decimal::ZERO, None));
-            let stale_target = current_target_version
-                .is_some_and(|version| version != pending.action.target_version);
+                .map(|state| state.admitted_target_notional)
+                .unwrap_or_default();
             let exit = match plan_risk_reducing_ioc(&ExitPlanningInput {
                 asset: &book.asset,
                 desired_target_notional: desired,
@@ -3366,10 +3364,7 @@ impl LiveShadowEngine {
                 execution_cushion: cushion,
                 maximum_slippage,
             }) {
-                Ok(exit)
-                    if stale_target
-                        && exit.residual_class == ResidualClass::DirectionFlipCloseLeg =>
-                {
+                Ok(exit) if exit.residual_class == ResidualClass::DirectionFlipCloseLeg => {
                     self.retire_pending_action(
                         &book.asset,
                         &pending,
@@ -3388,7 +3383,7 @@ impl LiveShadowEngine {
                     );
                     return Ok(ExecutionRecompute::None);
                 }
-                Err(ExitPlanningBlock::ExposureIncreasing) if stale_target => {
+                Err(ExitPlanningBlock::ExposureIncreasing) => {
                     self.retire_pending_action(
                         &book.asset,
                         &pending,
@@ -6531,6 +6526,22 @@ mod tests {
         current_target_version: u64,
     }
 
+    #[derive(Deserialize)]
+    struct R7BabySameVersionPriceDriftFixture {
+        source_bundle_id: String,
+        source_archive_sha256: String,
+        source_journal_gzip_sha256: String,
+        fatal_evidence_sha256: String,
+        last_valid_snapshot_generation: u64,
+        asset: String,
+        committed_quantity: Decimal,
+        opening_average_fill_price: Decimal,
+        current_reference_price: Decimal,
+        current_destination_notional: Decimal,
+        pending_target_version: u64,
+        current_target_version: u64,
+    }
+
     fn pending_reduce_only_engine(
         asset: &str,
         opening_quantity: Decimal,
@@ -6806,27 +6817,153 @@ mod tests {
     }
 
     #[test]
-    fn still_current_exposure_increasing_reduce_only_remains_a_hard_failure() {
-        let (mut engine, book) = pending_reduce_only_engine(
-            "RESOLV",
-            Decimal::from(2_085),
-            Decimal::new(17_723_128_537_170_263, 18),
-            Decimal::new(17_698, 6),
-        );
-        let pending_version = engine.pending["RESOLV"].action.target_version;
-        replace_current_target(
-            &mut engine,
-            "RESOLV",
-            Decimal::from(40),
-            pending_version,
-            Decimal::new(17_698, 6),
+    fn r7_baby_same_version_price_drift_cancels_reduce_only_for_normal_replan() {
+        let fixture: R7BabySameVersionPriceDriftFixture = serde_json::from_str(include_str!(
+            "../../../fixtures/su6r1-r7-baby-same-version-price-drift.json"
+        ))
+        .unwrap();
+        assert_eq!(fixture.source_bundle_id, "1786299897034-314-8e72025fcc2c");
+        assert_eq!(fixture.source_archive_sha256.len(), 64);
+        assert_eq!(fixture.source_journal_gzip_sha256.len(), 64);
+        assert_eq!(fixture.fatal_evidence_sha256.len(), 64);
+        assert_eq!(fixture.last_valid_snapshot_generation, 1_048);
+        assert_eq!(
+            fixture.pending_target_version,
+            fixture.current_target_version
         );
 
-        assert!(matches!(
-            engine.try_execute_pending(&book, 10_000),
-            Err(LiveShadowError::Core(message)) if message.contains("ExposureIncreasing")
-        ));
-        assert!(engine.pending.contains_key("RESOLV"));
+        let (mut engine, book) = pending_reduce_only_engine(
+            &fixture.asset,
+            fixture.committed_quantity,
+            fixture.opening_average_fill_price,
+            fixture.current_reference_price,
+        );
+        let original_position = engine.authoritative_position(&fixture.asset);
+        let pending_version = engine.pending[&fixture.asset].action.target_version;
+        let current_notional = original_position * fixture.current_reference_price;
+        assert!(fixture.current_destination_notional > current_notional);
+        replace_current_target(
+            &mut engine,
+            &fixture.asset,
+            fixture.current_destination_notional,
+            pending_version,
+            fixture.current_reference_price,
+        );
+
+        assert_eq!(
+            engine.try_execute_pending(&book, 10_000).unwrap(),
+            ExecutionRecompute::None
+        );
+        assert!(!engine.pending.contains_key(&fixture.asset));
+        assert_eq!(
+            engine.authoritative_position(&fixture.asset),
+            original_position
+        );
+        assert!(engine.executions.is_empty());
+        assert_eq!(
+            engine.action_lifecycle_events.last().unwrap().outcome,
+            ActionAttemptOutcome::SupersededByNewTarget
+        );
+        let density = engine.executable_density_summary().unwrap();
+        assert_eq!(density.unresolved_actionable_targets, 0);
+        assert!(density.root_conservation_verified);
+    }
+
+    #[test]
+    fn same_version_market_drift_cancellation_is_asset_agnostic() {
+        for asset in ["BTC", "ETH", "BABY", "0G", "kPEPE", "FUTURE-PAIR"] {
+            let reference_price = Decimal::from(4);
+            let (mut engine, book) = pending_reduce_only_engine(
+                asset,
+                Decimal::from(10),
+                Decimal::from(5),
+                reference_price,
+            );
+            let pending_version = engine.pending[asset].action.target_version;
+            replace_current_target(
+                &mut engine,
+                asset,
+                Decimal::from(45),
+                pending_version,
+                reference_price,
+            );
+
+            assert_eq!(
+                engine.try_execute_pending(&book, 10_000).unwrap(),
+                ExecutionRecompute::None,
+                "asset {asset}"
+            );
+            assert!(!engine.pending.contains_key(asset), "asset {asset}");
+            assert!(engine.executions.is_empty(), "asset {asset}");
+            assert_eq!(
+                engine.action_lifecycle_events.last().unwrap().outcome,
+                ActionAttemptOutcome::SupersededByNewTarget,
+                "asset {asset}"
+            );
+        }
+    }
+
+    #[test]
+    fn partial_position_change_obsoletes_pending_reduce_only_without_execution() {
+        let asset = "PARTIAL";
+        let reference_price = Decimal::from(4);
+        let (mut engine, book) =
+            pending_reduce_only_engine(asset, Decimal::from(10), Decimal::from(5), reference_price);
+        let pending_version = engine.pending[asset].action.target_version;
+        let partial_close = crossing_test_execution(
+            asset,
+            Side::Sell,
+            Decimal::from(5),
+            reference_price,
+            Decimal::from(10),
+            Decimal::ZERO,
+            Decimal::ZERO,
+            Decimal::ZERO,
+        );
+        engine
+            .ledger
+            .apply_portfolio_execution(&partial_close, 2)
+            .unwrap();
+        engine
+            .ledger
+            .apply_source_execution("technical:range_mean_reversion:range", &partial_close, 2)
+            .unwrap();
+        replace_current_target(
+            &mut engine,
+            asset,
+            Decimal::from(30),
+            pending_version,
+            reference_price,
+        );
+
+        assert_eq!(
+            engine.try_execute_pending(&book, 10_000).unwrap(),
+            ExecutionRecompute::None
+        );
+        assert!(!engine.pending.contains_key(asset));
+        assert_eq!(engine.authoritative_position(asset), Decimal::from(5));
+    }
+
+    #[test]
+    fn sub_step_destination_increase_obsoletes_pending_reduce_only() {
+        let asset = "ROUNDING";
+        let reference_price = Decimal::from(4);
+        let (mut engine, book) =
+            pending_reduce_only_engine(asset, Decimal::from(10), Decimal::from(5), reference_price);
+        let pending_version = engine.pending[asset].action.target_version;
+        replace_current_target(
+            &mut engine,
+            asset,
+            Decimal::new(416, 1),
+            pending_version,
+            reference_price,
+        );
+
+        assert_eq!(
+            engine.try_execute_pending(&book, 10_000).unwrap(),
+            ExecutionRecompute::None
+        );
+        assert!(!engine.pending.contains_key(asset));
         assert!(engine.executions.is_empty());
     }
 
