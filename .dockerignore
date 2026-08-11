@@ -1,0 +1,7 @@
+*
+!Dockerfile.railway
+!railway.toml
+!scripts/
+!scripts/run_su6_railway.sh
+!railway-frozen/
+!railway-frozen/**

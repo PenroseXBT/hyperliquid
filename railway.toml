@@ -1,0 +1,12 @@
+[build]
+builder = "DOCKERFILE"
+dockerfilePath = "Dockerfile.railway"
+
+[deploy]
+startCommand = "/app/bin/run_su6_railway.sh"
+region = "asia-southeast1-eqsg3a"
+numReplicas = 1
+restartPolicyType = "ALWAYS"
+restartPolicyMaxRetries = 10
+overlapSeconds = 0
+drainingSeconds = 300
