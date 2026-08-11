@@ -1,7 +1,9 @@
 use crate::ipc_client::{
     IntentDispatchState, ProductionDispatchHandle, ProductionIntentDispatcher,
 };
-use crate::live_shadow::{LiveShadowEngine, ProductionIntentIdentity, UnsignedShadowStateIdentity};
+use crate::live_shadow::{
+    EconomicAttribution, LiveShadowEngine, ProductionIntentIdentity, UnsignedShadowStateIdentity,
+};
 use crate::profitability::{summarize_profitability, ProfitabilitySummary};
 use crate::public_mainnet::{HyperliquidPublicTransport, PublicTransportPolicy};
 use crate::qualification_evidence::{
@@ -15,10 +17,10 @@ use copytrade_core::decision::{derive_config_hash, derive_risk_policy_hash};
 use copytrade_core::scheduler::{
     BudgetClass, Clock, ExecutionOutcome, MonotonicClock, ReadOnlyDataSource,
     ReadOnlySchedulerConfig, ReadRequestKind, RequestKey, RequestPriority, RequestScheduler,
-    RequestSubject, ScheduleOutcome, ScheduledReadRequest, SourceTier, Timestamp,
+    RequestSubject, ScheduleOutcome, ScheduledReadRequest, SchedulerHealth, SourceTier, Timestamp,
 };
 use copytrade_core::CopyTradeConfig;
-use rust_decimal::prelude::FromPrimitive;
+use rust_decimal::prelude::{FromPrimitive, ToPrimitive};
 use rust_decimal::Decimal;
 use serde::Serialize;
 use sha2::{Digest, Sha256};
@@ -64,6 +66,76 @@ pub struct QualificationOptions {
     pub profitability_gate: bool,
     pub micro_density_gate: bool,
     pub production: Option<ProductionObserverRuntime>,
+    /// Run the hardened observer as a continuous daemon. Qualification
+    /// evidence, deadlines, and profitability exit gates are disabled; only
+    /// safety/integrity errors terminate the process.
+    pub continuous: bool,
+}
+
+struct RuntimeEvidence {
+    bundle: Option<EvidenceBundle>,
+}
+
+impl RuntimeEvidence {
+    fn qualification(bundle: EvidenceBundle) -> Self {
+        Self {
+            bundle: Some(bundle),
+        }
+    }
+
+    fn continuous() -> Self {
+        Self { bundle: None }
+    }
+
+    fn append_replay_event(
+        &mut self,
+        observed_at_mono: Timestamp,
+        payload: ReplayPayload,
+    ) -> Result<(), Box<dyn Error>> {
+        if let Some(bundle) = &mut self.bundle {
+            bundle.append_replay_event(observed_at_mono, payload)?;
+        }
+        Ok(())
+    }
+
+    fn append_log(&mut self, stderr: bool, line: &str) -> Result<(), Box<dyn Error>> {
+        if let Some(bundle) = &mut self.bundle {
+            bundle.append_log(stderr, line)?;
+        }
+        Ok(())
+    }
+
+    fn append_checkpoint(&mut self, payload: CheckpointPayload) -> Result<(), Box<dyn Error>> {
+        if let Some(bundle) = &mut self.bundle {
+            bundle.append_checkpoint(payload)?;
+        }
+        Ok(())
+    }
+
+    fn write_summary<T: Serialize + ?Sized>(
+        &self,
+        name: &str,
+        value: &T,
+    ) -> Result<(), Box<dyn Error>> {
+        if let Some(bundle) = &self.bundle {
+            bundle.write_summary(name, value)?;
+        }
+        Ok(())
+    }
+
+    fn write_terminal(&self, summary: &TerminalSummary) -> Result<(), Box<dyn Error>> {
+        if let Some(bundle) = &self.bundle {
+            bundle.write_terminal(summary)?;
+        }
+        Ok(())
+    }
+
+    fn flush_replay_events(&mut self) -> Result<(), Box<dyn Error>> {
+        if let Some(bundle) = &mut self.bundle {
+            bundle.flush_replay_events()?;
+        }
+        Ok(())
+    }
 }
 
 fn persist_unsigned_state(
@@ -77,12 +149,16 @@ fn persist_unsigned_state(
 }
 
 fn append_new_cohort_records(
-    evidence: &mut EvidenceBundle,
+    evidence: &mut RuntimeEvidence,
     engine: &LiveShadowEngine,
     cursor: &mut usize,
     observed_at_mono: Timestamp,
 ) -> Result<(), Box<dyn Error>> {
     let records = engine.cohort_indicator_records();
+    if evidence.bundle.is_none() {
+        *cursor = records.len();
+        return Ok(());
+    }
     for indicator in records.get(*cursor..).unwrap_or_default() {
         evidence.append_replay_event(
             observed_at_mono,
@@ -96,11 +172,15 @@ fn append_new_cohort_records(
 }
 
 fn append_new_technical_records(
-    evidence: &mut EvidenceBundle,
+    evidence: &mut RuntimeEvidence,
     engine: &LiveShadowEngine,
     cursor: &mut usize,
 ) -> Result<(), Box<dyn Error>> {
     let records = engine.technical_decision_records();
+    if evidence.bundle.is_none() {
+        *cursor = records.len();
+        return Ok(());
+    }
     for decision in records.get(*cursor..).unwrap_or_default() {
         evidence.append_replay_event(
             decision.observed_at_mono,
@@ -142,14 +222,81 @@ struct Counters {
     transport_latency_ms_by_kind: BTreeMap<ReadRequestKind, LatencyEvidence>,
 }
 
+#[derive(Serialize)]
+struct RollingEconomicStatus {
+    horizon: &'static str,
+    cutoff_mono: Timestamp,
+    archived_episode_totals_included: bool,
+    attribution_scope: &'static str,
+    closures: usize,
+    executions: usize,
+    turnover: Decimal,
+    gross_pnl: Decimal,
+    fees: Decimal,
+    slippage: Decimal,
+    funding: Decimal,
+    net_pnl: Decimal,
+    net_pnl_per_turnover: Decimal,
+    settled_return_on_configured_equity: Decimal,
+    profit_factor: Option<Decimal>,
+    maximum_drawdown: Decimal,
+    annualized_sharpe_5m: f64,
+    net_pnl_by_asset: BTreeMap<String, Decimal>,
+    net_pnl_by_source: BTreeMap<String, Decimal>,
+    execution_net_pnl_by_context: BTreeMap<EconomicAttribution, Decimal>,
+}
+
+#[derive(Serialize)]
+struct ContinuousStatus<'a> {
+    mode: &'static str,
+    run_id: &'a str,
+    started_at_mono: Timestamp,
+    observed_at_mono: Timestamp,
+    elapsed_seconds: u64,
+    healthy: bool,
+    fatal_stop: bool,
+    snapshot_generation: Option<u64>,
+    candidate_count: usize,
+    fresh_candidate_count: usize,
+    expired_candidate_count: u64,
+    never_refreshed_candidate_count: u64,
+    projection_violations: u64,
+    persistence_failures: u64,
+    unresolved_roots: usize,
+    open_episodes: usize,
+    closed_episodes_lifetime: u64,
+    scheduler_pending: usize,
+    scheduler_in_flight: usize,
+    rate_limited_responses: u64,
+    source_transition_observations: u64,
+    active_source_observations: usize,
+    source_directions_above_cost_threshold: usize,
+    source_risk_increases_admitted: u64,
+    source_risk_increases_rejected_below_edge: u64,
+    source_expectancy: BTreeMap<String, crate::live_shadow::SourceExpectancyReport>,
+    economics: Vec<RollingEconomicStatus>,
+}
+
 pub async fn run_qualification(options: QualificationOptions) -> Result<PathBuf, Box<dyn Error>> {
+    if options.continuous
+        && (options.transport_gate || options.profitability_gate || options.micro_density_gate)
+    {
+        return Err("continuous runtime cannot enable qualification gates".into());
+    }
+    if options.continuous && options.state_root.is_none() && options.production.is_none() {
+        return Err("continuous runtime requires --state-root".into());
+    }
     if options.production.is_some() && options.state_root.is_some() {
         return Err("unsigned state restoration is forbidden in production mode".into());
     }
-    if options.state_root.is_some() && !options.profitability_gate {
-        return Err("--state-root is supported only by unsigned profitability runs".into());
+    if options.state_root.is_some() && !options.profitability_gate && !options.continuous {
+        return Err(
+            "--state-root is supported only by unsigned profitability or continuous runs".into(),
+        );
     }
-    if options.production.is_some() {
+    if options.continuous {
+        // No elapsed-time or profitability lifecycle controls the daemon.
+    } else if options.production.is_some() {
         if options.duration_seconds < 60 {
             return Err("production observer duration must be at least 60 seconds".into());
         }
@@ -225,7 +372,11 @@ pub async fn run_qualification(options: QualificationOptions) -> Result<PathBuf,
         std::process::id(),
         &manifest.binary_sha256[..12]
     );
-    let output = options.output.join(&run_id);
+    let output = if options.continuous {
+        options.output.clone()
+    } else {
+        options.output.join(&run_id)
+    };
     let read_policy_value = serde_json::to_value(&scheduler_config)?;
     let transport_policy_value = serde_json::to_value(&transport_policy)?;
     let header = RunHeader {
@@ -249,7 +400,11 @@ pub async fn run_qualification(options: QualificationOptions) -> Result<PathBuf,
         transport_policy_sha256: sha256_json(&transport_policy_value)?,
         start_wall_clock_utc_ms: wall_ms,
         start_monotonic_ms: start,
-        expected_minimum_duration_seconds: options.duration_seconds,
+        expected_minimum_duration_seconds: if options.continuous {
+            0
+        } else {
+            options.duration_seconds
+        },
         candidate_count: config.candidates.len(),
         process_id: std::process::id(),
         host_identity: std::env::var("HOSTNAME").unwrap_or_else(|_| "unavailable".into()),
@@ -259,15 +414,24 @@ pub async fn run_qualification(options: QualificationOptions) -> Result<PathBuf,
         api_wallet_present: false,
     };
     let qualification_config = serde_json::json!({"copytrade":config,"read_policy":read_policy_value,"transport_policy":transport_policy_value});
-    let mut evidence = EvidenceBundle::create(
-        &output,
-        &options.release_manifest_path,
-        &qualification_config,
-        &header,
-        &options.isolation_report_path,
-    )?;
-    if let Some(layer_path) = &options.very_profitable_layer_path {
-        std::fs::copy(layer_path, output.join("very-profitable-layer.json"))?;
+    let mut evidence = if options.continuous {
+        std::fs::create_dir_all(&output)?;
+        RuntimeEvidence::continuous()
+    } else {
+        RuntimeEvidence::qualification(EvidenceBundle::create(
+            &output,
+            &options.release_manifest_path,
+            &qualification_config,
+            &header,
+            &options.isolation_report_path,
+        )?)
+    };
+    if !options.continuous {
+        if let Some(layer_path) = &options.very_profitable_layer_path {
+            std::fs::copy(layer_path, output.join("very-profitable-layer.json"))?;
+        }
+    }
+    if options.very_profitable_layer_path.is_some() {
         evidence.append_log(
             false,
             "very_profitable_layer=installed hyperdash_role=discovery_and_context hyperliquid_role=authoritative_state",
@@ -285,10 +449,12 @@ pub async fn run_qualification(options: QualificationOptions) -> Result<PathBuf,
             transport_policy_sha256: header.transport_policy_sha256.clone(),
         },
     )?;
-    std::fs::copy(
-        std::env::current_exe()?,
-        output.join("observer-release-binary"),
-    )?;
+    if !options.continuous {
+        std::fs::copy(
+            std::env::current_exe()?,
+            output.join("observer-release-binary"),
+        )?;
+    }
     evidence.append_log(false, if options.production.is_some() {
         "observer_key_access=false signer_handoff_enabled=true observer_submission_capable=false"
     } else {
@@ -411,21 +577,25 @@ pub async fn run_qualification(options: QualificationOptions) -> Result<PathBuf,
     let mut checkpoint_due = 0;
     let mut counters = Counters::default();
     let mut tasks = JoinSet::new();
-    let deadline = start
-        .checked_add(
-            options
-                .duration_seconds
-                .checked_mul(1000)
-                .ok_or("duration overflow")?,
-        )
-        .ok_or("deadline overflow")?;
+    let deadline = (!options.continuous)
+        .then(|| {
+            start
+                .checked_add(
+                    options
+                        .duration_seconds
+                        .checked_mul(1000)
+                        .ok_or("duration overflow")?,
+                )
+                .ok_or("deadline overflow")
+        })
+        .transpose()?;
     let mut interrupted = false;
-    if options.profitability_gate {
+    if options.profitability_gate || options.continuous {
         engine.record_equity_boundary(start)?;
         evidence.append_replay_event(start, ReplayPayload::EquityBoundary)?;
         persist_unsigned_state(&mut engine, &mut state_root)?;
     }
-    while clock.now_ms() < deadline {
+    while deadline.is_none_or(|deadline| clock.now_ms() < deadline) {
         let now = clock.now_ms();
         if now >= tier_rebalance_due {
             let ordered_candidates = config
@@ -624,18 +794,15 @@ pub async fn run_qualification(options: QualificationOptions) -> Result<PathBuf,
                             *counters.accepted_count_by_tier.entry(tier).or_default() += 1;
                         }
                         let accepted_at = clock.now_ms();
-                        evidence.append_replay_event(
-                            accepted_at,
-                            ReplayPayload::AcceptedResponse {
-                                response: response.clone(),
-                            },
-                        )?;
-                        let persist_after_ingest = match &response.payload {
-                            crate::public_mainnet::PublicPayload::SourceState(state) => {
-                                !state.closed_candles.is_empty()
-                            }
-                            _ => true,
-                        };
+                        if !options.continuous {
+                            evidence.append_replay_event(
+                                accepted_at,
+                                ReplayPayload::AcceptedResponse {
+                                    response: response.clone(),
+                                },
+                            )?;
+                        }
+                        let executions_before = engine.metrics().shadow_executions;
                         engine.ingest(response, accepted_at).map_err(|e| e.to_string())?;
                         dispatch_production_intents(
                             &mut engine,
@@ -653,7 +820,9 @@ pub async fn run_qualification(options: QualificationOptions) -> Result<PathBuf,
                             &engine,
                             &mut technical_record_cursor,
                         )?;
-                        if persist_after_ingest {
+                        if !options.continuous
+                            || engine.metrics().shadow_executions != executions_before
+                        {
                             persist_unsigned_state(&mut engine, &mut state_root)?;
                         }
                     }
@@ -668,7 +837,9 @@ pub async fn run_qualification(options: QualificationOptions) -> Result<PathBuf,
             _ = sleep(Duration::from_millis(25)) => {}
         }
         let now = clock.now_ms();
-        if now >= decision_due && now.saturating_add(40_000) < deadline {
+        if now >= decision_due
+            && deadline.is_none_or(|deadline| now.saturating_add(40_000) < deadline)
+        {
             evidence.append_replay_event(now, ReplayPayload::DecisionTick)?;
             let _ = engine
                 .construct_next_decision(now)
@@ -679,7 +850,7 @@ pub async fn run_qualification(options: QualificationOptions) -> Result<PathBuf,
             persist_unsigned_state(&mut engine, &mut state_root)?;
             decision_due = now + 20_000;
         }
-        if (options.profitability_gate || options.micro_density_gate)
+        if (options.profitability_gate || options.micro_density_gate || options.continuous)
             && now >= profitability_bucket_due
         {
             engine.record_equity_boundary(profitability_bucket_due)?;
@@ -714,66 +885,91 @@ pub async fn run_qualification(options: QualificationOptions) -> Result<PathBuf,
                 projection_violations: m.projection_violations,
                 shadow_execution_count: m.shadow_executions,
                 open_episode_count: engine.ledger().portfolio_open_count() as u64,
-                closed_episode_count: engine.ledger().portfolio_closed().len() as u64,
+                closed_episode_count: engine.ledger().portfolio_closed_count(),
                 persistence_healthy: m.persistence_failures == 0,
                 response_rejected_as_stale: counters.response_rejected_as_stale,
-                accepted_snapshot_expired_by_age: expired_by_age,
-                candidate_never_refreshed: never_refreshed,
-                request_expired_in_queue: h.expired_in_queue_by_tier,
-                request_superseded_pending: h.superseded_pending_by_tier,
-                request_superseded_in_flight: h.superseded_in_flight_by_tier,
-                dispatch_count_by_tier: h.dispatch_count_by_tier,
+                accepted_snapshot_expired_by_age: expired_by_age.clone(),
+                candidate_never_refreshed: never_refreshed.clone(),
+                request_expired_in_queue: h.expired_in_queue_by_tier.clone(),
+                request_superseded_pending: h.superseded_pending_by_tier.clone(),
+                request_superseded_in_flight: h.superseded_in_flight_by_tier.clone(),
+                dispatch_count_by_tier: h.dispatch_count_by_tier.clone(),
                 accepted_count_by_tier: counters.accepted_count_by_tier.clone(),
                 queue_wait_ms_by_tier: counters.queue_wait_ms_by_tier.clone(),
                 transport_latency_ms_by_kind: counters.transport_latency_ms_by_kind.clone(),
-                fresh_candidates_by_tier: fresh_by_tier,
-                oldest_pending_age_by_tier: h.oldest_pending_age_ms_by_tier,
+                fresh_candidates_by_tier: fresh_by_tier.clone(),
+                oldest_pending_age_by_tier: h.oldest_pending_age_ms_by_tier.clone(),
             })?;
-            engine
-                .persist(output.join("shadow-ledger.json"))
-                .map_err(|e| e.to_string())?;
-            engine
-                .persist_target_state(output.join("virtual-target-ledger.json"))
-                .map_err(|e| e.to_string())?;
-            evidence.write_summary("shadow-actions.json", engine.executions())?;
-            evidence.write_summary(
-                "decision-plan-summary.json",
-                &engine.compact_decision_plan_summary(),
-            )?;
-            evidence.write_summary(
-                "cohort-indicator-records.json",
-                &engine.compact_cohort_decision_records(),
-            )?;
-            evidence.write_summary(
-                "cohort-decision-summary.json",
-                &engine.compact_cohort_decision_summary(),
-            )?;
-            evidence.write_summary(
-                "technical-decision-records.json",
-                engine.technical_decision_records(),
-            )?;
-            evidence.write_summary(
-                "book-evaluation-events.json",
-                engine.book_evaluation_events(),
-            )?;
-            evidence.write_summary(
-                "action-lifecycle-events.json",
-                engine.action_lifecycle_events(),
-            )?;
-            evidence.write_summary(
-                "executable-density-summary.json",
-                &engine.executable_density_summary()?,
-            )?;
-            evidence.write_summary("five-minute-return-buckets.json", engine.equity_buckets())?;
-            evidence.write_summary(
-                "portfolio-episodes.json",
-                engine.ledger().portfolio_closed(),
-            )?;
-            evidence.write_summary("source-episodes.json", &engine.ledger().all_source_closed())?;
-            evidence.write_summary(
-                "candidate-ingestion-audit.json",
-                &transport.candidate_audit_snapshot(),
-            )?;
+            if options.continuous {
+                engine.compact_runtime_history(now.saturating_sub(30 * 24 * 60 * 60 * 1_000))?;
+                cohort_record_cursor = engine.cohort_indicator_records().len();
+                technical_record_cursor = engine.technical_decision_records().len();
+                persist_unsigned_state(&mut engine, &mut state_root)?;
+                if let Err(error) = write_continuous_status(
+                    &output,
+                    &header.run_id,
+                    start,
+                    now,
+                    &config,
+                    &engine,
+                    &counters,
+                    &h,
+                    t.rate_limited.load(Ordering::SeqCst),
+                    &fresh_by_tier,
+                    expired_by_age.values().copied().sum(),
+                    never_refreshed.values().copied().sum(),
+                ) {
+                    println!("rolling_status_update_failed=true nonfatal=true error={error}");
+                }
+            } else {
+                engine
+                    .persist(output.join("shadow-ledger.json"))
+                    .map_err(|e| e.to_string())?;
+                engine
+                    .persist_target_state(output.join("virtual-target-ledger.json"))
+                    .map_err(|e| e.to_string())?;
+                evidence.write_summary("shadow-actions.json", engine.executions())?;
+                evidence.write_summary(
+                    "decision-plan-summary.json",
+                    &engine.compact_decision_plan_summary(),
+                )?;
+                evidence.write_summary(
+                    "cohort-indicator-records.json",
+                    &engine.compact_cohort_decision_records(),
+                )?;
+                evidence.write_summary(
+                    "cohort-decision-summary.json",
+                    &engine.compact_cohort_decision_summary(),
+                )?;
+                evidence.write_summary(
+                    "technical-decision-records.json",
+                    engine.technical_decision_records(),
+                )?;
+                evidence.write_summary(
+                    "book-evaluation-events.json",
+                    engine.book_evaluation_events(),
+                )?;
+                evidence.write_summary(
+                    "action-lifecycle-events.json",
+                    engine.action_lifecycle_events(),
+                )?;
+                evidence.write_summary(
+                    "executable-density-summary.json",
+                    &engine.executable_density_summary()?,
+                )?;
+                evidence
+                    .write_summary("five-minute-return-buckets.json", engine.equity_buckets())?;
+                evidence.write_summary(
+                    "portfolio-episodes.json",
+                    engine.ledger().portfolio_closed(),
+                )?;
+                evidence
+                    .write_summary("source-episodes.json", &engine.ledger().all_source_closed())?;
+                evidence.write_summary(
+                    "candidate-ingestion-audit.json",
+                    &transport.candidate_audit_snapshot(),
+                )?;
+            }
             checkpoint_due = now + 60_000;
         }
     }
@@ -792,12 +988,15 @@ pub async fn run_qualification(options: QualificationOptions) -> Result<PathBuf,
         if outcome == ExecutionOutcome::CompletedFresh {
             if let Some(response) = transport.take_accepted(&completed_request) {
                 let accepted_at = clock.now_ms();
-                evidence.append_replay_event(
-                    accepted_at,
-                    ReplayPayload::AcceptedResponse {
-                        response: response.clone(),
-                    },
-                )?;
+                if !options.continuous {
+                    evidence.append_replay_event(
+                        accepted_at,
+                        ReplayPayload::AcceptedResponse {
+                            response: response.clone(),
+                        },
+                    )?;
+                }
+                let executions_before = engine.metrics().shadow_executions;
                 engine
                     .ingest(response, accepted_at)
                     .map_err(|e| e.to_string())?;
@@ -809,13 +1008,16 @@ pub async fn run_qualification(options: QualificationOptions) -> Result<PathBuf,
                     accepted_at,
                 )?;
                 append_new_technical_records(&mut evidence, &engine, &mut technical_record_cursor)?;
-                persist_unsigned_state(&mut engine, &mut state_root)?;
+                if !options.continuous || engine.metrics().shadow_executions != executions_before {
+                    persist_unsigned_state(&mut engine, &mut state_root)?;
+                }
             }
         } else {
             let _ = transport.take_accepted(&completed_request);
         }
     }
     if (options.profitability_gate || options.micro_density_gate) && !interrupted {
+        let deadline = deadline.ok_or("qualification deadline missing")?;
         match engine.last_equity_boundary() {
             Some(last) if last == deadline => {}
             Some(last) if last < deadline => {
@@ -828,6 +1030,34 @@ pub async fn run_qualification(options: QualificationOptions) -> Result<PathBuf,
         }
     }
     evidence.flush_replay_events()?;
+    if options.continuous {
+        persist_unsigned_state(&mut engine, &mut state_root)?;
+        let now = clock.now_ms();
+        let health = scheduler.health();
+        let (fresh_by_tier, expired_by_age, never_refreshed) =
+            coverage_evidence(&config, &candidate_tiers, &engine, now);
+        if let Err(error) = write_continuous_status(
+            &output,
+            &header.run_id,
+            start,
+            now,
+            &config,
+            &engine,
+            &counters,
+            &health,
+            transport.metrics().rate_limited.load(Ordering::SeqCst),
+            &fresh_by_tier,
+            expired_by_age.values().copied().sum(),
+            never_refreshed.values().copied().sum(),
+        ) {
+            println!("rolling_status_update_failed=true nonfatal=true error={error}");
+        }
+        println!(
+            "continuous_observer_stopped_by_operator=true healthy=true output={}",
+            output.display()
+        );
+        return Ok(output);
+    }
     engine
         .persist(output.join("shadow-ledger.json"))
         .map_err(|e| e.to_string())?;
@@ -1000,6 +1230,284 @@ pub async fn run_qualification(options: QualificationOptions) -> Result<PathBuf,
         output.display()
     );
     Ok(output)
+}
+
+fn write_continuous_status(
+    output: &Path,
+    run_id: &str,
+    start: Timestamp,
+    now: Timestamp,
+    config: &CopyTradeConfig,
+    engine: &LiveShadowEngine,
+    _counters: &Counters,
+    scheduler: &SchedulerHealth,
+    rate_limited_responses: u64,
+    fresh_by_tier: &BTreeMap<SourceTier, u64>,
+    expired_candidate_count: u64,
+    never_refreshed_candidate_count: u64,
+) -> Result<(), Box<dyn Error>> {
+    let expectancy = engine.source_expectancy_report();
+    let source_transition_observations = expectancy
+        .values()
+        .map(|state| state.long.count.saturating_add(state.short.count))
+        .sum();
+    let active_source_observations = expectancy
+        .values()
+        .filter(|state| state.active.is_some())
+        .count();
+    let source_directions_above_cost_threshold = expectancy
+        .values()
+        .map(|state| {
+            usize::from(state.long.above_cost_threshold)
+                + usize::from(state.short.above_cost_threshold)
+        })
+        .sum();
+    let density = engine.executable_density_summary()?;
+    let unresolved_roots = engine.unresolved_actionable_root_count();
+    let economics = [
+        ("since_process_start", start),
+        ("last_24h", now.saturating_sub(24 * 60 * 60 * 1_000)),
+        ("last_7d", now.saturating_sub(7 * 24 * 60 * 60 * 1_000)),
+        ("last_30d", now.saturating_sub(30 * 24 * 60 * 60 * 1_000)),
+    ]
+    .into_iter()
+    .map(|(horizon, cutoff)| runtime_economic_status(horizon, cutoff, config, engine))
+    .collect::<Result<Vec<_>, _>>()?;
+    let metrics = engine.metrics();
+    let status = ContinuousStatus {
+        mode: "continuous_unsigned_planned_only",
+        run_id,
+        started_at_mono: start,
+        observed_at_mono: now,
+        elapsed_seconds: now.saturating_sub(start) / 1_000,
+        healthy: metrics.projection_violations == 0
+            && metrics.persistence_failures == 0
+            && unresolved_roots == 0,
+        fatal_stop: false,
+        snapshot_generation: engine.snapshot_generation(),
+        candidate_count: config.candidates.len(),
+        fresh_candidate_count: fresh_by_tier.values().copied().sum::<u64>() as usize,
+        expired_candidate_count,
+        never_refreshed_candidate_count,
+        projection_violations: metrics.projection_violations,
+        persistence_failures: metrics.persistence_failures,
+        unresolved_roots,
+        open_episodes: engine.ledger().portfolio_open_count(),
+        closed_episodes_lifetime: engine.ledger().portfolio_closed_count(),
+        scheduler_pending: scheduler.pending,
+        scheduler_in_flight: scheduler.in_flight,
+        rate_limited_responses,
+        source_transition_observations,
+        active_source_observations,
+        source_directions_above_cost_threshold,
+        source_risk_increases_admitted: density.admitted_new_positions,
+        source_risk_increases_rejected_below_edge: density
+            .source_risk_increases_suppressed_below_cost_edge,
+        source_expectancy: expectancy,
+        economics,
+    };
+    let path = output.join("rolling-status.json");
+    let temporary = output.join("rolling-status.tmp");
+    let mut bytes = serde_json::to_vec_pretty(&status)?;
+    bytes.push(b'\n');
+    std::fs::write(&temporary, bytes)?;
+    std::fs::rename(temporary, path)?;
+    let execution_start = engine.executions().len().saturating_sub(1_000);
+    let journal = serde_json::json!({
+        "schema_version": 1,
+        "scope": "last_1000_modeled_executions_and_lifecycle_events",
+        "executions": &engine.executions()[execution_start..],
+        "lifecycle": engine.action_lifecycle_events(),
+    });
+    let journal_path = output.join("rolling-execution-journal.json");
+    let journal_temporary = output.join("rolling-execution-journal.tmp");
+    let mut journal_bytes = serde_json::to_vec(&journal)?;
+    journal_bytes.push(b'\n');
+    std::fs::write(&journal_temporary, journal_bytes)?;
+    std::fs::rename(journal_temporary, journal_path)?;
+    Ok(())
+}
+
+fn runtime_economic_status(
+    horizon: &'static str,
+    cutoff: Timestamp,
+    config: &CopyTradeConfig,
+    engine: &LiveShadowEngine,
+) -> Result<RollingEconomicStatus, Box<dyn Error>> {
+    let episodes = engine
+        .ledger()
+        .portfolio_closed()
+        .iter()
+        .filter(|episode| episode.closed_at >= cutoff)
+        .collect::<Vec<_>>();
+    let executions = engine
+        .executions()
+        .iter()
+        .filter(|execution| execution.evaluation_timestamp_mono >= cutoff)
+        .collect::<Vec<_>>();
+    let buckets = engine
+        .equity_buckets()
+        .iter()
+        .filter(|bucket| bucket.closed_at_mono >= cutoff)
+        .collect::<Vec<_>>();
+    let sum_decimal = |values: Vec<Decimal>| -> Result<Decimal, Box<dyn Error>> {
+        values.into_iter().try_fold(Decimal::ZERO, |sum, value| {
+            sum.checked_add(value)
+                .ok_or_else(|| "rolling economic sum overflow".into())
+        })
+    };
+    let include_archived = horizon == "since_process_start";
+    let mut turnover = sum_decimal(executions.iter().map(|item| item.filled_notional).collect())?;
+    let mut gross_pnl = sum_decimal(episodes.iter().map(|item| item.realized_pnl).collect())?;
+    let mut fees = sum_decimal(episodes.iter().map(|item| item.fees).collect())?;
+    let mut slippage = sum_decimal(episodes.iter().map(|item| item.slippage).collect())?;
+    let mut funding = sum_decimal(episodes.iter().map(|item| item.funding).collect())?;
+    let mut net_pnl = sum_decimal(episodes.iter().map(|item| item.net_pnl).collect())?;
+    let mut gains = sum_decimal(
+        episodes
+            .iter()
+            .filter(|item| item.net_pnl > Decimal::ZERO)
+            .map(|item| item.net_pnl)
+            .collect(),
+    )?;
+    let mut losses = sum_decimal(
+        episodes
+            .iter()
+            .filter(|item| item.net_pnl < Decimal::ZERO)
+            .map(|item| item.net_pnl.abs())
+            .collect(),
+    )?;
+    let starting_equity = Decimal::from_f64(config.starting_equity_usd)
+        .ok_or("invalid configured starting equity")?;
+    let mut net_pnl_by_asset = BTreeMap::new();
+    for episode in &episodes {
+        let value = net_pnl_by_asset.entry(episode.asset.clone()).or_default();
+        *value =
+            Decimal::checked_add(*value, episode.net_pnl).ok_or("rolling asset pnl overflow")?;
+    }
+    let mut archived_closures = 0usize;
+    if include_archived {
+        for (asset, totals) in engine.ledger().portfolio_archived_totals() {
+            archived_closures = archived_closures.saturating_add(totals.closed_count as usize);
+            turnover = turnover
+                .checked_add(totals.entry_notional)
+                .and_then(|value| value.checked_add(totals.exit_notional))
+                .ok_or("lifetime turnover overflow")?;
+            gross_pnl = gross_pnl
+                .checked_add(totals.gross_pnl)
+                .ok_or("lifetime gross pnl overflow")?;
+            fees = fees
+                .checked_add(totals.fees)
+                .ok_or("lifetime fees overflow")?;
+            slippage = slippage
+                .checked_add(totals.slippage)
+                .ok_or("lifetime slippage overflow")?;
+            funding = funding
+                .checked_add(totals.funding)
+                .ok_or("lifetime funding overflow")?;
+            net_pnl = net_pnl
+                .checked_add(totals.net_pnl)
+                .ok_or("lifetime net pnl overflow")?;
+            gains = gains
+                .checked_add(totals.gains)
+                .ok_or("lifetime gains overflow")?;
+            losses = losses
+                .checked_add(totals.losses)
+                .ok_or("lifetime losses overflow")?;
+            let value = net_pnl_by_asset.entry(asset.clone()).or_default();
+            *value = value
+                .checked_add(totals.net_pnl)
+                .ok_or("lifetime asset pnl overflow")?;
+        }
+    }
+    let mut execution_net_pnl_by_context = BTreeMap::new();
+    for execution in &executions {
+        let value = execution_net_pnl_by_context
+            .entry(execution.economic_attribution)
+            .or_default();
+        *value = Decimal::checked_add(*value, execution.net_pnl_delta)
+            .ok_or("rolling context pnl overflow")?;
+    }
+    let mut net_pnl_by_source = BTreeMap::new();
+    for episode in engine
+        .ledger()
+        .all_source_closed()
+        .into_iter()
+        .filter(|episode| episode.closed_at >= cutoff)
+    {
+        let value = net_pnl_by_source.entry(episode.candidate_id).or_default();
+        *value = Decimal::checked_add(*value, episode.modeled_net_pnl)
+            .ok_or("rolling source pnl overflow")?;
+    }
+    let returns = buckets
+        .iter()
+        .filter_map(|bucket| bucket.return_fraction.to_f64())
+        .collect::<Vec<_>>();
+    let annualized_sharpe_5m = if returns.len() < 2 {
+        0.0
+    } else {
+        let mean = returns.iter().sum::<f64>() / returns.len() as f64;
+        let variance = returns
+            .iter()
+            .map(|value| (value - mean).powi(2))
+            .sum::<f64>()
+            / (returns.len() - 1) as f64;
+        if variance <= 0.0 {
+            0.0
+        } else {
+            mean / variance.sqrt() * (365.0_f64 * 24.0 * 12.0).sqrt()
+        }
+    };
+    let mut peak = buckets
+        .first()
+        .map_or(starting_equity, |bucket| bucket.starting_equity);
+    let mut maximum_drawdown = Decimal::ZERO;
+    for bucket in buckets {
+        peak = peak.max(bucket.ending_equity);
+        if !peak.is_zero() {
+            let drawdown = peak
+                .checked_sub(bucket.ending_equity)
+                .and_then(|value| value.checked_div(peak))
+                .ok_or("rolling drawdown overflow")?;
+            maximum_drawdown = maximum_drawdown.max(drawdown);
+        }
+    }
+    Ok(RollingEconomicStatus {
+        horizon,
+        cutoff_mono: cutoff,
+        archived_episode_totals_included: include_archived,
+        attribution_scope: "exact_retained_30_day_episode_and_execution_records",
+        closures: episodes.len().saturating_add(archived_closures),
+        executions: executions.len(),
+        turnover,
+        gross_pnl,
+        fees,
+        slippage,
+        funding,
+        net_pnl,
+        net_pnl_per_turnover: if turnover.is_zero() {
+            Decimal::ZERO
+        } else {
+            net_pnl
+                .checked_div(turnover)
+                .ok_or("rolling efficiency overflow")?
+        },
+        settled_return_on_configured_equity: if starting_equity.is_zero() {
+            Decimal::ZERO
+        } else {
+            net_pnl
+                .checked_div(starting_equity)
+                .ok_or("rolling return overflow")?
+        },
+        profit_factor: (!losses.is_zero())
+            .then(|| gains.checked_div(losses).ok_or("rolling PF overflow"))
+            .transpose()?,
+        maximum_drawdown,
+        annualized_sharpe_5m,
+        net_pnl_by_asset,
+        net_pnl_by_source,
+        execution_net_pnl_by_context,
+    })
 }
 
 fn manifest_stage_matches(production_enabled: bool, stage: &str) -> bool {
@@ -1437,7 +1945,7 @@ fn enqueue<C: Clock>(
 }
 
 fn append_freshness_decision(
-    evidence: &mut EvidenceBundle,
+    evidence: &mut RuntimeEvidence,
     request: &ScheduledReadRequest,
     outcome: ExecutionOutcome,
     observed_at_mono: u64,

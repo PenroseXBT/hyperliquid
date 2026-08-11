@@ -260,6 +260,30 @@ struct SourceExpectancyState {
     active: Option<ActiveSourceObservation>,
 }
 
+#[derive(Debug, Clone, Serialize)]
+pub struct SourceExpectancyDirectionReport {
+    pub count: u64,
+    pub ewma_gross_return_bps: Decimal,
+    pub ewma_lifetime_seconds: Decimal,
+    pub required_gross_return_bps: Decimal,
+    pub above_cost_threshold: bool,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ActiveSourceObservationReport {
+    pub entry_midpoint: Decimal,
+    pub entry_timestamp: Timestamp,
+    pub direction: String,
+    pub proposed_target: Decimal,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct SourceExpectancyReport {
+    pub long: SourceExpectancyDirectionReport,
+    pub short: SourceExpectancyDirectionReport,
+    pub active: Option<ActiveSourceObservationReport>,
+}
+
 impl SourceExpectancyState {
     fn estimate(&self, direction: SourceSignalDirection) -> &SourceExpectancyEstimate {
         match direction {
@@ -379,7 +403,7 @@ fn expected_move_covers_round_trip_cost(
             .unwrap_or(Decimal::MAX)
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum EconomicAttribution {
     SourceOnly,
@@ -844,7 +868,7 @@ fn reconciliation_difference(
     Ok((difference, tolerance))
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ShadowActionAccounting {
     pub shadow_execution_id: String,
     pub decision_id: String,
@@ -883,7 +907,7 @@ pub struct ShadowActionAccounting {
     pub economic_attribution: EconomicAttribution,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EquityReturnBucket {
     pub run_id: String,
     pub bucket_id: String,
@@ -1260,7 +1284,7 @@ pub struct ExecutableDensitySummary {
     pub source_risk_increases_suppressed_below_cost_edge: u64,
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 struct MicroDensityCounters {
     previous_raw: BTreeMap<String, Decimal>,
     previous_admitted: BTreeMap<String, Decimal>,
@@ -1338,7 +1362,7 @@ pub struct LiveShadowEngine {
     snapshot_generation: Option<u64>,
 }
 
-pub const UNSIGNED_SNAPSHOT_SCHEMA_VERSION: u32 = 6;
+pub const UNSIGNED_SNAPSHOT_SCHEMA_VERSION: u32 = 7;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -1368,6 +1392,10 @@ pub struct UnsignedObserverState {
     source_expectancy: BTreeMap<String, SourceExpectancyState>,
     source_expectancy_time_high_watermark: Timestamp,
     ledger_time_high_watermark: Timestamp,
+    executions: Vec<ShadowActionAccounting>,
+    equity_buckets: Vec<EquityReturnBucket>,
+    last_bucket: Option<(Timestamp, Decimal, BTreeMap<String, Decimal>)>,
+    micro_density: MicroDensityCounters,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -4018,6 +4046,10 @@ impl LiveShadowEngine {
             source_expectancy: self.source_expectancy.clone(),
             source_expectancy_time_high_watermark: self.source_expectancy_time_high_watermark,
             ledger_time_high_watermark: self.ledger_time_high_watermark,
+            executions: self.executions.clone(),
+            equity_buckets: self.equity_buckets.clone(),
+            last_bucket: self.last_bucket.clone(),
+            micro_density: self.micro_density.clone(),
         };
         let generation = match self.snapshot_generation {
             Some(previous) => previous.checked_add(1).ok_or(LiveShadowError::Arithmetic)?,
@@ -4151,6 +4183,10 @@ impl LiveShadowEngine {
             .checked_add(1)
             .ok_or(LiveShadowError::Arithmetic)?;
         self.ledger_time_high_watermark = state.ledger_time_high_watermark;
+        self.executions = state.executions;
+        self.equity_buckets = state.equity_buckets;
+        self.last_bucket = state.last_bucket;
+        self.micro_density = state.micro_density;
         self.snapshot_generation = Some(envelope.generation);
         self.last_funding_accrual = None;
         self.previous_target = self
@@ -4178,6 +4214,117 @@ impl LiveShadowEngine {
 
     pub fn metrics(&self) -> &LiveShadowMetrics {
         &self.metrics
+    }
+
+    pub fn unresolved_actionable_root_count(&self) -> usize {
+        self.pending
+            .values()
+            .map(|pending| pending.root_planned_cloid.as_str())
+            .chain(
+                self.pending_book
+                    .values()
+                    .map(|pending| pending.original_planned_cloid.as_str()),
+            )
+            .chain(
+                self.continuations
+                    .values()
+                    .map(|pending| pending.root_planned_cloid.as_str()),
+            )
+            .collect::<BTreeSet<_>>()
+            .len()
+    }
+
+    pub fn source_expectancy_report(&self) -> BTreeMap<String, SourceExpectancyReport> {
+        self.source_expectancy
+            .iter()
+            .map(|(asset, state)| {
+                let direction = |estimate: &SourceExpectancyEstimate| {
+                    let fee = Decimal::from_f64(self.config.taker_fee_bps / 10_000.0)
+                        .unwrap_or(Decimal::MAX);
+                    let slippage =
+                        Decimal::from_f64(self.config.execution.max_slippage_bps / 10_000.0)
+                            .unwrap_or(Decimal::MAX);
+                    let holding_hours = estimate
+                        .ewma_lifetime_seconds
+                        .checked_div(Decimal::from(3_600))
+                        .unwrap_or_default();
+                    let funding = self
+                        .metadata
+                        .as_ref()
+                        .and_then(|metadata| metadata.contexts.get(asset))
+                        .map(|context| context.funding_rate_hourly.abs())
+                        .unwrap_or_default()
+                        .checked_mul(holding_hours)
+                        .unwrap_or(Decimal::MAX);
+                    let multiple = Decimal::from_f64(self.config.technical.minimum_cost_multiple)
+                        .unwrap_or(Decimal::MAX);
+                    let required_gross_return_bps = fee
+                        .checked_mul(Decimal::from(2))
+                        .and_then(|fees| {
+                            slippage
+                                .checked_mul(Decimal::from(2))
+                                .and_then(|cost| fees.checked_add(cost))
+                        })
+                        .and_then(|cost| cost.checked_add(funding))
+                        .and_then(|cost| cost.checked_mul(multiple))
+                        .and_then(|fraction| fraction.checked_mul(BPS_PER_UNIT_RETURN))
+                        .unwrap_or(Decimal::MAX);
+                    SourceExpectancyDirectionReport {
+                        count: estimate.count,
+                        ewma_gross_return_bps: estimate.ewma_gross_return_bps,
+                        ewma_lifetime_seconds: estimate.ewma_lifetime_seconds,
+                        required_gross_return_bps,
+                        above_cost_threshold: estimate.ewma_gross_return_bps
+                            >= required_gross_return_bps,
+                    }
+                };
+                (
+                    asset.clone(),
+                    SourceExpectancyReport {
+                        long: direction(&state.long),
+                        short: direction(&state.short),
+                        active: state
+                            .active
+                            .as_ref()
+                            .map(|active| ActiveSourceObservationReport {
+                                entry_midpoint: active.entry_midpoint,
+                                entry_timestamp: active.entry_timestamp,
+                                direction: match active.direction {
+                                    SourceSignalDirection::Long => "long",
+                                    SourceSignalDirection::Short => "short",
+                                }
+                                .into(),
+                                proposed_target: active.proposed_target,
+                            }),
+                    },
+                )
+            })
+            .collect()
+    }
+
+    /// Keep exact economic records for the rolling 30-day horizon and only a
+    /// small recent execution/lifecycle tail. Repeated planning and indicator
+    /// evaluations are working data, not durable production evidence.
+    pub fn compact_runtime_history(&mut self, cutoff: Timestamp) -> Result<(), LiveShadowError> {
+        self.ledger.compact_closed_before(cutoff).map_err(core)?;
+        self.executions
+            .retain(|record| record.evaluation_timestamp_mono >= cutoff);
+        self.equity_buckets
+            .retain(|record| record.closed_at_mono >= cutoff);
+        if self.plans.len() > 2 {
+            self.plans.drain(..self.plans.len() - 2);
+        }
+        if self.book_evaluation_events.len() > 1_000 {
+            self.book_evaluation_events
+                .drain(..self.book_evaluation_events.len() - 1_000);
+        }
+        if self.action_lifecycle_events.len() > 1_000 {
+            self.action_lifecycle_events
+                .drain(..self.action_lifecycle_events.len() - 1_000);
+        }
+        self.technical_decision_records.clear();
+        self.cohort_indicator_records.clear();
+        Ok(())
     }
 
     pub fn executions(&self) -> &[ShadowActionAccounting] {
@@ -7319,6 +7466,10 @@ mod tests {
         let expected_funding = engine.accrued_funding.clone();
         let expected_source_expectancy = engine.source_expectancy.clone();
         let expected_source_expectancy_time = engine.source_expectancy_time_high_watermark;
+        let expected_executions = rmp_serde::to_vec(&engine.executions).unwrap();
+        let expected_equity_buckets = rmp_serde::to_vec(&engine.equity_buckets).unwrap();
+        let expected_last_bucket = rmp_serde::to_vec(&engine.last_bucket).unwrap();
+        let expected_micro_density = rmp_serde::to_vec(&engine.micro_density).unwrap();
         assert!(expected_source_expectancy["BTC"].active.is_some());
         assert_eq!(
             engine
@@ -7372,6 +7523,22 @@ mod tests {
             expected_retry_generation
         );
         assert_eq!(restored.accrued_funding, expected_funding);
+        assert_eq!(
+            rmp_serde::to_vec(&restored.executions).unwrap(),
+            expected_executions
+        );
+        assert_eq!(
+            rmp_serde::to_vec(&restored.equity_buckets).unwrap(),
+            expected_equity_buckets
+        );
+        assert_eq!(
+            rmp_serde::to_vec(&restored.last_bucket).unwrap(),
+            expected_last_bucket
+        );
+        assert_eq!(
+            rmp_serde::to_vec(&restored.micro_density).unwrap(),
+            expected_micro_density
+        );
         assert_eq!(restored.source_expectancy, expected_source_expectancy);
         assert_eq!(
             restored.source_expectancy_time_high_watermark,

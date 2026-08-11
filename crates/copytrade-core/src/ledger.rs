@@ -34,6 +34,8 @@ pub struct SourceEpisode {
     pub candidate_id: String,
     pub source_episode_id: EpisodeId,
     pub asset: String,
+    pub opened_at: u64,
+    pub closed_at: u64,
     pub modeled_entry: Decimal,
     pub modeled_exit: Decimal,
     pub modeled_fees: Decimal,
@@ -67,7 +69,58 @@ struct EpisodeBook {
     positions: BTreeMap<String, Decimal>,
     open: BTreeMap<String, OpenEpisode>,
     closed: Vec<PortfolioEpisode>,
+    #[serde(default)]
+    archived: BTreeMap<String, EpisodeTotals>,
     next_episode_sequence: u64,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EpisodeTotals {
+    pub closed_count: u64,
+    pub entry_notional: Decimal,
+    pub exit_notional: Decimal,
+    pub gross_pnl: Decimal,
+    pub fees: Decimal,
+    pub funding: Decimal,
+    pub slippage: Decimal,
+    pub net_pnl: Decimal,
+    pub gains: Decimal,
+    pub losses: Decimal,
+}
+
+impl EpisodeTotals {
+    fn add_episode(&mut self, episode: &PortfolioEpisode) -> Result<(), LedgerError> {
+        self.closed_count = self
+            .closed_count
+            .checked_add(1)
+            .ok_or(LedgerError::ArithmeticOverflow("archived closed count"))?;
+        self.entry_notional = checked_add(
+            self.entry_notional,
+            episode.entry_notional,
+            "archived entry notional",
+        )?;
+        self.exit_notional = checked_add(
+            self.exit_notional,
+            episode.exit_notional,
+            "archived exit notional",
+        )?;
+        self.gross_pnl = checked_add(self.gross_pnl, episode.realized_pnl, "archived gross pnl")?;
+        self.fees = checked_add(self.fees, episode.fees, "archived fees")?;
+        self.funding = checked_add(self.funding, episode.funding, "archived funding")?;
+        self.slippage = checked_add(self.slippage, episode.slippage, "archived slippage")?;
+        self.net_pnl = checked_add(self.net_pnl, episode.net_pnl, "archived net pnl")?;
+        if episode.net_pnl > Decimal::ZERO {
+            self.gains = checked_add(self.gains, episode.net_pnl, "archived gains")?;
+        } else if episode.net_pnl < Decimal::ZERO {
+            self.losses = checked_add(self.losses, episode.net_pnl.abs(), "archived losses")?;
+        }
+        Ok(())
+    }
+}
+
+fn checked_add(left: Decimal, right: Decimal, field: &'static str) -> Result<Decimal, LedgerError> {
+    left.checked_add(right)
+        .ok_or(LedgerError::ArithmeticOverflow(field))
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -176,6 +229,8 @@ impl DualLedger {
                 candidate_id: candidate_id.to_string(),
                 source_episode_id: episode.episode_id,
                 asset: episode.asset.clone(),
+                opened_at: episode.opened_at,
+                closed_at: episode.closed_at,
                 modeled_entry: episode.entry_notional,
                 modeled_exit: episode.exit_notional,
                 modeled_fees: episode.fees,
@@ -200,6 +255,14 @@ impl DualLedger {
         &self.portfolio.closed
     }
 
+    pub fn portfolio_closed_count(&self) -> u64 {
+        self.portfolio.total_closed_count()
+    }
+
+    pub fn portfolio_archived_totals(&self) -> &BTreeMap<String, EpisodeTotals> {
+        &self.portfolio.archived
+    }
+
     pub fn portfolio_realized_net_pnl(&self) -> Result<Decimal, LedgerError> {
         self.portfolio
             .closed
@@ -207,13 +270,15 @@ impl DualLedger {
             .try_fold(Decimal::ZERO, |sum, episode| {
                 sum.checked_add(episode.net_pnl)
                     .ok_or(LedgerError::ArithmeticOverflow("realized net pnl"))
-            })
+            })?
+            .checked_add(self.portfolio.archived_net_pnl()?)
+            .ok_or(LedgerError::ArithmeticOverflow("realized net pnl"))
     }
 
     pub fn source_closed_count(&self, candidate_id: &str) -> usize {
         self.sources
             .get(candidate_id)
-            .map_or(0, |book| book.closed.len())
+            .map_or(0, |book| book.total_closed_count() as usize)
     }
 
     pub fn assign_source_attribution_residual(
@@ -243,6 +308,8 @@ impl DualLedger {
             candidate_id: candidate_id.to_string(),
             source_episode_id: episode.episode_id,
             asset: episode.asset.clone(),
+            opened_at: episode.opened_at,
+            closed_at: episode.closed_at,
             modeled_entry: episode.entry_notional,
             modeled_exit: episode.exit_notional,
             modeled_fees: episode.fees,
@@ -303,6 +370,8 @@ impl DualLedger {
             candidate_id: candidate_id.to_string(),
             source_episode_id: episode.episode_id,
             asset: episode.asset.clone(),
+            opened_at: episode.opened_at,
+            closed_at: episode.closed_at,
             modeled_entry: episode.entry_notional,
             modeled_exit: episode.exit_notional,
             modeled_fees: episode.fees,
@@ -342,7 +411,20 @@ impl DualLedger {
     }
 
     pub fn total_source_closed(&self) -> usize {
-        self.sources.values().map(|book| book.closed.len()).sum()
+        self.sources
+            .values()
+            .map(|book| book.total_closed_count() as usize)
+            .sum()
+    }
+
+    /// Move closed episodes older than `cutoff` into bounded per-asset totals.
+    /// Open episodes and exact recent records remain untouched.
+    pub fn compact_closed_before(&mut self, cutoff: u64) -> Result<(), LedgerError> {
+        self.portfolio.compact_closed_before(cutoff)?;
+        for book in self.sources.values_mut() {
+            book.compact_closed_before(cutoff)?;
+        }
+        Ok(())
     }
 
     pub fn portfolio_open_count(&self) -> usize {
@@ -357,6 +439,8 @@ impl DualLedger {
                     candidate_id: candidate_id.clone(),
                     source_episode_id: episode.episode_id,
                     asset: episode.asset.clone(),
+                    opened_at: episode.opened_at,
+                    closed_at: episode.closed_at,
                     modeled_entry: episode.entry_notional,
                     modeled_exit: episode.exit_notional,
                     modeled_fees: episode.fees,
@@ -398,7 +482,9 @@ impl DualLedger {
         marks: &BTreeMap<String, Decimal>,
         unbooked_funding: Decimal,
     ) -> Result<Decimal, LedgerError> {
-        let mut equity = starting_equity;
+        let mut equity = starting_equity
+            .checked_add(self.portfolio.archived_net_pnl()?)
+            .ok_or(LedgerError::ArithmeticOverflow("archived closed equity"))?;
         for episode in &self.portfolio.closed {
             equity = equity
                 .checked_add(episode.net_pnl)
@@ -509,12 +595,43 @@ impl DualLedger {
 }
 
 impl EpisodeBook {
+    fn total_closed_count(&self) -> u64 {
+        self.archived
+            .values()
+            .fold(self.closed.len() as u64, |count, totals| {
+                count.saturating_add(totals.closed_count)
+            })
+    }
+
+    fn archived_net_pnl(&self) -> Result<Decimal, LedgerError> {
+        self.archived
+            .values()
+            .try_fold(Decimal::ZERO, |sum, totals| {
+                checked_add(sum, totals.net_pnl, "archived net pnl")
+            })
+    }
+
+    fn compact_closed_before(&mut self, cutoff: u64) -> Result<(), LedgerError> {
+        let split = self
+            .closed
+            .partition_point(|episode| episode.closed_at < cutoff);
+        for episode in self.closed.drain(..split) {
+            self.archived
+                .entry(episode.asset.clone())
+                .or_default()
+                .add_episode(&episode)?;
+        }
+        Ok(())
+    }
+
     fn equity(
         &self,
         starting_equity: Decimal,
         marks: &BTreeMap<String, Decimal>,
     ) -> Result<Decimal, LedgerError> {
-        let mut equity = starting_equity;
+        let mut equity = starting_equity
+            .checked_add(self.archived_net_pnl()?)
+            .ok_or(LedgerError::ArithmeticOverflow("archived book equity"))?;
         for episode in &self.closed {
             equity = equity
                 .checked_add(episode.net_pnl)
@@ -881,6 +998,37 @@ mod tests {
         assert_eq!(episode.slippage, d("0.50"));
         assert_eq!(episode.net_pnl, d("16.50"));
         assert_eq!(ledger.portfolio_closed().len(), 1);
+    }
+
+    #[test]
+    fn compacted_closed_episode_preserves_equity_counts_and_exact_totals() {
+        let mut ledger = DualLedger::default();
+        ledger
+            .apply_portfolio_execution(&execution(Side::Buy, "2", "100", "0"), 2)
+            .unwrap();
+        ledger
+            .apply_portfolio_execution(&execution(Side::Sell, "2", "110", "2"), 3)
+            .unwrap();
+        let realized = ledger.portfolio_realized_net_pnl().unwrap();
+        let equity = ledger
+            .portfolio_equity(d("100"), &BTreeMap::new(), Decimal::ZERO)
+            .unwrap();
+
+        ledger.compact_closed_before(4).unwrap();
+
+        assert!(ledger.portfolio_closed().is_empty());
+        assert_eq!(ledger.portfolio_closed_count(), 1);
+        assert_eq!(ledger.portfolio_realized_net_pnl().unwrap(), realized);
+        assert_eq!(
+            ledger
+                .portfolio_equity(d("100"), &BTreeMap::new(), Decimal::ZERO)
+                .unwrap(),
+            equity
+        );
+        let totals = &ledger.portfolio_archived_totals()["BTC"];
+        assert_eq!(totals.closed_count, 1);
+        assert_eq!(totals.gross_pnl, d("20"));
+        assert_eq!(totals.net_pnl, d("16.50"));
     }
 
     #[test]

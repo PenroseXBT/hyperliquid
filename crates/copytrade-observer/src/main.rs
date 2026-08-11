@@ -76,6 +76,7 @@ enum Operation {
     AggregateQualification,
     ReplayDensity,
     AuditCandidates,
+    Continuous,
     Production,
 }
 
@@ -141,6 +142,7 @@ async fn run() -> Result<(), Box<dyn Error>> {
                 profitability_gate: false,
                 micro_density_gate: false,
                 production: None,
+                continuous: false,
             })
             .await?;
         }
@@ -159,6 +161,7 @@ async fn run() -> Result<(), Box<dyn Error>> {
                 profitability_gate: false,
                 micro_density_gate: false,
                 production: None,
+                continuous: false,
             })
             .await?;
         }
@@ -177,6 +180,7 @@ async fn run() -> Result<(), Box<dyn Error>> {
                 profitability_gate: true,
                 micro_density_gate: false,
                 production: None,
+                continuous: false,
             })
             .await?;
         }
@@ -195,6 +199,7 @@ async fn run() -> Result<(), Box<dyn Error>> {
                 profitability_gate: false,
                 micro_density_gate: true,
                 production: None,
+                continuous: false,
             })
             .await?;
         }
@@ -245,6 +250,25 @@ async fn run() -> Result<(), Box<dyn Error>> {
         }
         Operation::AuditCandidates => {
             run_candidate_audit(&state, &arguments.transport_policy, &arguments.output).await?
+        }
+        Operation::Continuous => {
+            run_qualification(QualificationOptions {
+                config_path: arguments.config,
+                very_profitable_layer_path: arguments.very_profitable_layer,
+                request_policy_path: arguments.request_policy,
+                transport_policy_path: arguments.transport_policy,
+                release_manifest_path: arguments.release_manifest,
+                isolation_report_path: arguments.isolation_report,
+                output: arguments.output,
+                state_root: arguments.state_root,
+                duration_seconds: 0,
+                transport_gate: false,
+                profitability_gate: false,
+                micro_density_gate: false,
+                production: None,
+                continuous: true,
+            })
+            .await?;
         }
         Operation::Production => run_production_observer(&arguments).await?,
     }
@@ -440,6 +464,7 @@ fn parse_arguments(arguments: impl Iterator<Item = String>) -> Result<Arguments,
             }
             "replay-density" => set_operation(&mut operation, Operation::ReplayDensity)?,
             "audit-candidates" => set_operation(&mut operation, Operation::AuditCandidates)?,
+            "continuous" => set_operation(&mut operation, Operation::Continuous)?,
             "production" => set_operation(&mut operation, Operation::Production)?,
             "--validate-config" => set_operation(&mut operation, Operation::ValidateConfig)?,
             "--print-effective-config" => {
@@ -689,6 +714,7 @@ async fn run_production_observer(arguments: &Arguments) -> Result<(), Box<dyn Er
                 expires_after_ms: 20_000,
             },
         }),
+        continuous: true,
     })
     .await?;
     Ok(())
@@ -963,6 +989,27 @@ mod tests {
         assert_eq!(
             parsed.state_root,
             Some(PathBuf::from("/data/su6-forward/state"))
+        );
+    }
+
+    #[test]
+    fn continuous_parser_accepts_state_root_without_a_duration() {
+        let parsed = parse_arguments(
+            [
+                "continuous".to_string(),
+                "--state-root".to_string(),
+                "/data/su6-continuous/state".to_string(),
+                "--output".to_string(),
+                "/data/su6-continuous/runtime".to_string(),
+            ]
+            .into_iter(),
+        )
+        .unwrap();
+        assert_eq!(parsed.operation, Operation::Continuous);
+        assert_eq!(parsed.duration_seconds, None);
+        assert_eq!(
+            parsed.state_root,
+            Some(PathBuf::from("/data/su6-continuous/state"))
         );
     }
 

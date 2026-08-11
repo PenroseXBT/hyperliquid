@@ -1175,6 +1175,8 @@ mod tests {
             candidate_id: "source".into(),
             source_episode_id: episode.episode_id,
             asset: episode.asset.clone(),
+            opened_at: episode.opened_at,
+            closed_at: episode.closed_at,
             modeled_entry: episode.entry_notional,
             modeled_exit: episode.exit_notional,
             modeled_fees: episode.fees,

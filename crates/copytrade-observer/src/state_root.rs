@@ -14,7 +14,7 @@ const MARKER_TEMP_FILE_NAME: &str = "initialized.tmp";
 const SNAPSHOT_TEMP_FILE_NAME: &str = "unsigned-observer-state.tmp";
 
 pub const UNSIGNED_PERSISTENCE_SCHEMA_DESCRIPTOR: &str = concat!(
-    "copytrade-observer-unsigned-persistence-v5\n",
+    "copytrade-observer-unsigned-persistence-v6\n",
     "lock=.observer-state.lock:exclusive-os-lock:lifetime\n",
     "marker=initialized.json:",
     "InitializationMarker{schema_version:u32,snapshot_schema_version:u32,generation:u64,",
@@ -34,10 +34,15 @@ pub const UNSIGNED_PERSISTENCE_SCHEMA_DESCRIPTOR: &str = concat!(
     "accrued_funding:BTreeMap<String,Decimal>,last_mids:Option<MarketSnapshotResponse>,",
     "source_expectancy:BTreeMap<String,SourceExpectancyState>,",
     "source_expectancy_time_high_watermark:Timestamp,",
-    "ledger_time_high_watermark:Timestamp}\n",
+    "ledger_time_high_watermark:Timestamp,executions:Vec<ShadowActionAccounting>,",
+    "equity_buckets:Vec<EquityReturnBucket>,last_bucket:Option<EquityBoundary>,",
+    "micro_density:MicroDensityCounters}\n",
     "ledger_episode=PortfolioEpisode{entry_notional:Decimal,exit_notional:Decimal,",
     "realized_pnl:Decimal,fees:Decimal,funding:Decimal,slippage:Decimal,",
     "attribution_residual:Decimal,net_pnl:Decimal}\n",
+    "ledger_archive=BTreeMap<asset,EpisodeTotals{closed_count:u64,entry_notional:Decimal,",
+    "exit_notional:Decimal,gross_pnl:Decimal,fees:Decimal,funding:Decimal,slippage:Decimal,",
+    "net_pnl:Decimal,gains:Decimal,losses:Decimal}>\n",
     "checksum=sha256(canonical-messagepack((schema_version,generation,identity,payload)))\n",
     "commit=temp-write,file-fsync,atomic-rename,directory-fsync,marker-update,directory-fsync\n",
 );

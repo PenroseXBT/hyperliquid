@@ -6,10 +6,6 @@ RUN apt-get update \
         bash \
         ca-certificates \
         coreutils \
-        findutils \
-        gzip \
-        jq \
-        tar \
         tini \
     && rm -rf /var/lib/apt/lists/*
 
@@ -20,9 +16,6 @@ COPY --chmod=0444 railway-frozen/copytrade.json /app/config/copytrade.json
 COPY --chmod=0444 railway-frozen/very-profitable-layer.json /app/config/very-profitable-layer.json
 COPY --chmod=0444 railway-frozen/read-api-policy.json /app/policy/read-api-policy.json
 COPY --chmod=0444 railway-frozen/public-mainnet-transport.json /app/policy/public-mainnet-transport.json
-COPY --chmod=0444 railway-frozen/candidate-configuration.json /app/policy/candidate-configuration.json
-COPY --chmod=0444 railway-frozen/strategy-policy.json /app/policy/strategy-policy.json
-COPY --chmod=0444 railway-frozen/risk-policy.json /app/policy/risk-policy.json
 COPY --chmod=0444 railway-frozen/release-manifest.json /app/frozen/release-manifest.json
 COPY --chmod=0444 railway-frozen/release-manifest.sha256 /app/frozen/release-manifest.sha256
 COPY --chmod=0444 railway-frozen/frozen-identity.json /app/frozen/frozen-identity.json
