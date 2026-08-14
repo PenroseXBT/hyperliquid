@@ -1,7 +1,11 @@
 use crate::cohort_layer::{is_cohort_candidate_label, PreparedVeryProfitableLayer};
+use crate::mfce::{
+    evaluate_admission, MfceAdmissionInput, MfceDirection, MfceEngine, MfceError,
+    MfceFeatureVector, MfcePersistentState, MfceRejectionReason, MfceReport, MFCE_FEATURE_COUNT,
+};
 use crate::public_mainnet::{
-    AcceptedPublicResponse, CandleResponse, MarketMetadataResponse, MarketSnapshotResponse,
-    OrderBookResponse, PublicPayload, SourceStateResponse,
+    AcceptedPublicResponse, BookLevel, CandleResponse, MarketMetadataResponse,
+    MarketSnapshotResponse, OrderBookResponse, PublicPayload, SourceStateResponse,
 };
 use copytrade_core::authorized_intent::{
     AuthorizedExecutionIntent, PreSigningContext, TimeInForce, AUTHORIZED_INTENT_SCHEMA_VERSION,
@@ -9,7 +13,7 @@ use copytrade_core::authorized_intent::{
 use copytrade_core::cohort::{
     aggregate_authoritative_positions, classify_attribution, AttributionTag, CohortAssetAggregate,
     CohortDecisionReason, CohortIndicatorRecord, CohortPenalties, CohortRiskFlags,
-    CohortSignalInput, VeryProfitableCohortEngine, COHORT_CHASE_LIMIT_R,
+    CohortSignalInput, VeryProfitableCohortEngine,
 };
 use copytrade_core::configuration::CopyTradeConfig;
 use copytrade_core::consensus::{
@@ -38,7 +42,8 @@ use copytrade_core::shadow::{
 };
 use copytrade_core::target_state::VirtualTargetLedger;
 use copytrade_core::technical::{
-    CandleAcceptance, CostEstimate, TechnicalEngine, TechnicalFunnel, TechnicalTarget,
+    CandleAcceptance, SignalArchetype, TechnicalContext, TechnicalEngine, TechnicalFunnel,
+    TechnicalTarget,
 };
 use rust_decimal::prelude::{FromPrimitive, ToPrimitive};
 use rust_decimal::Decimal;
@@ -61,6 +66,9 @@ pub struct LiveShadowMetrics {
     pub cohort_indicator_records: u64,
     pub cohort_runtime_rejections: u64,
     pub technical_decision_records: u64,
+    pub mfce_retrain_attempts: u64,
+    pub mfce_model_promotions: u64,
+    pub mfce_retrain_failures: u64,
 }
 
 fn normalized_directional_weights(
@@ -206,201 +214,421 @@ fn include_held_assets_in_target_universe(
     }
 }
 
-fn source_target_adds_risk(current: Decimal, desired: Decimal) -> bool {
-    !desired.is_zero()
-        && (current.is_zero()
-            || current.is_sign_positive() != desired.is_sign_positive()
-            || desired.abs() > current.abs())
-}
-
-const SOURCE_EXPECTANCY_ALPHA: Decimal = Decimal::from_parts(25, 0, 0, false, 2);
 const BPS_PER_UNIT_RETURN: Decimal = Decimal::from_parts(10_000, 0, 0, false, 0);
+const MFCE_LIVE_BOOK_MAX_AGE_MS: u64 = 40_000;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-enum SourceSignalDirection {
-    Long,
-    Short,
-}
-
-impl SourceSignalDirection {
-    fn from_target(target: Decimal) -> Option<Self> {
-        if target.is_zero() {
-            None
-        } else if target.is_sign_positive() {
-            Some(Self::Long)
-        } else {
-            Some(Self::Short)
-        }
+const fn mfce_indicator(value: bool) -> Decimal {
+    if value {
+        Decimal::ONE
+    } else {
+        Decimal::ZERO
     }
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct SourceExpectancyEstimate {
-    count: u64,
-    ewma_gross_return_bps: Decimal,
-    ewma_lifetime_seconds: Decimal,
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct MfceLiveMarketContext {
+    friction_bps: Decimal,
+    spread_bps: Decimal,
+    entry_depth_ratio: Decimal,
+    exit_depth_ratio: Decimal,
+    depth_imbalance: Decimal,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct ActiveSourceObservation {
-    entry_midpoint: Decimal,
-    entry_timestamp: Timestamp,
-    direction: SourceSignalDirection,
-    proposed_target: Decimal,
-}
-
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct SourceExpectancyState {
-    long: SourceExpectancyEstimate,
-    short: SourceExpectancyEstimate,
-    active: Option<ActiveSourceObservation>,
-}
-
-#[derive(Debug, Clone, Serialize)]
-pub struct SourceExpectancyDirectionReport {
-    pub count: u64,
-    pub ewma_gross_return_bps: Decimal,
-    pub ewma_lifetime_seconds: Decimal,
-    pub required_gross_return_bps: Decimal,
-    pub above_cost_threshold: bool,
-}
-
-#[derive(Debug, Clone, Serialize)]
-pub struct ActiveSourceObservationReport {
-    pub entry_midpoint: Decimal,
-    pub entry_timestamp: Timestamp,
-    pub direction: String,
-    pub proposed_target: Decimal,
-}
-
-#[derive(Debug, Clone, Serialize)]
-pub struct SourceExpectancyReport {
-    pub long: SourceExpectancyDirectionReport,
-    pub short: SourceExpectancyDirectionReport,
-    pub active: Option<ActiveSourceObservationReport>,
-}
-
-impl SourceExpectancyState {
-    fn estimate(&self, direction: SourceSignalDirection) -> &SourceExpectancyEstimate {
-        match direction {
-            SourceSignalDirection::Long => &self.long,
-            SourceSignalDirection::Short => &self.short,
-        }
-    }
-
-    fn estimate_mut(&mut self, direction: SourceSignalDirection) -> &mut SourceExpectancyEstimate {
-        match direction {
-            SourceSignalDirection::Long => &mut self.long,
-            SourceSignalDirection::Short => &mut self.short,
-        }
-    }
-}
-
-fn update_source_expectancy(
-    estimate: &mut SourceExpectancyEstimate,
-    gross_return_bps: Decimal,
-    lifetime_seconds: Decimal,
-) -> Result<(), LiveShadowError> {
-    let retained_weight = Decimal::ONE
-        .checked_sub(SOURCE_EXPECTANCY_ALPHA)
-        .ok_or(LiveShadowError::Arithmetic)?;
-    estimate.ewma_gross_return_bps = estimate
-        .ewma_gross_return_bps
-        .checked_mul(retained_weight)
-        .and_then(|retained| {
-            gross_return_bps
-                .checked_mul(SOURCE_EXPECTANCY_ALPHA)
-                .and_then(|observed| retained.checked_add(observed))
-        })
-        .ok_or(LiveShadowError::Arithmetic)?;
-    estimate.ewma_lifetime_seconds = estimate
-        .ewma_lifetime_seconds
-        .checked_mul(retained_weight)
-        .and_then(|retained| {
-            lifetime_seconds
-                .checked_mul(SOURCE_EXPECTANCY_ALPHA)
-                .and_then(|observed| retained.checked_add(observed))
-        })
-        .ok_or(LiveShadowError::Arithmetic)?;
-    estimate.count = estimate
-        .count
-        .checked_add(1)
-        .ok_or(LiveShadowError::Arithmetic)?;
-    Ok(())
-}
-
-fn observe_source_transition(
-    states: &mut BTreeMap<String, SourceExpectancyState>,
+fn mfce_leg_cost(
     asset: &str,
-    current_target: Decimal,
-    desired_target: Decimal,
+    levels: &[BookLevel],
     midpoint: Decimal,
-    now: Timestamp,
-) -> Result<SourceExpectancyEstimate, LiveShadowError> {
-    if midpoint <= Decimal::ZERO {
+    requested_notional: Decimal,
+    is_buy: bool,
+    maximum_slippage_bps: Decimal,
+) -> Result<(Decimal, Decimal), LiveShadowError> {
+    if levels.is_empty()
+        || midpoint <= Decimal::ZERO
+        || requested_notional <= Decimal::ZERO
+        || maximum_slippage_bps < Decimal::ZERO
+        || maximum_slippage_bps >= BPS_PER_UNIT_RETURN
+    {
         return Err(LiveShadowError::InvalidMarket(asset.to_string()));
     }
-    let desired_direction = SourceSignalDirection::from_target(desired_target);
-    if desired_direction.is_none() && !states.contains_key(asset) {
-        return Ok(SourceExpectancyEstimate::default());
-    }
-    let state = states.entry(asset.to_string()).or_default();
-    if state.active.as_ref().is_some_and(|active| {
-        desired_direction.map_or(true, |direction| {
-            direction != active.direction
-                || !source_target_adds_risk(current_target, desired_target)
-        })
-    }) {
-        let active = state
-            .active
-            .take()
-            .ok_or_else(|| LiveShadowError::Core("missing active source observation".into()))?;
-        let unsigned_return = midpoint
-            .checked_sub(active.entry_midpoint)
-            .and_then(|delta| delta.checked_div(active.entry_midpoint))
-            .and_then(|fraction| fraction.checked_mul(BPS_PER_UNIT_RETURN))
-            .ok_or(LiveShadowError::Arithmetic)?;
-        let gross_return_bps = match active.direction {
-            SourceSignalDirection::Long => unsigned_return,
-            SourceSignalDirection::Short => -unsigned_return,
-        };
-        let lifetime_seconds = Decimal::from(now.saturating_sub(active.entry_timestamp))
-            .checked_div(Decimal::from(1_000))
-            .ok_or(LiveShadowError::Arithmetic)?;
-        update_source_expectancy(
-            state.estimate_mut(active.direction),
-            gross_return_bps,
-            lifetime_seconds,
-        )?;
-    }
-    if let Some(direction) = desired_direction {
-        if state.active.is_none() && source_target_adds_risk(current_target, desired_target) {
-            state.active = Some(ActiveSourceObservation {
-                entry_midpoint: midpoint,
-                entry_timestamp: now,
-                direction,
-                proposed_target: desired_target,
-            });
-        }
-        Ok(state.estimate(direction).clone())
+    let maximum_slippage_fraction = maximum_slippage_bps
+        .checked_div(BPS_PER_UNIT_RETURN)
+        .ok_or(LiveShadowError::Arithmetic)?;
+    let limit_price = if is_buy {
+        Decimal::ONE.checked_add(maximum_slippage_fraction)
     } else {
-        Ok(SourceExpectancyEstimate::default())
+        Decimal::ONE.checked_sub(maximum_slippage_fraction)
     }
+    .and_then(|factor| midpoint.checked_mul(factor))
+    .ok_or(LiveShadowError::Arithmetic)?;
+    let executable = |price: Decimal| {
+        if is_buy {
+            price <= limit_price
+        } else {
+            price >= limit_price
+        }
+    };
+    let requested_quantity = requested_notional
+        .checked_div(midpoint)
+        .ok_or(LiveShadowError::Arithmetic)?;
+    let visible_notional = levels.iter().try_fold(Decimal::ZERO, |sum, level| {
+        if level.price <= Decimal::ZERO || level.quantity <= Decimal::ZERO {
+            return Err(LiveShadowError::InvalidMarket(asset.to_string()));
+        }
+        if !executable(level.price) {
+            return Ok(sum);
+        }
+        level
+            .price
+            .checked_mul(level.quantity)
+            .and_then(|notional| sum.checked_add(notional))
+            .ok_or(LiveShadowError::Arithmetic)
+    })?;
+    // A displayed best quote outside the configured execution envelope cannot
+    // be replaced by invented, better liquidity at the cap.
+    if !levels.iter().any(|level| executable(level.price)) {
+        return Err(LiveShadowError::InvalidMarket(asset.to_string()));
+    }
+    let depth_ratio = visible_notional
+        .checked_div(requested_notional)
+        .ok_or(LiveShadowError::Arithmetic)?
+        .clamp(Decimal::ZERO, Decimal::from(10));
+    let mut remaining = requested_quantity;
+    let mut price_quantity = Decimal::ZERO;
+    for level in levels {
+        if remaining.is_zero() {
+            break;
+        }
+        if !executable(level.price) {
+            continue;
+        }
+        let quantity = remaining.min(level.quantity);
+        price_quantity = level
+            .price
+            .checked_mul(quantity)
+            .and_then(|value| price_quantity.checked_add(value))
+            .ok_or(LiveShadowError::Arithmetic)?;
+        remaining = remaining
+            .checked_sub(quantity)
+            .ok_or(LiveShadowError::Arithmetic)?;
+    }
+    if !remaining.is_zero() {
+        // Missing displayed depth is conservatively charged at the execution
+        // cap, which is never better than any executable visible level.
+        price_quantity = limit_price
+            .checked_mul(remaining)
+            .and_then(|value| price_quantity.checked_add(value))
+            .ok_or(LiveShadowError::Arithmetic)?;
+    }
+    let vwap = price_quantity
+        .checked_div(requested_quantity)
+        .ok_or(LiveShadowError::Arithmetic)?;
+    let slippage_fraction = if is_buy {
+        vwap.checked_sub(midpoint)
+    } else {
+        midpoint.checked_sub(vwap)
+    }
+    .and_then(|difference| difference.checked_div(midpoint))
+    .ok_or(LiveShadowError::Arithmetic)?;
+    let cost_bps = slippage_fraction
+        .checked_mul(BPS_PER_UNIT_RETURN)
+        .ok_or(LiveShadowError::Arithmetic)?
+        .max(Decimal::ZERO);
+    Ok((cost_bps, depth_ratio))
 }
 
-fn expected_move_covers_round_trip_cost(
-    expected_move_fraction: Decimal,
-    round_trip_cost_fraction: Decimal,
-    minimum_cost_multiple: Decimal,
-) -> bool {
-    expected_move_fraction
-        >= round_trip_cost_fraction
-            .checked_mul(minimum_cost_multiple)
-            .unwrap_or(Decimal::MAX)
+fn mfce_live_market_context(
+    asset: &str,
+    book: &OrderBookResponse,
+    direction: MfceDirection,
+    current_position_notional: Decimal,
+    proposed_position_notional: Decimal,
+    taker_fee_bps: Decimal,
+    maximum_slippage_bps: Decimal,
+    funding_rate_hourly: Decimal,
+    holding_hours: Decimal,
+) -> Result<MfceLiveMarketContext, LiveShadowError> {
+    let best_bid = book
+        .bids
+        .first()
+        .ok_or_else(|| LiveShadowError::InvalidMarket(asset.to_string()))?
+        .price;
+    let best_ask = book
+        .asks
+        .first()
+        .ok_or_else(|| LiveShadowError::InvalidMarket(asset.to_string()))?
+        .price;
+    if best_bid <= Decimal::ZERO || best_ask <= best_bid {
+        return Err(LiveShadowError::InvalidMarket(asset.to_string()));
+    }
+    let midpoint = best_bid
+        .checked_add(best_ask)
+        .and_then(|value| value.checked_div(Decimal::from(2)))
+        .ok_or(LiveShadowError::Arithmetic)?;
+    let spread_bps = best_ask
+        .checked_sub(best_bid)
+        .and_then(|spread| spread.checked_div(midpoint))
+        .and_then(|fraction| fraction.checked_mul(BPS_PER_UNIT_RETURN))
+        .ok_or(LiveShadowError::Arithmetic)?;
+    let notional = proposed_position_notional.abs();
+    if notional.is_zero() {
+        return Err(LiveShadowError::InvalidMarket(asset.to_string()));
+    }
+    let entry_notional = if !current_position_notional.is_zero()
+        && current_position_notional.is_sign_positive()
+            == proposed_position_notional.is_sign_positive()
+    {
+        notional
+            .checked_sub(current_position_notional.abs())
+            .ok_or(LiveShadowError::Arithmetic)?
+            .max(Decimal::ZERO)
+    } else {
+        notional
+    };
+    if entry_notional.is_zero() {
+        return Err(LiveShadowError::InvalidMarket(asset.to_string()));
+    }
+    let (entry_levels, exit_levels, entry_is_buy) = match direction {
+        MfceDirection::Long => (&book.asks[..], &book.bids[..], true),
+        MfceDirection::Short => (&book.bids[..], &book.asks[..], false),
+    };
+    let (entry_slippage_bps, entry_depth_ratio) = mfce_leg_cost(
+        asset,
+        entry_levels,
+        midpoint,
+        entry_notional,
+        entry_is_buy,
+        maximum_slippage_bps,
+    )?;
+    let (exit_slippage_bps, exit_depth_ratio) = mfce_leg_cost(
+        asset,
+        exit_levels,
+        midpoint,
+        notional,
+        !entry_is_buy,
+        maximum_slippage_bps,
+    )?;
+    let maximum_slippage_fraction = maximum_slippage_bps
+        .checked_div(BPS_PER_UNIT_RETURN)
+        .ok_or(LiveShadowError::Arithmetic)?;
+    let bid_floor = Decimal::ONE
+        .checked_sub(maximum_slippage_fraction)
+        .and_then(|factor| midpoint.checked_mul(factor))
+        .ok_or(LiveShadowError::Arithmetic)?;
+    let ask_ceiling = Decimal::ONE
+        .checked_add(maximum_slippage_fraction)
+        .and_then(|factor| midpoint.checked_mul(factor))
+        .ok_or(LiveShadowError::Arithmetic)?;
+    let executable_depth = |levels: &[BookLevel], is_bid: bool| {
+        levels.iter().try_fold(Decimal::ZERO, |sum, level| {
+            if level.price <= Decimal::ZERO || level.quantity <= Decimal::ZERO {
+                return Err(LiveShadowError::InvalidMarket(asset.to_string()));
+            }
+            let executable = if is_bid {
+                level.price >= bid_floor
+            } else {
+                level.price <= ask_ceiling
+            };
+            if !executable {
+                return Ok(sum);
+            }
+            level
+                .price
+                .checked_mul(level.quantity)
+                .and_then(|value| sum.checked_add(value))
+                .ok_or(LiveShadowError::Arithmetic)
+        })
+    };
+    let bid_depth = executable_depth(&book.bids, true)?;
+    let ask_depth = executable_depth(&book.asks, false)?;
+    let depth_imbalance = bid_depth
+        .checked_add(ask_depth)
+        .filter(|total| !total.is_zero())
+        .and_then(|total| bid_depth.checked_sub(ask_depth)?.checked_div(total))
+        .unwrap_or_default();
+    let direction_sign = Decimal::from(direction.sign());
+    let funding_bps = funding_rate_hourly
+        .checked_mul(holding_hours)
+        .and_then(|value| value.checked_mul(direction_sign))
+        .and_then(|value| value.checked_mul(BPS_PER_UNIT_RETURN))
+        .ok_or(LiveShadowError::Arithmetic)?;
+    // Entry/exit slippage are measured from midpoint, so together they
+    // already include the live spread as well as depth impact.
+    let entry_fraction = entry_notional
+        .checked_div(notional)
+        .ok_or(LiveShadowError::Arithmetic)?;
+    let friction_bps = entry_slippage_bps
+        .checked_mul(entry_fraction)
+        .and_then(|entry| entry.checked_add(exit_slippage_bps))
+        .and_then(|value| {
+            taker_fee_bps
+                .checked_mul(Decimal::ONE.checked_add(entry_fraction)?)
+                .and_then(|fees| value.checked_add(fees))
+        })
+        .and_then(|value| value.checked_add(funding_bps))
+        .ok_or(LiveShadowError::Arithmetic)?
+        .max(Decimal::ZERO);
+    Ok(MfceLiveMarketContext {
+        friction_bps,
+        spread_bps,
+        entry_depth_ratio,
+        exit_depth_ratio,
+        depth_imbalance,
+    })
+}
+
+fn mfce_feature_vector(
+    raw_source_exposure: Decimal,
+    previous_source_exposure: Decimal,
+    current_target: Decimal,
+    proposed_target: Decimal,
+    available_gross: Decimal,
+    funding_rate_hourly: Decimal,
+    technical: Option<&TechnicalContext>,
+    fallback_atr_fraction: Option<Decimal>,
+    live: Option<&MfceLiveMarketContext>,
+) -> Result<MfceFeatureVector, LiveShadowError> {
+    let direction = MfceDirection::from_signed(raw_source_exposure)
+        .ok_or_else(|| LiveShadowError::Core("MFCE risk transition has no direction".into()))?;
+    let sign = Decimal::from(direction.sign());
+    let raw_reversal = !previous_source_exposure.is_zero()
+        && previous_source_exposure.is_sign_positive() != raw_source_exposure.is_sign_positive();
+    let opening = current_target.is_zero();
+    let reversal =
+        !opening && current_target.is_sign_positive() != proposed_target.is_sign_positive();
+    let expansion = !opening && !reversal && proposed_target.abs() > current_target.abs();
+    let conviction_change = if raw_reversal {
+        raw_source_exposure.abs()
+    } else {
+        raw_source_exposure
+            .abs()
+            .checked_sub(previous_source_exposure.abs())
+            .ok_or(LiveShadowError::Arithmetic)?
+    };
+    let scale = |value: Decimal| {
+        if available_gross.is_zero() {
+            Ok(Decimal::ZERO)
+        } else {
+            value
+                .checked_div(available_gross)
+                .ok_or(LiveShadowError::Arithmetic)
+        }
+    };
+    let technical_missing = mfce_indicator(technical.is_none());
+    let atr_fraction = technical
+        .map(|context| context.atr_fraction)
+        .or(fallback_atr_fraction)
+        .unwrap_or_default();
+    let aligned = |value: Decimal| value.checked_mul(sign).ok_or(LiveShadowError::Arithmetic);
+    let (
+        raw_score,
+        regime,
+        trend_4h,
+        trend_1h,
+        trigger_30m,
+        trigger_15m,
+        ma50,
+        ma100,
+        trend_pullback,
+        range_mean_reversion,
+    ) = match technical {
+        Some(context) => (
+            aligned(context.raw_contextual_score)?,
+            Decimal::from(context.state.regime_12h.direction)
+                .checked_mul(sign)
+                .ok_or(LiveShadowError::Arithmetic)?,
+            Decimal::from(context.state.trend_4h.score())
+                .checked_mul(sign)
+                .ok_or(LiveShadowError::Arithmetic)?,
+            Decimal::from(context.state.trend_1h.score())
+                .checked_mul(sign)
+                .ok_or(LiveShadowError::Arithmetic)?,
+            Decimal::from(context.state.trigger_30m.score())
+                .checked_mul(sign)
+                .ok_or(LiveShadowError::Arithmetic)?,
+            Decimal::from(context.state.trigger_15m.score())
+                .checked_mul(sign)
+                .ok_or(LiveShadowError::Arithmetic)?,
+            aligned(context.state.regime_12h.ma50_normalized_slope)?,
+            aligned(context.state.regime_12h.ma100_normalized_slope)?,
+            mfce_indicator(context.archetype == SignalArchetype::TrendPullback),
+            mfce_indicator(context.archetype == SignalArchetype::RangeMeanReversion),
+        ),
+        None => (
+            Decimal::ZERO,
+            Decimal::ZERO,
+            Decimal::ZERO,
+            Decimal::ZERO,
+            Decimal::ZERO,
+            Decimal::ZERO,
+            Decimal::ZERO,
+            Decimal::ZERO,
+            Decimal::ZERO,
+            Decimal::ZERO,
+        ),
+    };
+    let values = [
+        raw_source_exposure.abs(),
+        conviction_change,
+        sign,
+        raw_source_exposure,
+        scale(current_target)?,
+        scale(
+            proposed_target
+                .checked_sub(current_target)
+                .ok_or(LiveShadowError::Arithmetic)?,
+        )?,
+        mfce_indicator(opening),
+        mfce_indicator(expansion),
+        mfce_indicator(reversal),
+        atr_fraction
+            .checked_mul(BPS_PER_UNIT_RETURN)
+            .ok_or(LiveShadowError::Arithmetic)?,
+        mfce_indicator(live.is_none()),
+        live.map_or(Decimal::ZERO, |context| context.spread_bps),
+        live.map_or(Decimal::ZERO, |context| context.entry_depth_ratio),
+        live.map_or(Decimal::ZERO, |context| context.exit_depth_ratio),
+        live.map_or(Decimal::ZERO, |context| context.depth_imbalance),
+        funding_rate_hourly
+            .checked_mul(sign)
+            .and_then(|value| value.checked_mul(BPS_PER_UNIT_RETURN))
+            .ok_or(LiveShadowError::Arithmetic)?,
+        technical_missing,
+        raw_score,
+        regime,
+        trend_4h,
+        trend_1h,
+        trigger_30m,
+        trigger_15m,
+        ma50,
+        ma100,
+        trend_pullback,
+        range_mean_reversion,
+    ];
+    debug_assert_eq!(values.len(), MFCE_FEATURE_COUNT);
+    Ok(MfceFeatureVector::new(values))
+}
+
+fn remaining_mfce_tail_budget(
+    config: &CopyTradeConfig,
+    deployment: DeploymentEquity,
+) -> Result<Decimal, LiveShadowError> {
+    let maximum_loss = deployment
+        .starting_equity
+        .checked_mul(
+            Decimal::from_f64(config.max_account_drawdown_pct)
+                .ok_or(LiveShadowError::Arithmetic)?,
+        )
+        .and_then(|value| value.checked_div(Decimal::from(100)))
+        .ok_or(LiveShadowError::Arithmetic)?;
+    let loss_already_realized_or_marked = deployment
+        .starting_equity
+        .checked_sub(deployment.current_equity)
+        .ok_or(LiveShadowError::Arithmetic)?
+        .max(Decimal::ZERO);
+    Ok(maximum_loss
+        .checked_sub(loss_already_realized_or_marked)
+        .unwrap_or(Decimal::ZERO)
+        .max(Decimal::ZERO))
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
@@ -1238,6 +1466,17 @@ pub struct ActionLifecycleEvent {
 }
 
 #[derive(Debug, Clone, Serialize)]
+pub struct UnresolvedRootStatus {
+    pub asset: String,
+    pub root_planned_cloid: String,
+    pub lifecycle: &'static str,
+    pub planned_cloid: Option<String>,
+    pub parent_planned_cloid: Option<String>,
+    pub decision_id: Option<String>,
+    pub retry_generation: Option<u32>,
+}
+
+#[derive(Debug, Clone, Serialize)]
 pub struct ExecutableDensitySummary {
     pub global_risk_scale: f64,
     pub root_actionable_targets: usize,
@@ -1322,6 +1561,8 @@ pub struct LiveShadowEngine {
     inactive_freshness_ms: u64,
     mids: Option<(MarketSnapshotResponse, Timestamp)>,
     metadata: Option<MarketMetadataResponse>,
+    metadata_received_at: Option<Timestamp>,
+    metadata_valid_until: Option<Timestamp>,
     books: BTreeMap<String, (OrderBookResponse, Timestamp)>,
     previous_target: Option<PreviousTargetState>,
     decision_sequence: u64,
@@ -1354,15 +1595,17 @@ pub struct LiveShadowEngine {
     very_profitable_layer: Option<PreparedVeryProfitableLayer>,
     very_profitable_engine: VeryProfitableCohortEngine,
     cohort_indicator_records: Vec<CohortIndicatorRecord>,
-    source_expectancy: BTreeMap<String, SourceExpectancyState>,
-    source_expectancy_time_offset: Timestamp,
-    source_expectancy_time_high_watermark: Timestamp,
+    mfce: MfceEngine,
+    mfce_authorized_assets: BTreeMap<String, Timestamp>,
+    mfce_time_offset: Timestamp,
+    mfce_time_high_watermark: Timestamp,
     ledger_time_offset: Timestamp,
     ledger_time_high_watermark: Timestamp,
     snapshot_generation: Option<u64>,
 }
 
-pub const UNSIGNED_SNAPSHOT_SCHEMA_VERSION: u32 = 7;
+pub const LEGACY_UNSIGNED_SNAPSHOT_SCHEMA_VERSION: u32 = 7;
+pub const UNSIGNED_SNAPSHOT_SCHEMA_VERSION: u32 = 8;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -1389,7 +1632,66 @@ pub struct UnsignedObserverState {
     continuations: BTreeMap<String, ContinuationIntent>,
     accrued_funding: BTreeMap<String, Decimal>,
     last_mids: Option<MarketSnapshotResponse>,
-    source_expectancy: BTreeMap<String, SourceExpectancyState>,
+    mfce: MfcePersistentState,
+    mfce_time_high_watermark: Timestamp,
+    ledger_time_high_watermark: Timestamp,
+    executions: Vec<ShadowActionAccounting>,
+    equity_buckets: Vec<EquityReturnBucket>,
+    last_bucket: Option<(Timestamp, Decimal, BTreeMap<String, Decimal>)>,
+    micro_density: MicroDensityCounters,
+}
+
+// Read-only schema-v7 decoder used solely to migrate the existing durable
+// observer state. The scalar estimates are intentionally discarded after
+// their checksum is verified; MFCE begins with an empty bounded state while
+// every ledger, continuation, candle, and accounting field is preserved.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum LegacySourceSignalDirection {
+    Long,
+    Short,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct LegacySourceExpectancyEstimate {
+    count: u64,
+    ewma_gross_return_bps: Decimal,
+    ewma_lifetime_seconds: Decimal,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct LegacyActiveSourceObservation {
+    entry_midpoint: Decimal,
+    entry_timestamp: Timestamp,
+    direction: LegacySourceSignalDirection,
+    proposed_target: Decimal,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct LegacySourceExpectancyState {
+    long: LegacySourceExpectancyEstimate,
+    short: LegacySourceExpectancyEstimate,
+    active: Option<LegacyActiveSourceObservation>,
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct LegacyUnsignedObserverState {
+    ledger: DualLedger,
+    target_ledger: VirtualTargetLedger,
+    technical_engine: TechnicalEngine,
+    #[serde(default)]
+    technical_decision_state: BTreeMap<String, TechnicalDecisionUniquenessState>,
+    very_profitable_engine: VeryProfitableCohortEngine,
+    very_profitable_layer_artifact_sha256: Option<String>,
+    decision_sequence: u64,
+    continuations: BTreeMap<String, ContinuationIntent>,
+    accrued_funding: BTreeMap<String, Decimal>,
+    last_mids: Option<MarketSnapshotResponse>,
+    source_expectancy: BTreeMap<String, LegacySourceExpectancyState>,
     source_expectancy_time_high_watermark: Timestamp,
     ledger_time_high_watermark: Timestamp,
     executions: Vec<ShadowActionAccounting>,
@@ -1408,11 +1710,32 @@ pub struct UnsignedSnapshotEnvelope {
     pub checksum_sha256: [u8; 32],
 }
 
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct LegacyUnsignedSnapshotEnvelope {
+    schema_version: u32,
+    generation: u64,
+    identity: SnapshotIdentity,
+    payload: LegacyUnsignedObserverState,
+    checksum_sha256: [u8; 32],
+}
+
 fn unsigned_snapshot_checksum(
     schema_version: u32,
     generation: u64,
     identity: &SnapshotIdentity,
     payload: &UnsignedObserverState,
+) -> Result<[u8; 32], LiveShadowError> {
+    let canonical = rmp_serde::to_vec(&(schema_version, generation, identity, payload))
+        .map_err(|error| LiveShadowError::Core(error.to_string()))?;
+    Ok(Sha256::digest(canonical).into())
+}
+
+fn legacy_unsigned_snapshot_checksum(
+    schema_version: u32,
+    generation: u64,
+    identity: &SnapshotIdentity,
+    payload: &LegacyUnsignedObserverState,
 ) -> Result<[u8; 32], LiveShadowError> {
     let canonical = rmp_serde::to_vec(&(schema_version, generation, identity, payload))
         .map_err(|error| LiveShadowError::Core(error.to_string()))?;
@@ -1429,36 +1752,104 @@ fn decode_unsigned_snapshot(
     bytes: &[u8],
     expected_identity: &SnapshotIdentity,
 ) -> Result<UnsignedSnapshotEnvelope, LiveShadowError> {
-    let envelope: UnsignedSnapshotEnvelope = rmp_serde::from_slice(bytes)
+    if let Ok(envelope) = rmp_serde::from_slice::<UnsignedSnapshotEnvelope>(bytes) {
+        let canonical = encode_unsigned_snapshot(&envelope)?;
+        if canonical != bytes {
+            return Err(LiveShadowError::Core(
+                "unsigned snapshot is not canonically encoded".into(),
+            ));
+        }
+        if envelope.schema_version != UNSIGNED_SNAPSHOT_SCHEMA_VERSION {
+            return Err(LiveShadowError::Core(
+                "unsupported unsigned snapshot schema".into(),
+            ));
+        }
+        if &envelope.identity != expected_identity {
+            return Err(LiveShadowError::Core(
+                "unsigned snapshot identity mismatch".into(),
+            ));
+        }
+        let expected_checksum = unsigned_snapshot_checksum(
+            envelope.schema_version,
+            envelope.generation,
+            &envelope.identity,
+            &envelope.payload,
+        )?;
+        if envelope.checksum_sha256 != expected_checksum {
+            return Err(LiveShadowError::Core(
+                "unsigned snapshot checksum mismatch".into(),
+            ));
+        }
+        return Ok(envelope);
+    }
+
+    let legacy: LegacyUnsignedSnapshotEnvelope = rmp_serde::from_slice(bytes)
         .map_err(|error| LiveShadowError::Core(format!("invalid unsigned snapshot: {error}")))?;
-    let canonical = encode_unsigned_snapshot(&envelope)?;
+    let canonical =
+        rmp_serde::to_vec(&legacy).map_err(|error| LiveShadowError::Core(error.to_string()))?;
     if canonical != bytes {
         return Err(LiveShadowError::Core(
-            "unsigned snapshot is not canonically encoded".into(),
+            "legacy unsigned snapshot is not canonically encoded".into(),
         ));
     }
-    if envelope.schema_version != UNSIGNED_SNAPSHOT_SCHEMA_VERSION {
+    if legacy.schema_version != LEGACY_UNSIGNED_SNAPSHOT_SCHEMA_VERSION {
         return Err(LiveShadowError::Core(
             "unsupported unsigned snapshot schema".into(),
         ));
     }
-    if &envelope.identity != expected_identity {
+    if &legacy.identity != expected_identity {
         return Err(LiveShadowError::Core(
             "unsigned snapshot identity mismatch".into(),
         ));
     }
-    let expected_checksum = unsigned_snapshot_checksum(
-        envelope.schema_version,
-        envelope.generation,
-        &envelope.identity,
-        &envelope.payload,
-    )?;
-    if envelope.checksum_sha256 != expected_checksum {
+    if legacy.payload.source_expectancy.len() > crate::mfce::MFCE_MAX_ASSETS {
         return Err(LiveShadowError::Core(
-            "unsigned snapshot checksum mismatch".into(),
+            "legacy source expectancy asset bound exceeded".into(),
         ));
     }
-    Ok(envelope)
+    let expected_checksum = legacy_unsigned_snapshot_checksum(
+        legacy.schema_version,
+        legacy.generation,
+        &legacy.identity,
+        &legacy.payload,
+    )?;
+    if legacy.checksum_sha256 != expected_checksum {
+        return Err(LiveShadowError::Core(
+            "legacy unsigned snapshot checksum mismatch".into(),
+        ));
+    }
+    let payload = UnsignedObserverState {
+        ledger: legacy.payload.ledger,
+        target_ledger: legacy.payload.target_ledger,
+        technical_engine: legacy.payload.technical_engine,
+        technical_decision_state: legacy.payload.technical_decision_state,
+        very_profitable_engine: legacy.payload.very_profitable_engine,
+        very_profitable_layer_artifact_sha256: legacy.payload.very_profitable_layer_artifact_sha256,
+        decision_sequence: legacy.payload.decision_sequence,
+        continuations: legacy.payload.continuations,
+        accrued_funding: legacy.payload.accrued_funding,
+        last_mids: legacy.payload.last_mids,
+        mfce: MfcePersistentState::default(),
+        mfce_time_high_watermark: legacy.payload.source_expectancy_time_high_watermark,
+        ledger_time_high_watermark: legacy.payload.ledger_time_high_watermark,
+        executions: legacy.payload.executions,
+        equity_buckets: legacy.payload.equity_buckets,
+        last_bucket: legacy.payload.last_bucket,
+        micro_density: legacy.payload.micro_density,
+    };
+    let checksum_sha256 = unsigned_snapshot_checksum(
+        UNSIGNED_SNAPSHOT_SCHEMA_VERSION,
+        legacy.generation,
+        &legacy.identity,
+        &payload,
+    )?;
+    Ok(UnsignedSnapshotEnvelope {
+        schema_version: UNSIGNED_SNAPSHOT_SCHEMA_VERSION,
+        generation: legacy.generation,
+        identity: legacy.identity,
+        payload,
+        checksum_sha256,
+    })
 }
 
 #[derive(Debug, Clone)]
@@ -1504,6 +1895,8 @@ impl LiveShadowEngine {
             inactive_freshness_ms,
             mids: None,
             metadata: None,
+            metadata_received_at: None,
+            metadata_valid_until: None,
             books: BTreeMap::new(),
             previous_target: None,
             decision_sequence: 0,
@@ -1536,9 +1929,10 @@ impl LiveShadowEngine {
             very_profitable_layer: None,
             very_profitable_engine: VeryProfitableCohortEngine::default(),
             cohort_indicator_records: Vec::new(),
-            source_expectancy: BTreeMap::new(),
-            source_expectancy_time_offset: 0,
-            source_expectancy_time_high_watermark: 0,
+            mfce: MfceEngine::default(),
+            mfce_authorized_assets: BTreeMap::new(),
+            mfce_time_offset: 0,
+            mfce_time_high_watermark: 0,
             ledger_time_offset: 0,
             ledger_time_high_watermark: 0,
             snapshot_generation: None,
@@ -1609,6 +2003,39 @@ impl LiveShadowEngine {
             !state.position_mismatches.is_empty() || state.equity_mismatch.is_some();
     }
 
+    /// Returns the bounded observer-only MFCE state suitable for inclusion in
+    /// the existing production trading-state commit.
+    pub fn mfce_persistence_snapshot(&self) -> (MfcePersistentState, Timestamp) {
+        (self.mfce.state().clone(), self.mfce_time_high_watermark)
+    }
+
+    /// Restores MFCE state before production event processing. Runtime model
+    /// handles are reconstructed as one pair, and the process-local monotonic
+    /// clock is rebased beyond every persisted transition/sample timestamp.
+    pub fn restore_mfce_persistent_state(
+        &mut self,
+        state: MfcePersistentState,
+        time_high_watermark: Timestamp,
+    ) -> Result<(), LiveShadowError> {
+        if time_high_watermark < state.time_high_watermark() {
+            return Err(LiveShadowError::Core(
+                "persisted MFCE time high-watermark regressed".into(),
+            ));
+        }
+        let time_offset = time_high_watermark
+            .checked_add(1)
+            .ok_or(LiveShadowError::Arithmetic)?;
+        let replacement = MfceEngine::from_state(state).map_err(|error| {
+            LiveShadowError::Core(format!("invalid persisted MFCE state: {error}"))
+        })?;
+        self.mfce = replacement;
+        self.mfce_authorized_assets.clear();
+        self.mfce_time_offset = time_offset;
+        self.mfce_time_high_watermark = time_high_watermark;
+        self.refresh_desired_books();
+        Ok(())
+    }
+
     pub fn recompute_after_production_updates(
         &mut self,
         now: Timestamp,
@@ -1671,6 +2098,25 @@ impl LiveShadowEngine {
                         Ok((asset.clone(), exposure))
                     })
                     .collect::<Result<BTreeMap<_, _>, LiveShadowError>>()?;
+                let authorized_assets =
+                    if let Some(previous) = self.source_exposure_book.get(&candidate_id) {
+                        previous
+                            .exposures
+                            .keys()
+                            .chain(exposures.keys())
+                            .filter(|asset| previous.exposures.get(*asset) != exposures.get(*asset))
+                            .cloned()
+                            .collect::<BTreeSet<_>>()
+                    } else {
+                        // First post-start hydration is authoritative for both its
+                        // visible positions and every durable aggregate lifecycle
+                        // that may have changed while the daemon was offline.
+                        exposures
+                            .keys()
+                            .chain(self.mfce.tracked_assets())
+                            .cloned()
+                            .collect::<BTreeSet<_>>()
+                    };
                 let exposure_state = SourceExposureState {
                     accepted_sequence: *sequence,
                     payload_hash,
@@ -1685,16 +2131,35 @@ impl LiveShadowEngine {
                     valid_until: response.valid_until_mono,
                     sequence: *sequence,
                 };
-                match self.source_store.accept(snapshot, now, true) {
+                let source_transition_accepted = match self.source_store.accept(snapshot, now, true)
+                {
                     SnapshotAcceptance::Accepted => {
                         self.source_exposure_book
                             .accept(candidate_id, exposure_state);
+                        for asset in authorized_assets {
+                            self.mfce_authorized_assets
+                                .entry(asset)
+                                .and_modify(|valid_until| {
+                                    *valid_until = (*valid_until).max(response.valid_until_mono)
+                                })
+                                .or_insert(response.valid_until_mono);
+                        }
+                        self.mfce
+                            .note_accepted_source_snapshot()
+                            .map_err(mfce_error)?;
                         self.metrics.accepted_source_snapshots += 1;
+                        true
                     }
-                    SnapshotAcceptance::Expired => self.metrics.stale_source_snapshots += 1,
-                    _ => self.metrics.rejected_source_snapshots += 1,
-                }
-                if technical_changed {
+                    SnapshotAcceptance::Expired => {
+                        self.metrics.stale_source_snapshots += 1;
+                        false
+                    }
+                    _ => {
+                        self.metrics.rejected_source_snapshots += 1;
+                        false
+                    }
+                };
+                if source_transition_accepted || technical_changed {
                     self.construct_next_decision(response.received_at_mono)?;
                 }
             }
@@ -1704,16 +2169,32 @@ impl LiveShadowEngine {
             PublicPayload::MarketMetadata(metadata) => {
                 self.accrue_funding(response.received_at_mono)?;
                 self.metadata = Some(metadata);
+                self.metadata_received_at = Some(response.received_at_mono);
+                self.metadata_valid_until = Some(response.valid_until_mono);
                 self.last_funding_accrual = Some(response.received_at_mono);
             }
             PublicPayload::OrderBook(book) => {
                 let asset = book.asset.clone();
-                let triggers_recompute = self.pending_book.contains_key(&asset);
+                let triggers_recompute = self.pending_book.contains_key(&asset)
+                    || self
+                        .mfce
+                        .awaiting_book_assets()
+                        .any(|pending| pending == &asset);
+                let refreshes_active_mfce = self.mfce.has_active_transition(&asset);
                 self.books
                     .insert(asset.clone(), (book.clone(), response.received_at_mono));
-                let execution_recompute =
-                    self.try_execute_pending(&book, response.received_at_mono)?;
-                if triggers_recompute || execution_recompute.is_required() {
+                let admission_recomputed = refreshes_active_mfce
+                    && self
+                        .construct_next_decision(response.received_at_mono)?
+                        .is_some();
+                let execution_recompute = if refreshes_active_mfce && !admission_recomputed {
+                    ExecutionRecompute::None
+                } else {
+                    self.try_execute_pending(&book, response.received_at_mono)?
+                };
+                if (!admission_recomputed && triggers_recompute)
+                    || execution_recompute.is_required()
+                {
                     let recomputed = self
                         .construct_next_decision(response.received_at_mono)?
                         .is_some();
@@ -1875,7 +2356,7 @@ impl LiveShadowEngine {
         &mut self,
         now: Timestamp,
         mids: &MarketSnapshotResponse,
-        metadata: &MarketMetadataResponse,
+        _metadata: &MarketMetadataResponse,
         fresh_states: &[SourceStateResponse],
         source_received_at: &BTreeMap<String, Timestamp>,
         existing_wallet_consensus: &BTreeMap<String, Decimal>,
@@ -1916,13 +2397,6 @@ impl LiveShadowEngine {
         let assets = consensus_inputs.keys().cloned().collect::<Vec<_>>();
         let source_budget = Decimal::from_f64(self.config.technical.source_budget_fraction)
             .ok_or(LiveShadowError::Arithmetic)?;
-        let technical_budget = Decimal::from_f64(self.config.technical.technical_budget_fraction)
-            .ok_or(LiveShadowError::Arithmetic)?;
-        let fee = Decimal::from_f64(self.config.taker_fee_bps / 10_000.0)
-            .ok_or(LiveShadowError::Arithmetic)?;
-        let slippage = Decimal::from_f64(self.config.execution.max_slippage_bps / 10_000.0)
-            .ok_or(LiveShadowError::Arithmetic)?;
-        let holding_hours = Decimal::from(self.config.technical.expected_holding_hours);
         let dominant_wallet_limit_pct = Decimal::from_f64(self.config.max_asset_notional_pct)
             .ok_or(LiveShadowError::Arithmetic)?;
         let rebalance_tolerance = Decimal::from_f64(self.config.global_risk.slot_rank_hysteresis)
@@ -1931,14 +2405,7 @@ impl LiveShadowEngine {
             Ok(wallets) => wallets,
             Err(_) => {
                 for asset in &assets {
-                    let technical_target = technical_budget
-                        .checked_mul(
-                            self.technical_targets
-                                .get(asset)
-                                .map(|target| target.score)
-                                .unwrap_or_default(),
-                        )
-                        .ok_or(LiveShadowError::Arithmetic)?;
+                    let technical_target = Decimal::ZERO;
                     self.record_cohort_runtime_rejection(
                         &layer,
                         asset,
@@ -1962,14 +2429,7 @@ impl LiveShadowEngine {
                 .get(&asset)
                 .copied()
                 .unwrap_or_default();
-            let technical_score = self
-                .technical_targets
-                .get(&asset)
-                .map(|target| target.score)
-                .unwrap_or_default();
-            let technical_target = technical_budget
-                .checked_mul(technical_score)
-                .ok_or(LiveShadowError::Arithmetic)?;
+            let technical_target = Decimal::ZERO;
             let aggregate = match aggregate_authoritative_positions(
                 &asset,
                 observed_at_ms,
@@ -2004,39 +2464,21 @@ impl LiveShadowEngine {
                 )?;
                 continue;
             };
-            let r_unit = match self.technical_engine.latest_atr(&asset) {
-                Ok(Some(value)) => value,
-                Ok(None) | Err(_) => {
-                    self.record_cohort_runtime_rejection(
-                        &layer,
-                        &asset,
-                        CohortDecisionReason::MissingAtr,
-                        Some(&aggregate),
-                        existing_consensus,
-                        technical_target,
-                        source_budget,
-                        Decimal::ZERO,
-                    )?;
-                    continue;
-                }
-            };
-            let expected_move_fraction = match self.technical_engine.expected_move_fraction(&asset)
-            {
-                Ok(Some(value)) => value,
-                Ok(None) | Err(_) => {
-                    self.record_cohort_runtime_rejection(
-                        &layer,
-                        &asset,
-                        CohortDecisionReason::MissingExpectedMove,
-                        Some(&aggregate),
-                        existing_consensus,
-                        technical_target,
-                        source_budget,
-                        Decimal::ZERO,
-                    )?;
-                    continue;
-                }
-            };
+            // ATR and expected move are MFCE features. Missing technical
+            // history must not veto an otherwise authoritative source signal.
+            let r_unit = self
+                .technical_engine
+                .latest_atr(&asset)
+                .ok()
+                .flatten()
+                .filter(|value| *value > Decimal::ZERO)
+                .unwrap_or(current_price);
+            let expected_move_fraction = self
+                .technical_engine
+                .expected_move_fraction(&asset)
+                .ok()
+                .flatten()
+                .unwrap_or_default();
             let cohort_wallet_inputs = fresh_states
                 .iter()
                 .filter(|state| {
@@ -2090,65 +2532,16 @@ impl LiveShadowEngine {
             };
             let filtered_wallet_consensus = Decimal::from_f64(cohort_wallet_consensus.exposure)
                 .ok_or(LiveShadowError::Arithmetic)?;
-            let hourly_funding = metadata
-                .contexts
-                .get(&asset)
-                .map(|context| context.funding_rate_hourly)
-                .unwrap_or_default();
-            let funding_cost = hourly_funding
-                .abs()
-                .checked_mul(holding_hours)
-                .ok_or(LiveShadowError::Arithmetic)?;
-            let estimated_round_trip_cost_fraction = fee
-                .checked_mul(Decimal::from(2))
-                .and_then(|value| {
-                    slippage
-                        .checked_mul(Decimal::from(2))
-                        .and_then(|slippage| value.checked_add(slippage))
-                })
-                .and_then(|value| value.checked_add(funding_cost))
-                .ok_or(LiveShadowError::Arithmetic)?;
-            let cohort_direction = if aggregate.cohort_position > Decimal::ZERO {
-                1i8
-            } else if aggregate.cohort_position < Decimal::ZERO {
-                -1i8
-            } else {
-                0i8
-            };
-            let adverse_funding_direction = cohort_direction != 0
-                && (cohort_direction > 0) == hourly_funding.is_sign_positive();
-            let expensive_adverse_funding = adverse_funding_direction
-                && expected_move_fraction
-                    < estimated_round_trip_cost_fraction
-                        .checked_mul(
-                            Decimal::from_f64(self.config.technical.minimum_cost_multiple)
-                                .ok_or(LiveShadowError::Arithmetic)?,
-                        )
-                        .ok_or(LiveShadowError::Arithmetic)?;
+            // Execution friction is evaluated once, from the live book, at
+            // the MFCE admission seam below. The cohort layer remains a pure
+            // source-candidate constructor in deferred mode.
+            let estimated_round_trip_cost_fraction = Decimal::ZERO;
             let crowding_penalty = aggregate
                 .dominant_wallet_percentage
                 .saturating_sub(dominant_wallet_limit_pct)
                 .checked_div(Decimal::from(100))
                 .ok_or(LiveShadowError::Arithmetic)?
                 .clamp(Decimal::ZERO, Decimal::ONE);
-            let chase_penalty = aggregate
-                .observed_entry_opportunity
-                .and_then(|entry| {
-                    let distance = if cohort_direction > 0 {
-                        current_price.checked_sub(entry)
-                    } else if cohort_direction < 0 {
-                        entry.checked_sub(current_price)
-                    } else {
-                        Some(Decimal::ZERO)
-                    }?;
-                    distance.checked_div(r_unit)
-                })
-                .map(|distance_r| {
-                    distance_r
-                        .saturating_sub(COHORT_CHASE_LIMIT_R)
-                        .clamp(Decimal::ZERO, Decimal::ONE)
-                })
-                .unwrap_or_default();
             let active_twap = layer.active_twaps.get(&asset).filter(|twap| {
                 observed_at_ms >= twap.observed_at_ms
                     && observed_at_ms.saturating_sub(twap.observed_at_ms)
@@ -2163,18 +2556,14 @@ impl LiveShadowEngine {
                 // but do not let it influence source activation or sizing.
                 market_confirmation: Decimal::ZERO,
                 penalties: CohortPenalties {
-                    chase: chase_penalty,
+                    chase: Decimal::ZERO,
                     crowding: crowding_penalty,
-                    funding: if adverse_funding_direction {
-                        funding_cost.clamp(Decimal::ZERO, Decimal::ONE)
-                    } else {
-                        Decimal::ZERO
-                    },
+                    funding: Decimal::ZERO,
                     liquidation: Decimal::ZERO,
                 },
                 risk_flags: CohortRiskFlags {
                     incomplete_authoritative_wallet_state: !complete_authoritative_state,
-                    adverse_funding: expensive_adverse_funding,
+                    adverse_funding: false,
                     ..CohortRiskFlags::default()
                 },
                 position_change_age_ms,
@@ -2188,6 +2577,7 @@ impl LiveShadowEngine {
                 existing_wallet_source_target: existing_consensus,
                 technical_target,
                 rebalance_tolerance,
+                defer_market_context_admission: true,
             };
             let record = match self.very_profitable_engine.evaluate(input) {
                 Ok(record) => record,
@@ -2388,22 +2778,49 @@ impl LiveShadowEngine {
         let Some(metadata) = self.metadata.clone() else {
             return Ok(None);
         };
-        let source_expectancy_now = self
-            .source_expectancy_time_offset
+        let live_metadata_context = self
+            .metadata_received_at
+            .zip(self.metadata_valid_until)
+            .is_some_and(|(received_at, valid_until)| received_at <= now && now <= valid_until);
+        match self.mfce.poll_training() {
+            Ok(true) => {
+                self.metrics.mfce_model_promotions =
+                    self.metrics.mfce_model_promotions.saturating_add(1)
+            }
+            Ok(false) => {}
+            Err(_) => {
+                self.metrics.mfce_retrain_failures =
+                    self.metrics.mfce_retrain_failures.saturating_add(1)
+            }
+        }
+        let mfce_now = self
+            .mfce_time_offset
             .checked_add(now)
             .ok_or(LiveShadowError::Arithmetic)?;
-        self.source_expectancy_time_high_watermark = self
-            .source_expectancy_time_high_watermark
-            .max(source_expectancy_now);
+        self.mfce_time_high_watermark = self.mfce_time_high_watermark.max(mfce_now);
         let mut eligibility = SourceEligibilitySummary::default();
         let mut members = Vec::new();
         let mut consensus_inputs: BTreeMap<String, Vec<ConsensusInput>> = BTreeMap::new();
-        let mut high_density_source_inputs: BTreeMap<String, Vec<ConsensusInput>> = BTreeMap::new();
         let mut source_contributions: BTreeMap<String, BTreeMap<String, Decimal>> = BTreeMap::new();
         let mut existing_wallet_consensus = BTreeMap::new();
         let mut fresh_source_states = Vec::new();
         let mut source_received_at = BTreeMap::new();
         let source_budget = self.config.technical.source_budget_fraction;
+        // MFCE raw lifecycles are durable, while source snapshots are
+        // intentionally ephemeral. After restart, do not manufacture a flat
+        // transition/label from missing pre-hydration sources. Normal target
+        // construction may still fail-safe toward flat until every enabled
+        // configured source has supplied an authoritative post-start state.
+        let mfce_sources_hydrated = self
+            .config
+            .candidates
+            .iter()
+            .filter(|candidate| candidate.enabled)
+            .all(|candidate| {
+                self.source_exposure_book
+                    .get(&candidate.address.to_ascii_lowercase())
+                    .is_some()
+            });
         for candidate in &self.config.candidates {
             let id = candidate.address.to_ascii_lowercase();
             if !candidate.enabled {
@@ -2460,28 +2877,19 @@ impl LiveShadowEngine {
                     quarantined: false,
                     snapshot_age_ms: now.saturating_sub(snapshot.received_at),
                 };
-                if self.config.is_technical_gated_high_density(&id) {
-                    // Retention-limited high-density wallets select source
-                    // direction, but cannot independently create exposure.
-                    // Their vote is admitted only after the technical engine
-                    // has produced a same-direction target for this asset.
-                    high_density_source_inputs
-                        .entry(asset.clone())
-                        .or_default()
-                        .push(input);
-                    consensus_inputs.entry(asset.clone()).or_default();
-                } else {
-                    consensus_inputs
-                        .entry(asset.clone())
-                        .or_default()
-                        .push(input);
-                }
+                // MFCE is the sole conditional admission engine. Historical
+                // technical-gating metadata remains provenance only; every
+                // accepted source transition enters the same pooled model.
+                consensus_inputs
+                    .entry(asset.clone())
+                    .or_default()
+                    .push(input);
             }
         }
         for asset in self.technical_engine.tracked_assets() {
             consensus_inputs.entry(asset.clone()).or_default();
         }
-        for asset in self.source_expectancy.keys() {
+        for asset in self.mfce.tracked_assets() {
             if mids.mids.contains_key(asset) {
                 consensus_inputs.entry(asset.clone()).or_default();
             }
@@ -2602,107 +3010,9 @@ impl LiveShadowEngine {
                 )?)
             })
             .ok_or(LiveShadowError::Arithmetic)?;
-        let technical_assets = self
-            .technical_engine
-            .tracked_assets()
-            .cloned()
-            .collect::<Vec<_>>();
+        // Technical indicators are read-only MFCE features. They no longer
+        // create a separate target sleeve or apply their own cost gate.
         self.technical_targets.clear();
-        if self.config.technical.enabled {
-            for asset in technical_assets {
-                if !mids.mids.contains_key(&asset) {
-                    continue;
-                }
-                let hourly_funding = metadata
-                    .contexts
-                    .get(&asset)
-                    .and_then(|context| context.funding_rate_hourly.abs().to_f64())
-                    .unwrap_or_default();
-                let fee = self.config.taker_fee_bps / 10_000.0;
-                let slippage = self.config.execution.max_slippage_bps / 10_000.0;
-                let costs = CostEstimate {
-                    entry_fee_fraction: fee,
-                    exit_fee_fraction: fee,
-                    entry_slippage_fraction: slippage,
-                    exit_slippage_fraction: slippage,
-                    hourly_funding_fraction: hourly_funding,
-                };
-                if let Some(target) = self
-                    .technical_engine
-                    .evaluate(&asset, available_gross, costs)
-                    .map_err(|error| {
-                        LiveShadowError::Core(format!(
-                            "technical evaluation failed for {asset}: {error:?}"
-                        ))
-                    })?
-                {
-                    // Technical state is context for source-led exposure. It is
-                    // deliberately not an independent consensus input, so its
-                    // budget remains a ceiling rather than a turnover quota.
-                    self.technical_targets.insert(asset, target);
-                }
-            }
-        }
-        for (asset, high_density_inputs) in high_density_source_inputs {
-            let high_density = bounded_additive_consensus(
-                &high_density_inputs,
-                self.config.global_risk.max_source_exposure,
-                self.config.global_risk.source_snapshot_max_age_ms,
-            )
-            .map_err(|error| LiveShadowError::Core(error.to_string()))?;
-            let admitted_high_density =
-                Decimal::from_f64(high_density.exposure).ok_or(LiveShadowError::Arithmetic)?;
-            let regular_source = existing_wallet_consensus
-                .get(&asset)
-                .copied()
-                .unwrap_or_default();
-            let combined_source = regular_source
-                .checked_add(admitted_high_density)
-                .ok_or(LiveShadowError::Arithmetic)?
-                .clamp(-Decimal::ONE, Decimal::ONE);
-            existing_wallet_consensus.insert(asset.clone(), combined_source);
-            let inputs = consensus_inputs.entry(asset.clone()).or_default();
-            inputs.retain(|input| input.candidate_id != "source:aggregate");
-            if !combined_source.is_zero() {
-                inputs.push(ConsensusInput {
-                    candidate_id: "source:aggregate".into(),
-                    allocation_weight: source_budget,
-                    confidence_modifier: 1.0,
-                    source_exposure: combined_source
-                        .to_f64()
-                        .ok_or(LiveShadowError::Arithmetic)?,
-                    enabled: true,
-                    quarantined: false,
-                    snapshot_age_ms: 0,
-                });
-            }
-            let combined_source_target = combined_source
-                .checked_mul(Decimal::from_f64(source_budget).ok_or(LiveShadowError::Arithmetic)?)
-                .ok_or(LiveShadowError::Arithmetic)?;
-            let contributions = source_contributions.entry(asset).or_default();
-            let technical_contributions = contributions
-                .iter()
-                .filter(|(component, _)| component.starts_with("technical:"))
-                .map(|(component, target)| (component.clone(), *target))
-                .collect::<BTreeMap<_, _>>();
-            contributions.retain(|component, _| !component.starts_with("technical:"));
-            if !admitted_high_density.is_zero() {
-                contributions.insert(
-                    "source:technical_gated_high_density".into(),
-                    admitted_high_density
-                        .checked_mul(
-                            Decimal::from_f64(source_budget).ok_or(LiveShadowError::Arithmetic)?,
-                        )
-                        .ok_or(LiveShadowError::Arithmetic)?,
-                );
-            }
-            let scaled_source = absolute_directional_component_targets(
-                Some(contributions),
-                combined_source_target,
-            )?;
-            *contributions = technical_contributions;
-            contributions.extend(scaled_source);
-        }
         self.apply_very_profitable_cohort(
             now,
             &mids,
@@ -2713,22 +3023,67 @@ impl LiveShadowEngine {
             &mut consensus_inputs,
             &mut source_contributions,
         )?;
-        // Source/cohort targets may reduce or exit exposure unconditionally.
-        // A risk increase, including a direction reversal, must first show an
-        // asset-level expected move large enough to cover the same full
-        // round-trip cost multiple used by the technical sleeve. When it
-        // cannot, retain the currently committed source component target and
-        // let subsequent source changes accumulate without creating churn.
+        // Source transitions are the only candidate generator. MFCE observes
+        // their raw lifecycle before follower admission so rejected
+        // transitions still receive the same gross counterfactual label.
         let source_budget_decimal =
             Decimal::from_f64(source_budget).ok_or(LiveShadowError::Arithmetic)?;
-        let fee_fraction = Decimal::from_f64(self.config.taker_fee_bps / 10_000.0)
+        let configured_taker_fee_bps =
+            Decimal::from_f64(self.config.taker_fee_bps).ok_or(LiveShadowError::Arithmetic)?;
+        let taker_fee_bps = metadata.live_taker_fee_bps.or_else(|| {
+            // Unsigned historical replays predate the live fee field and keep
+            // the hash-bound conservative configuration. Production exposure
+            // increases fail pending unless the public userFees refresh is
+            // present in the replayable metadata payload.
+            self.production_identity
+                .is_none()
+                .then_some(configured_taker_fee_bps)
+        });
+        let maximum_slippage_bps = Decimal::from_f64(self.config.execution.max_slippage_bps)
             .ok_or(LiveShadowError::Arithmetic)?;
-        let slippage_fraction =
-            Decimal::from_f64(self.config.execution.max_slippage_bps / 10_000.0)
+        let total_tail_budget = remaining_mfce_tail_budget(&self.config, deployment)?;
+        let mut existing_tail_reservations = Decimal::ZERO;
+        for asset in self.mfce.tracked_assets() {
+            let Some(mark) = mids.mids.get(asset).copied() else {
+                continue;
+            };
+            let current_source_notional = if self.production_positions.is_some() {
+                self.authoritative_position(asset)
+                    .checked_mul(mark)
+                    .ok_or(LiveShadowError::Arithmetic)?
+            } else {
+                self.ledger
+                    .source_positions_for_asset(asset)
+                    .into_iter()
+                    .filter(|(component, _)| !component.starts_with("technical:"))
+                    .try_fold(Decimal::ZERO, |total, (_, quantity)| {
+                        quantity
+                            .checked_mul(mark)
+                            .and_then(|notional| total.checked_add(notional))
+                            .ok_or(LiveShadowError::Arithmetic)
+                    })?
+            };
+            existing_tail_reservations = existing_tail_reservations
+                .checked_add(
+                    self.mfce
+                        .reserved_tail_loss_usd(asset, current_source_notional)
+                        .map_err(mfce_error)?,
+                )
                 .ok_or(LiveShadowError::Arithmetic)?;
-        let minimum_cost_multiple = Decimal::from_f64(self.config.technical.minimum_cost_multiple)
-            .ok_or(LiveShadowError::Arithmetic)?;
+        }
+        let mut remaining_tail_budget = total_tail_budget
+            .checked_sub(existing_tail_reservations)
+            .unwrap_or(Decimal::ZERO)
+            .max(Decimal::ZERO);
         for (asset, inputs) in &mut consensus_inputs {
+            if !mfce_sources_hydrated {
+                inputs.clear();
+                source_contributions
+                    .entry(asset.clone())
+                    .or_default()
+                    .clear();
+                continue;
+            }
             let source_inputs = inputs
                 .iter()
                 .filter(|input| !input.candidate_id.starts_with("technical:"))
@@ -2746,12 +3101,14 @@ impl LiveShadowEngine {
                         .ok_or(LiveShadowError::Arithmetic)?,
                 )
                 .ok_or(LiveShadowError::Arithmetic)?;
+            let raw_source_exposure =
+                Decimal::from_f64(desired_source.exposure).ok_or(LiveShadowError::Arithmetic)?;
             let mark = mids
                 .mids
                 .get(asset)
                 .copied()
                 .ok_or_else(|| LiveShadowError::InvalidMarket(asset.clone()))?;
-            let current_source_targets = self
+            let mut current_source_targets = self
                 .ledger
                 .source_positions_for_asset(asset)
                 .into_iter()
@@ -2763,55 +3120,194 @@ impl LiveShadowEngine {
                         .ok_or(LiveShadowError::Arithmetic)
                 })
                 .collect::<Result<BTreeMap<_, _>, _>>()?;
-            let current_source_target = current_source_targets
-                .values()
-                .try_fold(Decimal::ZERO, |sum, target| sum.checked_add(*target))
-                .ok_or(LiveShadowError::Arithmetic)?;
-            let source_expectancy = observe_source_transition(
-                &mut self.source_expectancy,
-                asset,
-                current_source_target,
-                raw_desired_source_target,
-                mark,
-                source_expectancy_now,
-            )?;
-            if !source_target_adds_risk(current_source_target, raw_desired_source_target) {
+            let current_source_target = if self.production_positions.is_some() {
+                // Production fills live in the durable LiveTradingState, not
+                // the shadow DualLedger. Position-aware MFCE admission must
+                // therefore use the reconciled authoritative quantity.
+                let authoritative = self
+                    .authoritative_position(asset)
+                    .checked_mul(mark)
+                    .ok_or(LiveShadowError::Arithmetic)?;
+                current_source_targets.clear();
+                if !authoritative.is_zero() {
+                    current_source_targets.insert("source:aggregate".into(), authoritative);
+                }
+                authoritative
+            } else {
+                current_source_targets
+                    .values()
+                    .try_fold(Decimal::ZERO, |sum, target| sum.checked_add(*target))
+                    .ok_or(LiveShadowError::Arithmetic)?
+            };
+            let previous_source_exposure = self.mfce.previous_source_exposure(asset);
+            let technical = self
+                .technical_engine
+                .feature_context(asset)
+                .map_err(|error| {
+                    LiveShadowError::Core(format!(
+                        "technical feature extraction failed for {asset}: {error:?}"
+                    ))
+                })?;
+            let fallback_atr_fraction = self
+                .technical_engine
+                .latest_atr(asset)
+                .ok()
+                .flatten()
+                .and_then(|atr| atr.checked_div(mark));
+            let funding_rate_hourly = live_metadata_context
+                .then(|| metadata.contexts.get(asset))
+                .flatten()
+                .map(|context| context.funding_rate_hourly);
+            let preliminary_features = if raw_source_exposure.is_zero() {
+                MfceFeatureVector::new([Decimal::ZERO; MFCE_FEATURE_COUNT])
+            } else {
+                mfce_feature_vector(
+                    raw_source_exposure,
+                    previous_source_exposure,
+                    current_source_target,
+                    raw_desired_source_target,
+                    available_gross,
+                    funding_rate_hourly.unwrap_or_default(),
+                    technical.as_ref(),
+                    fallback_atr_fraction,
+                    None,
+                )?
+            };
+            let transition = self
+                .mfce
+                .observe_raw_source(
+                    asset,
+                    self.mfce_authorized_assets
+                        .get(asset)
+                        .is_some_and(|valid_until| now <= *valid_until),
+                    raw_source_exposure,
+                    raw_desired_source_target,
+                    current_source_target,
+                    mark,
+                    mfce_now,
+                    preliminary_features,
+                )
+                .map_err(mfce_error)?;
+            if transition.needs_live_book {
+                let transition_id = transition.transition_id.ok_or_else(|| {
+                    LiveShadowError::Core("pending MFCE transition has no identity".into())
+                })?;
+                let fresh_book = self.books.get(asset).filter(|(_, received_at)| {
+                    now.saturating_sub(*received_at) <= MFCE_LIVE_BOOK_MAX_AGE_MS
+                });
+                if let (
+                    Some((book, _)),
+                    Some(direction),
+                    Some(funding_rate_hourly),
+                    Some(taker_fee_bps),
+                ) = (
+                    fresh_book,
+                    MfceDirection::from_signed(raw_source_exposure),
+                    funding_rate_hourly,
+                    taker_fee_bps,
+                ) {
+                    let admission_target = self
+                        .mfce
+                        .pending_position_notional(asset, transition_id, raw_desired_source_target)
+                        .map_err(mfce_error)?;
+                    let holding_hours = self.mfce.expected_holding_hours(
+                        asset,
+                        direction,
+                        Decimal::from(self.config.technical.expected_holding_hours),
+                    );
+                    if let Ok(live_context) = mfce_live_market_context(
+                        asset,
+                        book,
+                        direction,
+                        current_source_target,
+                        admission_target,
+                        taker_fee_bps,
+                        maximum_slippage_bps,
+                        funding_rate_hourly,
+                        holding_hours,
+                    ) {
+                        self.mfce
+                            .update_pending_live_context(
+                                asset,
+                                transition_id,
+                                [
+                                    Decimal::ZERO,
+                                    live_context.spread_bps,
+                                    live_context.entry_depth_ratio,
+                                    live_context.exit_depth_ratio,
+                                    live_context.depth_imbalance,
+                                ],
+                                admission_target,
+                            )
+                            .map_err(mfce_error)?;
+                        match self.mfce.predict_pending(asset, transition_id) {
+                            Ok(prediction) => {
+                                let prior_tail_reservation = self
+                                    .mfce
+                                    .reserved_tail_loss_usd(asset, current_source_target)
+                                    .map_err(mfce_error)?;
+                                let asset_tail_budget = remaining_tail_budget
+                                    .checked_add(prior_tail_reservation)
+                                    .ok_or(LiveShadowError::Arithmetic)?;
+                                let decision = evaluate_admission(&MfceAdmissionInput {
+                                    prediction: prediction.clone(),
+                                    friction_bps: live_context.friction_bps,
+                                    proposed_position_notional: admission_target,
+                                    remaining_tail_loss_budget_usd: asset_tail_budget,
+                                })
+                                .map_err(mfce_error)?;
+                                self.mfce
+                                    .record_admission(
+                                        asset,
+                                        transition_id,
+                                        &decision,
+                                        &prediction,
+                                        current_source_target,
+                                    )
+                                    .map_err(mfce_error)?;
+                                remaining_tail_budget = remaining_tail_budget
+                                    .checked_add(prior_tail_reservation)
+                                    .and_then(|value| {
+                                        value.checked_sub(
+                                            self.mfce
+                                                .reserved_tail_loss_usd(
+                                                    asset,
+                                                    current_source_target,
+                                                )
+                                                .ok()?,
+                                        )
+                                    })
+                                    .ok_or(LiveShadowError::Arithmetic)?
+                                    .max(Decimal::ZERO);
+                            }
+                            Err(MfceError::InvalidState(_)) => self
+                                .mfce
+                                .reject_pending_without_prediction(
+                                    asset,
+                                    transition_id,
+                                    MfceRejectionReason::InsufficientPooledSupport,
+                                )
+                                .map_err(mfce_error)?,
+                            Err(_) => self
+                                .mfce
+                                .reject_pending_without_prediction(
+                                    asset,
+                                    transition_id,
+                                    MfceRejectionReason::InvalidPrediction,
+                                )
+                                .map_err(mfce_error)?,
+                        }
+                    }
+                }
+            }
+            let effective_target =
+                self.mfce
+                    .effective_target(asset, current_source_target, raw_desired_source_target);
+            if effective_target == raw_desired_source_target {
                 continue;
             }
-            let holding_hours = source_expectancy
-                .ewma_lifetime_seconds
-                .checked_div(Decimal::from(3_600))
-                .ok_or(LiveShadowError::Arithmetic)?;
-            let funding_fraction = metadata
-                .contexts
-                .get(asset)
-                .map(|context| context.funding_rate_hourly.abs())
-                .unwrap_or_default()
-                .checked_mul(holding_hours)
-                .ok_or(LiveShadowError::Arithmetic)?;
-            let round_trip_cost_fraction = fee_fraction
-                .checked_mul(Decimal::from(2))
-                .and_then(|fees| {
-                    slippage_fraction
-                        .checked_mul(Decimal::from(2))
-                        .and_then(|slippage| fees.checked_add(slippage))
-                })
-                .and_then(|cost| cost.checked_add(funding_fraction))
-                .ok_or(LiveShadowError::Arithmetic)?;
-            let expected_move = source_expectancy
-                .ewma_gross_return_bps
-                .checked_div(BPS_PER_UNIT_RETURN)
-                .ok_or(LiveShadowError::Arithmetic)?;
-            if expected_move_covers_round_trip_cost(
-                expected_move,
-                round_trip_cost_fraction,
-                minimum_cost_multiple,
-            ) {
-                continue;
-            }
-
             inputs.clear();
-            if !current_source_target.is_zero() && !source_budget_decimal.is_zero() {
+            if !effective_target.is_zero() && !source_budget_decimal.is_zero() {
                 let source_capacity = available_gross
                     .checked_mul(source_budget_decimal)
                     .ok_or(LiveShadowError::Arithmetic)?;
@@ -2820,7 +3316,7 @@ impl LiveShadowEngine {
                         candidate_id: "source:aggregate".into(),
                         allocation_weight: source_budget,
                         confidence_modifier: 1.0,
-                        source_exposure: current_source_target
+                        source_exposure: effective_target
                             .checked_div(source_capacity)
                             .ok_or(LiveShadowError::Arithmetic)?
                             .clamp(-Decimal::ONE, Decimal::ONE)
@@ -2833,12 +3329,36 @@ impl LiveShadowEngine {
                 }
             }
             let contributions = source_contributions.entry(asset.clone()).or_default();
-            *contributions = current_source_targets;
+            if effective_target.is_zero() {
+                contributions.clear();
+            } else if self.mfce.uses_current_position_attribution(asset) {
+                // Pending/rejected risk increases may keep only the follower's
+                // existing position and therefore its durable attribution.
+                *contributions = current_source_targets;
+            }
+            // Admitted and risk-reducing bypass targets retain the raw source
+            // weights. This is essential when an admitted opening has not yet
+            // filled: there is no current-position attribution to borrow.
             self.micro_density
                 .source_risk_increases_suppressed_below_cost_edge = self
                 .micro_density
                 .source_risk_increases_suppressed_below_cost_edge
                 .saturating_add(1);
+        }
+        if mfce_sources_hydrated {
+            self.mfce.finish_source_observation_cycle();
+            self.mfce_authorized_assets.clear();
+        }
+        match self.mfce.maybe_start_training() {
+            Ok(true) => {
+                self.metrics.mfce_retrain_attempts =
+                    self.metrics.mfce_retrain_attempts.saturating_add(1)
+            }
+            Ok(false) => {}
+            Err(_) => {
+                self.metrics.mfce_retrain_failures =
+                    self.metrics.mfce_retrain_failures.saturating_add(1)
+            }
         }
         // Reconstruct the source sleeve independently from the technical
         // component before the combined consensus is consumed by decision
@@ -3476,15 +3996,8 @@ impl LiveShadowEngine {
                 let asset_index = self
                     .metadata
                     .as_ref()
-                    .and_then(|metadata| {
-                        metadata
-                            .universe
-                            .iter()
-                            .position(|asset| asset.name == book.asset)
-                    })
-                    .ok_or_else(|| LiveShadowError::InvalidMarket(book.asset.clone()))?
-                    .try_into()
-                    .map_err(|_| LiveShadowError::Arithmetic)?;
+                    .and_then(|metadata| execution_asset_index(metadata, &book.asset))
+                    .ok_or_else(|| LiveShadowError::InvalidMarket(book.asset.clone()))?;
                 let root_cloid = parse_planned_cloid(&pending.root_planned_cloid)?;
                 let parent_cloid = pending
                     .parent_planned_cloid
@@ -4043,8 +4556,8 @@ impl LiveShadowEngine {
             continuations,
             accrued_funding: self.accrued_funding.clone(),
             last_mids: self.mids.as_ref().map(|(mids, _)| mids.clone()),
-            source_expectancy: self.source_expectancy.clone(),
-            source_expectancy_time_high_watermark: self.source_expectancy_time_high_watermark,
+            mfce: self.mfce.state().clone(),
+            mfce_time_high_watermark: self.mfce_time_high_watermark,
             ledger_time_high_watermark: self.ledger_time_high_watermark,
             executions: self.executions.clone(),
             equity_buckets: self.equity_buckets.clone(),
@@ -4107,34 +4620,11 @@ impl LiveShadowEngine {
         let state = envelope.payload;
         state.ledger.validate_integrity().map_err(core)?;
         state.target_ledger.validate_integrity().map_err(core)?;
-        for (asset, source_state) in &state.source_expectancy {
-            if asset.is_empty() {
-                return Err(LiveShadowError::Core(
-                    "unsigned shadow source expectancy has empty asset".into(),
-                ));
-            }
-            for estimate in [&source_state.long, &source_state.short] {
-                if estimate.ewma_lifetime_seconds < Decimal::ZERO
-                    || (estimate.count == 0
-                        && (!estimate.ewma_gross_return_bps.is_zero()
-                            || !estimate.ewma_lifetime_seconds.is_zero()))
-                {
-                    return Err(LiveShadowError::Core(
-                        "unsigned shadow source expectancy is invalid".into(),
-                    ));
-                }
-            }
-            if source_state.active.as_ref().is_some_and(|active| {
-                active.entry_midpoint <= Decimal::ZERO
-                    || active.proposed_target.is_zero()
-                    || SourceSignalDirection::from_target(active.proposed_target)
-                        != Some(active.direction)
-                    || active.entry_timestamp > state.source_expectancy_time_high_watermark
-            }) {
-                return Err(LiveShadowError::Core(
-                    "unsigned shadow active source observation is invalid".into(),
-                ));
-            }
+        state.mfce.validate().map_err(mfce_error)?;
+        if state.mfce_time_high_watermark < state.mfce.time_high_watermark() {
+            return Err(LiveShadowError::Core(
+                "unsigned shadow MFCE time high-watermark regressed".into(),
+            ));
         }
         if state.technical_engine.configuration() != &self.config.technical {
             return Err(LiveShadowError::Core(
@@ -4172,12 +4662,7 @@ impl LiveShadowEngine {
         self.continuations = state.continuations;
         self.accrued_funding = state.accrued_funding;
         self.mids = state.last_mids.map(|mids| (mids, 0));
-        self.source_expectancy = state.source_expectancy;
-        self.source_expectancy_time_offset = state
-            .source_expectancy_time_high_watermark
-            .checked_add(1)
-            .ok_or(LiveShadowError::Arithmetic)?;
-        self.source_expectancy_time_high_watermark = state.source_expectancy_time_high_watermark;
+        self.restore_mfce_persistent_state(state.mfce, state.mfce_time_high_watermark)?;
         self.ledger_time_offset = state
             .ledger_time_high_watermark
             .checked_add(1)
@@ -4234,72 +4719,55 @@ impl LiveShadowEngine {
             .len()
     }
 
-    pub fn source_expectancy_report(&self) -> BTreeMap<String, SourceExpectancyReport> {
-        self.source_expectancy
-            .iter()
-            .map(|(asset, state)| {
-                let direction = |estimate: &SourceExpectancyEstimate| {
-                    let fee = Decimal::from_f64(self.config.taker_fee_bps / 10_000.0)
-                        .unwrap_or(Decimal::MAX);
-                    let slippage =
-                        Decimal::from_f64(self.config.execution.max_slippage_bps / 10_000.0)
-                            .unwrap_or(Decimal::MAX);
-                    let holding_hours = estimate
-                        .ewma_lifetime_seconds
-                        .checked_div(Decimal::from(3_600))
-                        .unwrap_or_default();
-                    let funding = self
-                        .metadata
-                        .as_ref()
-                        .and_then(|metadata| metadata.contexts.get(asset))
-                        .map(|context| context.funding_rate_hourly.abs())
-                        .unwrap_or_default()
-                        .checked_mul(holding_hours)
-                        .unwrap_or(Decimal::MAX);
-                    let multiple = Decimal::from_f64(self.config.technical.minimum_cost_multiple)
-                        .unwrap_or(Decimal::MAX);
-                    let required_gross_return_bps = fee
-                        .checked_mul(Decimal::from(2))
-                        .and_then(|fees| {
-                            slippage
-                                .checked_mul(Decimal::from(2))
-                                .and_then(|cost| fees.checked_add(cost))
-                        })
-                        .and_then(|cost| cost.checked_add(funding))
-                        .and_then(|cost| cost.checked_mul(multiple))
-                        .and_then(|fraction| fraction.checked_mul(BPS_PER_UNIT_RETURN))
-                        .unwrap_or(Decimal::MAX);
-                    SourceExpectancyDirectionReport {
-                        count: estimate.count,
-                        ewma_gross_return_bps: estimate.ewma_gross_return_bps,
-                        ewma_lifetime_seconds: estimate.ewma_lifetime_seconds,
-                        required_gross_return_bps,
-                        above_cost_threshold: estimate.ewma_gross_return_bps
-                            >= required_gross_return_bps,
-                    }
-                };
-                (
-                    asset.clone(),
-                    SourceExpectancyReport {
-                        long: direction(&state.long),
-                        short: direction(&state.short),
-                        active: state
-                            .active
-                            .as_ref()
-                            .map(|active| ActiveSourceObservationReport {
-                                entry_midpoint: active.entry_midpoint,
-                                entry_timestamp: active.entry_timestamp,
-                                direction: match active.direction {
-                                    SourceSignalDirection::Long => "long",
-                                    SourceSignalDirection::Short => "short",
-                                }
-                                .into(),
-                                proposed_target: active.proposed_target,
-                            }),
-                    },
-                )
-            })
-            .collect()
+    pub fn unresolved_actionable_roots(&self) -> Vec<UnresolvedRootStatus> {
+        let mut roots = Vec::new();
+        for (asset, pending) in &self.pending {
+            roots.push(UnresolvedRootStatus {
+                asset: asset.clone(),
+                root_planned_cloid: pending.root_planned_cloid.clone(),
+                lifecycle: "pending_action",
+                planned_cloid: Some(pending.action.planned_cloid.to_string()),
+                parent_planned_cloid: pending.parent_planned_cloid.clone(),
+                decision_id: Some(pending.action.decision_id.to_string()),
+                retry_generation: Some(pending.action.retry_generation),
+            });
+        }
+        for (asset, pending) in &self.pending_book {
+            roots.push(UnresolvedRootStatus {
+                asset: asset.clone(),
+                root_planned_cloid: pending.original_planned_cloid.clone(),
+                lifecycle: "pending_live_book",
+                planned_cloid: Some(pending.original_planned_cloid.clone()),
+                parent_planned_cloid: None,
+                decision_id: Some(pending.original_decision_id.clone()),
+                retry_generation: None,
+            });
+        }
+        for (asset, continuation) in &self.continuations {
+            roots.push(UnresolvedRootStatus {
+                asset: asset.clone(),
+                root_planned_cloid: continuation.root_planned_cloid.clone(),
+                lifecycle: match continuation.kind {
+                    ContinuationKind::PartialIocRemainder => "partial_ioc_remainder",
+                    ContinuationKind::CloseFirstReversal => "close_first_reversal",
+                },
+                planned_cloid: None,
+                parent_planned_cloid: Some(continuation.parent_planned_cloid.clone()),
+                decision_id: None,
+                retry_generation: Some(continuation.next_retry_generation),
+            });
+        }
+        roots.sort_by(|left, right| {
+            left.root_planned_cloid
+                .cmp(&right.root_planned_cloid)
+                .then_with(|| left.asset.cmp(&right.asset))
+                .then_with(|| left.lifecycle.cmp(right.lifecycle))
+        });
+        roots
+    }
+
+    pub fn mfce_report(&self) -> MfceReport {
+        self.mfce.report()
     }
 
     /// Keep exact economic records for the rolling 30-day horizon and only a
@@ -4731,6 +5199,7 @@ impl LiveShadowEngine {
             .keys()
             .chain(self.pending_book.keys())
             .chain(self.continuations.keys())
+            .chain(self.mfce.awaiting_book_assets())
             .cloned()
             .collect();
         self.metrics.unreconciled_shadow_intents =
@@ -4938,6 +5407,32 @@ fn completed_close_first_reversal(
         && unfilled_quantity.is_zero()
 }
 
+/// Hyperliquid signs default perps by their local metadata index. Builder
+/// perps use the documented DEX offset; `xyz` is the first builder DEX and
+/// therefore begins at 110000. Its local index is stable within its own
+/// metadata response even though the observer stores one merged universe.
+fn execution_asset_index(metadata: &MarketMetadataResponse, asset: &str) -> Option<u32> {
+    if asset.starts_with("xyz:") {
+        let local = metadata
+            .universe
+            .iter()
+            .filter(|candidate| candidate.name.starts_with("xyz:"))
+            .position(|candidate| candidate.name == asset)?;
+        return u32::try_from(local)
+            .ok()
+            .and_then(|local| 110_000u32.checked_add(local));
+    }
+    if asset.contains(':') {
+        return None;
+    }
+    metadata
+        .universe
+        .iter()
+        .take_while(|candidate| !candidate.name.contains(':'))
+        .position(|candidate| candidate.name == asset)
+        .and_then(|index| u32::try_from(index).ok())
+}
+
 fn build_market_rules<'a>(
     mids: &MarketSnapshotResponse,
     metadata: &MarketMetadataResponse,
@@ -5076,6 +5571,10 @@ fn core(error: impl Display) -> LiveShadowError {
     LiveShadowError::Core(error.to_string())
 }
 
+fn mfce_error(error: MfceError) -> LiveShadowError {
+    LiveShadowError::Core(format!("MFCE: {error}"))
+}
+
 fn sum_execution_field(
     executions: &[ShadowActionAccounting],
     field: impl Fn(&ShadowActionAccounting) -> Decimal,
@@ -5108,199 +5607,568 @@ mod tests {
     };
     use copytrade_core::scheduler::ReadRequestKind;
     use copytrade_core::shadow::ShadowExecutionId;
-    use copytrade_core::technical::{CandleInterval, ClosedCandle, MarketRegime, SignalArchetype};
+    use copytrade_core::technical::{CandleInterval, ClosedCandle};
     use serde::ser::SerializeMap;
     use serde::Deserialize;
     use std::path::Path;
 
     #[test]
-    fn source_cost_gate_blocks_only_unproven_risk_increases() {
-        assert!(source_target_adds_risk(Decimal::ZERO, Decimal::from(20)));
-        assert!(source_target_adds_risk(
-            Decimal::from(-20),
-            Decimal::from(5)
-        ));
-        assert!(source_target_adds_risk(
-            Decimal::from(20),
-            Decimal::from(25)
-        ));
-        assert!(!source_target_adds_risk(
-            Decimal::from(20),
-            Decimal::from(10)
-        ));
-        assert!(!source_target_adds_risk(Decimal::from(20), Decimal::ZERO));
+    fn execution_indices_cover_default_and_xyz_perpetuals() {
+        let metadata = MarketMetadataResponse {
+            universe: vec![
+                MarketMetadataAsset {
+                    name: "BTC".into(),
+                    size_decimals: 5,
+                },
+                MarketMetadataAsset {
+                    name: "ETH".into(),
+                    size_decimals: 4,
+                },
+                MarketMetadataAsset {
+                    name: "xyz:SP500".into(),
+                    size_decimals: 2,
+                },
+                MarketMetadataAsset {
+                    name: "xyz:GOLD".into(),
+                    size_decimals: 3,
+                },
+            ],
+            contexts: BTreeMap::new(),
+            live_taker_fee_bps: None,
+        };
+        assert_eq!(execution_asset_index(&metadata, "BTC"), Some(0));
+        assert_eq!(execution_asset_index(&metadata, "ETH"), Some(1));
+        assert_eq!(execution_asset_index(&metadata, "xyz:SP500"), Some(110_000));
+        assert_eq!(execution_asset_index(&metadata, "xyz:GOLD"), Some(110_001));
+        assert_eq!(execution_asset_index(&metadata, "other:UNKNOWN"), None);
+    }
 
-        assert!(!expected_move_covers_round_trip_cost(
-            Decimal::ZERO,
-            Decimal::new(5, 3),
-            Decimal::from(2),
-        ));
-        assert!(!expected_move_covers_round_trip_cost(
-            Decimal::new(9, 3),
-            Decimal::new(5, 3),
-            Decimal::from(2),
-        ));
-        assert!(expected_move_covers_round_trip_cost(
-            Decimal::new(1, 2),
-            Decimal::new(5, 3),
-            Decimal::from(2),
-        ));
+    fn seed_positive_mfce_backoff(engine: &mut LiveShadowEngine, asset: &str) {
+        let mut state = MfcePersistentState::default();
+        for sample_id in 1..=8_u64 {
+            state.samples.push_back(crate::mfce::MfceTrainingSample {
+                sample_id,
+                asset: asset.to_string(),
+                direction: MfceDirection::Long,
+                transition_kind: crate::mfce::MfceTransitionKind::Opening,
+                opened_at_mono: sample_id * 1_000,
+                completed_at_mono: sample_id * 1_000 + 500,
+                features: MfceFeatureVector::new([Decimal::ZERO; MFCE_FEATURE_COUNT]),
+                gross_return_bps: Decimal::from(100),
+                lifetime_seconds: Decimal::new(5, 1),
+                admitted: false,
+            });
+        }
+        state.next_sample_id = 9;
+        engine.mfce.replace_state(state).unwrap();
+        engine.mfce_time_high_watermark = engine.mfce.state().time_high_watermark();
+        engine.mfce_time_offset = engine.mfce_time_high_watermark + 1;
+    }
+
+    fn mfce_test_book(
+        asset: &str,
+        source_time_ms: u64,
+        bid: Decimal,
+        ask: Decimal,
+        quantity: Decimal,
+    ) -> OrderBookResponse {
+        OrderBookResponse {
+            asset: asset.to_string(),
+            source_time_ms,
+            bids: vec![BookLevel {
+                price: bid,
+                quantity,
+            }],
+            asks: vec![BookLevel {
+                price: ask,
+                quantity,
+            }],
+        }
+    }
+
+    fn warm_flat_technical_context(engine: &mut LiveShadowEngine, asset: &str) {
+        for interval in CandleInterval::ALL {
+            for index in 0..interval.warmup_candles() {
+                let duration = interval.duration_ms();
+                let open_time_ms = u64::try_from(index).unwrap() * duration;
+                engine
+                    .technical_engine
+                    .accept_closed_candle(ClosedCandle {
+                        asset: asset.to_string(),
+                        interval,
+                        open_time_ms,
+                        close_time_ms: open_time_ms + duration,
+                        open: Decimal::from(100),
+                        high: Decimal::from(101),
+                        low: Decimal::from(99),
+                        close: Decimal::from(100),
+                        base_volume: Decimal::from(10),
+                        trade_count: 5,
+                    })
+                    .unwrap();
+            }
+        }
+        assert!(engine
+            .technical_engine
+            .feature_context(asset)
+            .unwrap()
+            .is_some());
     }
 
     #[test]
-    fn rejected_source_signals_learn_counterfactually_from_zero() {
-        #[derive(Deserialize)]
-        struct Fixture {
-            source_bundle_id: String,
-            source_archive_sha256: String,
-            asset: String,
-            direction: String,
-            samples: Vec<(Decimal, Decimal, u64)>,
-        }
-        let fixture: Fixture = serde_json::from_str(include_str!(
-            "../../../fixtures/su6r1-r6-eigen-source-signal-lifecycles.json"
-        ))
-        .unwrap();
-        assert_eq!(fixture.source_bundle_id, "1786273632602-314-bd6d63a4d469");
-        assert_eq!(
-            fixture.source_archive_sha256,
-            "5480f7954f93e84510dd0c8b4f0615414c87facce968c7a523975095ce530fd0"
-        );
-        assert_eq!(fixture.asset, "EIGEN");
-        assert_eq!(fixture.direction, "short");
-        assert_eq!(fixture.samples.len(), 78);
-
-        let mut states = BTreeMap::new();
-        let threshold = Decimal::new(34, 4);
-        let mut now = 0_u64;
-        let mut admitted = 0_u64;
-        for (entry, exit, lifetime_ms) in fixture.samples {
-            let expected = observe_source_transition(
-                &mut states,
-                "EIGEN",
-                Decimal::ZERO,
-                -Decimal::ONE,
-                entry,
-                now,
-            )
-            .unwrap();
-            admitted += u64::from(expected_move_covers_round_trip_cost(
-                expected.ewma_gross_return_bps / BPS_PER_UNIT_RETURN,
-                threshold,
-                Decimal::ONE,
-            ));
-            observe_source_transition(
-                &mut states,
-                "EIGEN",
-                Decimal::ZERO,
-                Decimal::ZERO,
-                exit,
-                now + lifetime_ms,
-            )
-            .unwrap();
-            now += lifetime_ms + 1;
-        }
-        let eigen = &states["EIGEN"].short;
-        assert_eq!(eigen.count, 78);
-        assert!(eigen.ewma_gross_return_bps < Decimal::ZERO);
-        assert_eq!(admitted, 0);
-        assert_eq!(states["EIGEN"].active, None);
-    }
-
-    #[test]
-    fn positive_counterfactual_lifecycles_can_recover_admission() {
-        let mut states = BTreeMap::new();
-        let threshold = Decimal::new(34, 4);
-        for sample in 0..8_u64 {
-            let opened_at = sample * 20_000;
-            observe_source_transition(
-                &mut states,
-                "RECOVERY",
-                Decimal::ZERO,
-                Decimal::ONE,
-                Decimal::from(1_000),
-                opened_at,
-            )
-            .unwrap();
-            observe_source_transition(
-                &mut states,
-                "RECOVERY",
-                Decimal::ZERO,
-                Decimal::ZERO,
-                Decimal::from(1_010),
-                opened_at + 10_000,
-            )
-            .unwrap();
-        }
-        let expected = observe_source_transition(
-            &mut states,
-            "RECOVERY",
-            Decimal::ZERO,
-            Decimal::ONE,
-            Decimal::from(1_000),
-            200_000,
-        )
-        .unwrap();
-        assert!(expected_move_covers_round_trip_cost(
-            expected.ewma_gross_return_bps / BPS_PER_UNIT_RETURN,
-            threshold,
-            Decimal::ONE,
-        ));
-    }
-
-    #[test]
-    fn aggregate_transition_is_one_lifecycle_across_rejected_target_wiggles() {
-        let mut states = BTreeMap::new();
-        observe_source_transition(
-            &mut states,
+    fn mfce_execution_friction_is_external_to_gross_prediction() {
+        let book = mfce_test_book(
             "BTC",
-            Decimal::ZERO,
-            Decimal::from(31),
-            Decimal::from(100),
             1_000,
-        )
-        .unwrap();
-        observe_source_transition(
-            &mut states,
+            Decimal::new(9_999, 2),
+            Decimal::new(10_001, 2),
+            Decimal::from(1_000),
+        );
+        let low_fee = mfce_live_market_context(
             "BTC",
+            &book,
+            MfceDirection::Long,
             Decimal::ZERO,
-            Decimal::from(34),
-            Decimal::from(101),
-            2_000,
+            Decimal::from(1_000),
+            Decimal::ONE,
+            Decimal::from(50),
+            Decimal::ZERO,
+            Decimal::from(6),
         )
         .unwrap();
-        observe_source_transition(
-            &mut states,
+        let high_fee = mfce_live_market_context(
             "BTC",
+            &book,
+            MfceDirection::Long,
             Decimal::ZERO,
-            Decimal::from(30),
-            Decimal::from(102),
-            3_000,
+            Decimal::from(1_000),
+            Decimal::from(5),
+            Decimal::from(50),
+            Decimal::ZERO,
+            Decimal::from(6),
         )
         .unwrap();
-        observe_source_transition(
-            &mut states,
+        let expansion = mfce_live_market_context(
             "BTC",
+            &book,
+            MfceDirection::Long,
+            Decimal::from(800),
+            Decimal::from(1_000),
+            Decimal::ONE,
+            Decimal::from(50),
             Decimal::ZERO,
-            Decimal::from(36),
-            Decimal::from(103),
-            4_000,
+            Decimal::from(6),
         )
         .unwrap();
-        assert_eq!(states["BTC"].long.count, 0);
-        assert!(states["BTC"].active.is_some());
+        let funded = mfce_live_market_context(
+            "BTC",
+            &book,
+            MfceDirection::Long,
+            Decimal::ZERO,
+            Decimal::from(1_000),
+            Decimal::from(5),
+            Decimal::from(50),
+            Decimal::new(1, 4),
+            Decimal::from(6),
+        )
+        .unwrap();
+        let shallow_wide = mfce_live_market_context(
+            "BTC",
+            &mfce_test_book(
+                "BTC",
+                1_000,
+                Decimal::new(996, 1),
+                Decimal::new(1_004, 1),
+                Decimal::new(1, 1),
+            ),
+            MfceDirection::Long,
+            Decimal::ZERO,
+            Decimal::from(1_000),
+            Decimal::ONE,
+            Decimal::from(50),
+            Decimal::ZERO,
+            Decimal::from(6),
+        )
+        .unwrap();
 
-        observe_source_transition(
-            &mut states,
+        assert_eq!(low_fee.spread_bps, high_fee.spread_bps);
+        assert_eq!(low_fee.entry_depth_ratio, high_fee.entry_depth_ratio);
+        assert_eq!(low_fee.exit_depth_ratio, high_fee.exit_depth_ratio);
+        assert!(high_fee.friction_bps > low_fee.friction_bps);
+        assert!(expansion.friction_bps < low_fee.friction_bps);
+        assert!(funded.friction_bps > high_fee.friction_bps);
+        assert!(shallow_wide.friction_bps > low_fee.friction_bps);
+        assert!(shallow_wide.spread_bps > low_fee.spread_bps);
+        assert!(shallow_wide.entry_depth_ratio < low_fee.entry_depth_ratio);
+        assert!(mfce_live_market_context(
             "BTC",
+            &mfce_test_book(
+                "BTC",
+                1_000,
+                Decimal::from(99),
+                Decimal::from(101),
+                Decimal::ONE,
+            ),
+            MfceDirection::Long,
+            Decimal::ZERO,
+            Decimal::from(1_000),
+            Decimal::ONE,
+            Decimal::from(50),
+            Decimal::ZERO,
+            Decimal::from(6),
+        )
+        .is_err());
+
+        // Fees change only the separately computed admission friction. The
+        // learned gross-return feature row has no friction/fee threshold in it.
+        let low_fee_features = mfce_feature_vector(
+            Decimal::new(5, 1),
             Decimal::ZERO,
             Decimal::ZERO,
-            Decimal::from(104),
-            5_000,
+            Decimal::from(1_000),
+            Decimal::from(2_000),
+            Decimal::ZERO,
+            None,
+            Some(Decimal::new(1, 2)),
+            Some(&low_fee),
         )
         .unwrap();
-        assert_eq!(states["BTC"].long.count, 1);
-        assert!(states["BTC"].active.is_none());
+        let high_fee_features = mfce_feature_vector(
+            Decimal::new(5, 1),
+            Decimal::ZERO,
+            Decimal::ZERO,
+            Decimal::from(1_000),
+            Decimal::from(2_000),
+            Decimal::ZERO,
+            None,
+            Some(Decimal::new(1, 2)),
+            Some(&high_fee),
+        )
+        .unwrap();
+        assert_eq!(low_fee_features, high_fee_features);
+
+        let separating_median = low_fee
+            .friction_bps
+            .checked_add(high_fee.friction_bps)
+            .and_then(|sum| sum.checked_div(Decimal::from(2)))
+            .unwrap();
+        let gross_prediction = crate::mfce::MfcePrediction {
+            model_epoch: 7,
+            q10_gross_bps: separating_median,
+            q50_gross_bps: separating_median,
+            uncertainty_bps: Decimal::ZERO,
+            pooled_sample_count: 64,
+            direction_sample_count: 32,
+            asset_direction_sample_count: 8,
+            used_model: true,
+        };
+        let low_cost_decision = evaluate_admission(&MfceAdmissionInput {
+            prediction: gross_prediction.clone(),
+            friction_bps: low_fee.friction_bps,
+            proposed_position_notional: Decimal::from(1_000),
+            remaining_tail_loss_budget_usd: Decimal::from(10_000),
+        })
+        .unwrap();
+        let high_cost_decision = evaluate_admission(&MfceAdmissionInput {
+            prediction: gross_prediction.clone(),
+            friction_bps: high_fee.friction_bps,
+            proposed_position_notional: Decimal::from(1_000),
+            remaining_tail_loss_budget_usd: Decimal::from(10_000),
+        })
+        .unwrap();
+        assert!(low_cost_decision.admitted);
+        assert!(!high_cost_decision.admitted);
+        assert_eq!(gross_prediction.model_epoch, 7);
+        assert_eq!(gross_prediction.q50_gross_bps, separating_median);
+    }
+
+    #[test]
+    fn mfce_transition_features_follow_follower_position_state() {
+        let opening = mfce_feature_vector(
+            Decimal::new(5, 1),
+            Decimal::ONE,
+            Decimal::ZERO,
+            Decimal::from(50),
+            Decimal::from(100),
+            Decimal::ZERO,
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+        assert_eq!(opening.values[6], Decimal::ONE);
+        assert_eq!(opening.values[7], Decimal::ZERO);
+        assert_eq!(opening.values[8], Decimal::ZERO);
+
+        let reversal = mfce_feature_vector(
+            Decimal::new(-5, 1),
+            Decimal::ONE,
+            Decimal::from(40),
+            Decimal::from(-50),
+            Decimal::from(100),
+            Decimal::ZERO,
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+        assert_eq!(reversal.values[6], Decimal::ZERO);
+        assert_eq!(reversal.values[7], Decimal::ZERO);
+        assert_eq!(reversal.values[8], Decimal::ONE);
+    }
+
+    #[test]
+    fn restored_pending_mfce_requests_book_and_survives_pre_source_market_ticks() {
+        use crate::mfce::{
+            MfceActiveTransition, MfceAdmissionState, MfceAssetState, MfceTransitionKind,
+        };
+
+        let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../config/copytrade.json");
+        let config = CopyTradeConfig::from_path(path).unwrap();
+        let mut engine =
+            LiveShadowEngine::new(config, b"mfce-restore", "run", 40_000, 80_000).unwrap();
+        let mut state = MfcePersistentState::default();
+        state.source_epoch = 1;
+        state.next_transition_id = 2;
+        state.assets.insert(
+            "BTC".into(),
+            MfceAssetState {
+                last_observed_source_epoch: 1,
+                last_raw_source_exposure: Decimal::ONE,
+                approved_target_notional: Decimal::ZERO,
+                reserved_tail_loss_bps: Decimal::ZERO,
+                active: Some(MfceActiveTransition {
+                    transition_id: 1,
+                    entry_midpoint: Decimal::from(100),
+                    entry_timestamp_mono: 100,
+                    direction: MfceDirection::Long,
+                    transition_kind: MfceTransitionKind::Opening,
+                    proposed_source_exposure: Decimal::ONE,
+                    proposed_target_notional: Decimal::from(100),
+                    features: MfceFeatureVector::new([Decimal::ZERO; MFCE_FEATURE_COUNT]),
+                    admitted: false,
+                }),
+                admission: MfceAdmissionState::AwaitingLiveBook { transition_id: 1 },
+            },
+        );
+        engine.restore_mfce_persistent_state(state, 100).unwrap();
+        assert!(engine.desired_books.contains("BTC"));
+
+        engine
+            .ingest(
+                accepted(
+                    PublicPayload::MarketSnapshot(MarketSnapshotResponse {
+                        mids: BTreeMap::from([("BTC".into(), Decimal::from(100))]),
+                    }),
+                    ReadRequestKind::MarketMids,
+                    1_000,
+                ),
+                1_000,
+            )
+            .unwrap();
+        engine
+            .ingest(
+                accepted(
+                    PublicPayload::MarketMetadata(MarketMetadataResponse {
+                        universe: vec![MarketMetadataAsset {
+                            name: "BTC".into(),
+                            size_decimals: 3,
+                        }],
+                        contexts: BTreeMap::from([(
+                            "BTC".into(),
+                            MarketAssetContext {
+                                funding_rate_hourly: Decimal::ZERO,
+                            },
+                        )]),
+                        live_taker_fee_bps: Some(Decimal::from(5)),
+                    }),
+                    ReadRequestKind::ExchangeMetadata,
+                    1_000,
+                ),
+                1_000,
+            )
+            .unwrap();
+        engine.construct_next_decision(1_001).unwrap();
+        assert!(engine.mfce.state().assets["BTC"].active.is_some());
+        assert!(engine.mfce.state().samples.is_empty());
+    }
+
+    #[test]
+    fn technical_context_cannot_originate_a_live_target() {
+        let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../config/copytrade.json");
+        let mut config = CopyTradeConfig::from_path(path).unwrap();
+        config.candidates.truncate(1);
+        let mut engine =
+            LiveShadowEngine::new(config, b"technical-feature-only", "run", 40_000, 80_000)
+                .unwrap();
+        warm_flat_technical_context(&mut engine, "TECH");
+        engine
+            .ingest(
+                accepted(
+                    PublicPayload::MarketSnapshot(MarketSnapshotResponse {
+                        mids: BTreeMap::from([("TECH".into(), Decimal::from(100))]),
+                    }),
+                    ReadRequestKind::MarketMids,
+                    10_000,
+                ),
+                10_000,
+            )
+            .unwrap();
+        engine
+            .ingest(
+                accepted(
+                    PublicPayload::MarketMetadata(MarketMetadataResponse {
+                        universe: vec![MarketMetadataAsset {
+                            name: "TECH".into(),
+                            size_decimals: 3,
+                        }],
+                        contexts: BTreeMap::new(),
+                        live_taker_fee_bps: Some(Decimal::from(5)),
+                    }),
+                    ReadRequestKind::ExchangeMetadata,
+                    10_000,
+                ),
+                10_000,
+            )
+            .unwrap();
+
+        engine.construct_next_decision(10_001).unwrap();
+
+        assert!(engine.technical_targets.is_empty());
+        assert!(engine.mfce.tracked_assets().all(|asset| asset != "TECH"));
+        assert_eq!(
+            engine
+                .target_ledger
+                .get("TECH")
+                .map_or(Decimal::ZERO, |state| state.admitted_target_notional),
+            Decimal::ZERO
+        );
+        assert!(!engine.pending.contains_key("TECH"));
+        assert!(!engine.pending_book.contains_key("TECH"));
+    }
+
+    #[test]
+    fn stale_book_keeps_source_transition_pending_and_requests_replacement() {
+        let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../config/copytrade.json");
+        let mut config = CopyTradeConfig::from_path(path).unwrap();
+        let candidate = config.candidates[0].address.to_ascii_lowercase();
+        config.candidates.truncate(1);
+        config.technical.enabled = false;
+        let mut engine =
+            LiveShadowEngine::new(config, b"mfce-stale-book", "run", 40_000, 80_000).unwrap();
+        engine.set_source_tier(&candidate, SourceTier::Active);
+        seed_positive_mfce_backoff(&mut engine, "BTC");
+
+        engine
+            .ingest(
+                accepted(
+                    PublicPayload::OrderBook(mfce_test_book(
+                        "BTC",
+                        50_000,
+                        Decimal::new(9_999, 2),
+                        Decimal::new(10_001, 2),
+                        Decimal::from(1_000_000),
+                    )),
+                    ReadRequestKind::OrderBook,
+                    50_000,
+                ),
+                50_000,
+            )
+            .unwrap();
+        engine
+            .ingest(
+                accepted(
+                    PublicPayload::SourceState(SourceStateResponse {
+                        candidate_id: candidate,
+                        account_value: Decimal::from(1_000),
+                        source_time_ms: 100_000,
+                        positions: BTreeMap::from([(
+                            "BTC".into(),
+                            SourceAssetPosition {
+                                asset: "BTC".into(),
+                                signed_size: Decimal::ONE,
+                                signed_notional: Decimal::from(100),
+                                entry_price: Some(Decimal::from(100)),
+                                unrealized_pnl: Some(Decimal::ZERO),
+                            },
+                        )]),
+                        closed_candles: Vec::new(),
+                    }),
+                    ReadRequestKind::SourceState,
+                    100_000,
+                ),
+                100_000,
+            )
+            .unwrap();
+        engine
+            .ingest(
+                accepted(
+                    PublicPayload::MarketSnapshot(MarketSnapshotResponse {
+                        mids: BTreeMap::from([("BTC".into(), Decimal::from(100))]),
+                    }),
+                    ReadRequestKind::MarketMids,
+                    100_000,
+                ),
+                100_000,
+            )
+            .unwrap();
+        engine
+            .ingest(
+                accepted(
+                    PublicPayload::MarketMetadata(MarketMetadataResponse {
+                        universe: vec![MarketMetadataAsset {
+                            name: "BTC".into(),
+                            size_decimals: 3,
+                        }],
+                        contexts: BTreeMap::from([(
+                            "BTC".into(),
+                            MarketAssetContext {
+                                funding_rate_hourly: Decimal::ZERO,
+                            },
+                        )]),
+                        live_taker_fee_bps: Some(Decimal::from(5)),
+                    }),
+                    ReadRequestKind::ExchangeMetadata,
+                    100_000,
+                ),
+                100_000,
+            )
+            .unwrap();
+
+        engine.construct_next_decision(100_001).unwrap();
+
+        assert!(engine
+            .mfce
+            .awaiting_book_assets()
+            .any(|asset| asset == "BTC"));
+        assert!(engine.desired_books.contains("BTC"));
+        assert!(!engine.pending.contains_key("BTC"));
+
+        engine
+            .ingest(
+                accepted(
+                    PublicPayload::OrderBook(mfce_test_book(
+                        "BTC",
+                        100_002,
+                        Decimal::new(9_999, 2),
+                        Decimal::new(10_001, 2),
+                        Decimal::from(1_000_000),
+                    )),
+                    ReadRequestKind::OrderBook,
+                    100_002,
+                ),
+                100_002,
+            )
+            .unwrap();
+
+        assert!(!engine
+            .mfce
+            .awaiting_book_assets()
+            .any(|asset| asset == "BTC"));
+        assert!(matches!(
+            engine.mfce.state().assets["BTC"].admission,
+            crate::mfce::MfceAdmissionState::Admitted { .. }
+        ));
     }
 
     #[test]
@@ -5500,7 +6368,7 @@ mod tests {
     }
 
     #[test]
-    fn installed_cohort_is_one_deduplicated_source_target_and_keeps_technical_independent() {
+    fn installed_cohort_is_one_source_target_and_technical_context_never_vetoes() {
         let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../config/copytrade.json");
         let mut config = CopyTradeConfig::from_path(path).unwrap();
         config.candidates.truncate(1);
@@ -5577,17 +6445,6 @@ mod tests {
                 })
                 .unwrap();
         }
-        engine.technical_targets.insert(
-            "BTC".into(),
-            TechnicalTarget {
-                asset: "BTC".into(),
-                score: Decimal::ONE,
-                desired_notional: Decimal::from(65),
-                regime: MarketRegime::Range,
-                archetype: SignalArchetype::RangeMeanReversion,
-                candle_close_ms: 15 * 3_600_000,
-            },
-        );
         let mids = MarketSnapshotResponse {
             mids: BTreeMap::from([("BTC".into(), Decimal::from(100))]),
         };
@@ -5602,6 +6459,7 @@ mod tests {
                     funding_rate_hourly: Decimal::ZERO,
                 },
             )]),
+            live_taker_fee_bps: Some(Decimal::from(5)),
         };
         let source_state = |address: String, at: u64, notional: Decimal| SourceStateResponse {
             candidate_id: address,
@@ -5622,38 +6480,21 @@ mod tests {
         let inputs = || {
             BTreeMap::from([(
                 "BTC".into(),
-                vec![
-                    ConsensusInput {
-                        candidate_id: "source:aggregate".into(),
-                        allocation_weight: 0.35,
-                        confidence_modifier: 1.0,
-                        source_exposure: 1.0,
-                        enabled: true,
-                        quarantined: false,
-                        snapshot_age_ms: 0,
-                    },
-                    ConsensusInput {
-                        candidate_id: "technical:range_mean_reversion:range".into(),
-                        allocation_weight: 0.65,
-                        confidence_modifier: 1.0,
-                        source_exposure: 1.0,
-                        enabled: true,
-                        quarantined: false,
-                        snapshot_age_ms: 0,
-                    },
-                ],
+                vec![ConsensusInput {
+                    candidate_id: "source:aggregate".into(),
+                    allocation_weight: 0.35,
+                    confidence_modifier: 1.0,
+                    source_exposure: 1.0,
+                    enabled: true,
+                    quarantined: false,
+                    snapshot_age_ms: 0,
+                }],
             )])
         };
         let contributions = || {
             BTreeMap::from([(
                 "BTC".into(),
-                BTreeMap::from([
-                    ("source:existing".into(), Decimal::new(35, 2)),
-                    (
-                        "technical:range_mean_reversion:range".into(),
-                        Decimal::new(65, 2),
-                    ),
-                ]),
+                BTreeMap::from([("source:existing".into(), Decimal::new(35, 2))]),
             )])
         };
 
@@ -5686,7 +6527,7 @@ mod tests {
                 .count(),
             1
         );
-        assert!(first_inputs["BTC"]
+        assert!(!first_inputs["BTC"]
             .iter()
             .any(|input| input.candidate_id.starts_with("technical:")));
 
@@ -5715,6 +6556,7 @@ mod tests {
                         size_decimals: 3,
                     }],
                     contexts: BTreeMap::new(),
+                    live_taker_fee_bps: Some(Decimal::from(5)),
                 },
                 &[
                     source_state(existing.clone(), 2_000, Decimal::from(100)),
@@ -5733,11 +6575,12 @@ mod tests {
             .unwrap();
         let rejection = engine.cohort_indicator_records.last().unwrap();
         assert_eq!(rejection.asset, "ETH");
-        assert_eq!(
-            rejection.reasons,
-            [CohortDecisionReason::MissingAtr].into_iter().collect()
-        );
-        assert!(!rejection.independent_execution_root);
+        assert!(!rejection
+            .reasons
+            .contains(&CohortDecisionReason::MissingAtr));
+        assert!(!rejection
+            .reasons
+            .contains(&CohortDecisionReason::MissingExpectedMove));
         assert_eq!(rejection.very_profitable_cohort_target, Decimal::ZERO);
 
         let mut second_inputs = inputs();
@@ -5765,16 +6608,13 @@ mod tests {
         let record = engine.cohort_indicator_records.last().unwrap();
         assert!(record.source_target > Decimal::ZERO, "{record:?}");
         assert!(record.source_target <= Decimal::new(35, 2));
-        assert_eq!(record.technical_target, Decimal::new(65, 2));
-        assert_eq!(
-            record.combined_target,
-            record.source_target + record.technical_target
-        );
+        assert_eq!(record.technical_target, Decimal::ZERO);
+        assert_eq!(record.combined_target, record.source_target);
         assert!(record.independent_execution_root);
         assert!(record
             .attribution
             .contains(&AttributionTag::BothSourceSetsAgreeing));
-        assert!(record
+        assert!(!record
             .attribution
             .contains(&AttributionTag::SourceTechnicalHybrid));
         assert_eq!(record.overlap_with_existing, 1);
@@ -6775,6 +7615,7 @@ mod tests {
                             size_decimals: 0,
                         }],
                         contexts: BTreeMap::new(),
+                        live_taker_fee_bps: Some(Decimal::from(5)),
                     }),
                     ReadRequestKind::ExchangeMetadata,
                     1_000,
@@ -7197,6 +8038,7 @@ mod tests {
                             size_decimals: 0,
                         }],
                         contexts: BTreeMap::new(),
+                        live_taker_fee_bps: Some(Decimal::from(5)),
                     }),
                     ReadRequestKind::ExchangeMetadata,
                     1_000,
@@ -7251,17 +8093,7 @@ mod tests {
         let mut engine =
             LiveShadowEngine::new(config, b"partial-fixture", "run", 40_000, 80_000).unwrap();
         engine.set_source_tier(&candidate, SourceTier::Active);
-        engine.source_expectancy.insert(
-            "BTC".into(),
-            SourceExpectancyState {
-                long: SourceExpectancyEstimate {
-                    count: 1,
-                    ewma_gross_return_bps: Decimal::from(100),
-                    ewma_lifetime_seconds: Decimal::from(60),
-                },
-                ..SourceExpectancyState::default()
-            },
-        );
+        seed_positive_mfce_backoff(&mut engine, "BTC");
         let persisted_candle = ClosedCandle {
             asset: "BTC".into(),
             interval: CandleInterval::FifteenMinutes,
@@ -7361,6 +8193,7 @@ mod tests {
                         )]
                         .into_iter()
                         .collect(),
+                        live_taker_fee_bps: Some(Decimal::from(5)),
                     }),
                     ReadRequestKind::ExchangeMetadata,
                     1_000,
@@ -7369,7 +8202,11 @@ mod tests {
             )
             .unwrap();
         engine.construct_next_decision(1_000).unwrap();
-        assert!(engine.pending_book.contains_key("BTC"));
+        assert!(engine
+            .mfce
+            .awaiting_book_assets()
+            .any(|asset| asset == "BTC"));
+        assert!(engine.desired_books.contains("BTC"));
 
         let shallow_book = OrderBookResponse {
             asset: "BTC".to_string(),
@@ -7443,6 +8280,19 @@ mod tests {
         assert_eq!(density.partial_fills, 1);
         assert_eq!(density.unresolved_actionable_targets, 1);
         assert!(density.root_conservation_verified);
+        let unresolved = engine.unresolved_actionable_roots();
+        assert_eq!(unresolved.len(), 1);
+        assert_eq!(unresolved[0].asset, "BTC");
+        assert_eq!(unresolved[0].lifecycle, "pending_action");
+        assert_eq!(unresolved[0].root_planned_cloid, expected_root);
+        assert_eq!(
+            unresolved[0].parent_planned_cloid.as_deref(),
+            Some(partial.planned_cloid.as_str())
+        );
+        assert_eq!(
+            unresolved[0].retry_generation,
+            Some(expected_retry_generation)
+        );
         engine.accrue_funding(3_603_000).unwrap();
         assert!(engine.accrued_funding["BTC"] > Decimal::ZERO);
         engine.technical_engine.reset_funnel();
@@ -7464,13 +8314,13 @@ mod tests {
         let expected_deployment_equity = engine.deployment_equity().unwrap();
         let expected_technical_state = rmp_serde::to_vec(&engine.technical_engine).unwrap();
         let expected_funding = engine.accrued_funding.clone();
-        let expected_source_expectancy = engine.source_expectancy.clone();
-        let expected_source_expectancy_time = engine.source_expectancy_time_high_watermark;
+        let expected_mfce = engine.mfce.state().clone();
+        let expected_mfce_time = engine.mfce_time_high_watermark;
         let expected_executions = rmp_serde::to_vec(&engine.executions).unwrap();
         let expected_equity_buckets = rmp_serde::to_vec(&engine.equity_buckets).unwrap();
         let expected_last_bucket = rmp_serde::to_vec(&engine.last_bucket).unwrap();
         let expected_micro_density = rmp_serde::to_vec(&engine.micro_density).unwrap();
-        assert!(expected_source_expectancy["BTC"].active.is_some());
+        assert!(expected_mfce.assets["BTC"].active.is_some());
         assert_eq!(
             engine
                 .persist_unsigned_state(&state_path, &identity)
@@ -7539,14 +8389,9 @@ mod tests {
             rmp_serde::to_vec(&restored.micro_density).unwrap(),
             expected_micro_density
         );
-        assert_eq!(restored.source_expectancy, expected_source_expectancy);
-        assert_eq!(
-            restored.source_expectancy_time_high_watermark,
-            expected_source_expectancy_time
-        );
-        assert!(
-            restored.source_expectancy_time_offset > engine.source_expectancy_time_high_watermark
-        );
+        assert_eq!(restored.mfce.state(), &expected_mfce);
+        assert_eq!(restored.mfce_time_high_watermark, expected_mfce_time);
+        assert!(restored.mfce_time_offset > engine.mfce_time_high_watermark);
         assert_eq!(
             rmp_serde::to_vec(&restored.technical_engine).unwrap(),
             expected_technical_state
@@ -7576,6 +8421,73 @@ mod tests {
             restored_equity.deployment_equity,
             expected_deployment_equity.deployment_equity
         );
+    }
+
+    #[test]
+    fn legacy_unsigned_snapshot_migrates_ledgers_and_discards_scalar_ewma() {
+        let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../config/copytrade.json");
+        let config = CopyTradeConfig::from_path(path).unwrap();
+        let engine =
+            LiveShadowEngine::new(config, b"legacy-mfce-migration", "run", 40_000, 80_000).unwrap();
+        let identity = SnapshotIdentity {
+            source_tree_sha256: "source".into(),
+            observer_binary_sha256: "observer".into(),
+            configuration_sha256: "configuration".into(),
+            risk_policy_sha256: "risk".into(),
+        };
+        let payload = LegacyUnsignedObserverState {
+            ledger: engine.ledger.clone(),
+            target_ledger: engine.target_ledger.clone(),
+            technical_engine: engine.technical_engine.clone(),
+            technical_decision_state: engine.technical_decision_state.clone(),
+            very_profitable_engine: engine.very_profitable_engine.clone(),
+            very_profitable_layer_artifact_sha256: None,
+            decision_sequence: 17,
+            continuations: BTreeMap::new(),
+            accrued_funding: BTreeMap::from([("BTC".into(), Decimal::ONE)]),
+            last_mids: None,
+            source_expectancy: BTreeMap::from([(
+                "BTC".into(),
+                LegacySourceExpectancyState {
+                    long: LegacySourceExpectancyEstimate {
+                        count: 9,
+                        ewma_gross_return_bps: Decimal::from(25),
+                        ewma_lifetime_seconds: Decimal::from(60),
+                    },
+                    ..LegacySourceExpectancyState::default()
+                },
+            )]),
+            source_expectancy_time_high_watermark: 42_000,
+            ledger_time_high_watermark: 41_000,
+            executions: Vec::new(),
+            equity_buckets: Vec::new(),
+            last_bucket: None,
+            micro_density: MicroDensityCounters::default(),
+        };
+        let checksum_sha256 = legacy_unsigned_snapshot_checksum(
+            LEGACY_UNSIGNED_SNAPSHOT_SCHEMA_VERSION,
+            7,
+            &identity,
+            &payload,
+        )
+        .unwrap();
+        let legacy = LegacyUnsignedSnapshotEnvelope {
+            schema_version: LEGACY_UNSIGNED_SNAPSHOT_SCHEMA_VERSION,
+            generation: 7,
+            identity: identity.clone(),
+            payload,
+            checksum_sha256,
+        };
+        let decoded =
+            decode_unsigned_snapshot(&rmp_serde::to_vec(&legacy).unwrap(), &identity).unwrap();
+        assert_eq!(decoded.schema_version, UNSIGNED_SNAPSHOT_SCHEMA_VERSION);
+        assert_eq!(decoded.generation, 7);
+        assert_eq!(decoded.payload.decision_sequence, 17);
+        assert_eq!(decoded.payload.accrued_funding["BTC"], Decimal::ONE);
+        assert_eq!(decoded.payload.ledger, engine.ledger);
+        assert_eq!(decoded.payload.target_ledger, engine.target_ledger);
+        assert_eq!(decoded.payload.mfce, MfcePersistentState::default());
+        assert_eq!(decoded.payload.mfce_time_high_watermark, 42_000);
     }
 
     #[test]

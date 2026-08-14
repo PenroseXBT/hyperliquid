@@ -54,6 +54,6 @@ pub use execution_floor::{
 pub use target_state::{TargetStateError, VirtualTargetLedger, VirtualTargetState};
 pub use technical::{
     CandleAcceptance, CandleConflict, CandleFieldDifference, CandleInterval, ClosedCandle,
-    CostEstimate, MarketRegime, SignalArchetype, TechnicalEngine, TechnicalError, TechnicalFunnel,
-    TechnicalState, TechnicalStrategyConfig, TechnicalTarget,
+    CostEstimate, MarketRegime, SignalArchetype, TechnicalContext, TechnicalEngine, TechnicalError,
+    TechnicalFunnel, TechnicalState, TechnicalStrategyConfig, TechnicalTarget,
 };

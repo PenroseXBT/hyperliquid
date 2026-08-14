@@ -38,6 +38,18 @@ impl ReadRequestKind {
     fn permits_reserved_budget(self) -> bool {
         matches!(self, Self::FollowerState | Self::FollowerOpenOrders)
     }
+
+    fn is_replaceable_refresh(self) -> bool {
+        matches!(
+            self,
+            Self::SourceState
+                | Self::MarketMids
+                | Self::ExchangeMetadata
+                | Self::OrderBook
+                | Self::FollowerState
+                | Self::FollowerOpenOrders
+        )
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -598,6 +610,7 @@ pub enum ScheduleOutcome {
     Enqueued,
     ReplacedOlder,
     SuccessorRecorded,
+    ShedReplaceable,
     RejectedOlder,
     RejectedQueueFull,
     RejectedInvalid,
@@ -659,6 +672,12 @@ impl QueueState {
         } else {
             false
         }
+    }
+}
+
+impl ScheduledReadRequest {
+    fn may_shed_under_backpressure(&self) -> bool {
+        self.kind.is_replaceable_refresh() && self.priority != RequestPriority::Critical
     }
 }
 
@@ -748,6 +767,9 @@ impl<C: Clock> RequestScheduler<C> {
                 return ScheduleOutcome::SuccessorRecorded;
             }
             if !make_queue_room(&mut queue, self.policy.queue_capacity, &request) {
+                if request.may_shed_under_backpressure() {
+                    return ScheduleOutcome::ShedReplaceable;
+                }
                 return ScheduleOutcome::RejectedQueueFull;
             }
             if let Some(tier) = request.source_tier {
@@ -770,6 +792,9 @@ impl<C: Clock> RequestScheduler<C> {
         }
 
         if !make_queue_room(&mut queue, self.policy.queue_capacity, &request) {
+            if request.may_shed_under_backpressure() {
+                return ScheduleOutcome::ShedReplaceable;
+            }
             return ScheduleOutcome::RejectedQueueFull;
         }
         queue.pending.insert(request.key.clone(), request);
@@ -960,7 +985,9 @@ impl<C: Clock> RequestScheduler<C> {
         match self.schedule(request) {
             ScheduleOutcome::Enqueued
             | ScheduleOutcome::ReplacedOlder
-            | ScheduleOutcome::SuccessorRecorded => ExecutionOutcome::RetryScheduled,
+            | ScheduleOutcome::SuccessorRecorded
+            | ScheduleOutcome::RejectedOlder
+            | ScheduleOutcome::ShedReplaceable => ExecutionOutcome::RetryScheduled,
             _ => ExecutionOutcome::RetryExhausted,
         }
     }
@@ -1008,6 +1035,9 @@ fn make_queue_room(
     if queue.queued_len() < capacity {
         return true;
     }
+    if incoming.may_shed_under_backpressure() && shed_stale_replaceable(queue, incoming) {
+        return true;
+    }
     let pending = queue
         .pending
         .iter()
@@ -1033,6 +1063,43 @@ fn make_queue_room(
         queue.pending.remove(&key);
     }
     true
+}
+
+fn shed_stale_replaceable(queue: &mut QueueState, incoming: &ScheduledReadRequest) -> bool {
+    let pending = queue
+        .pending
+        .iter()
+        .filter(|(_, request)| {
+            request.may_shed_under_backpressure() && request.priority <= incoming.priority
+        })
+        .map(|(key, request)| (false, key.clone(), request.clone()));
+    let successors = queue
+        .successors
+        .iter()
+        .filter(|(_, request)| {
+            request.may_shed_under_backpressure() && request.priority <= incoming.priority
+        })
+        .map(|(key, request)| (true, key.clone(), request.clone()));
+    let Some((is_successor, key, _)) = pending
+        .chain(successors)
+        .min_by(|(_, _, left), (_, _, right)| compare_shed_candidate(left, right))
+    else {
+        return false;
+    };
+    if is_successor {
+        queue.successors.remove(&key);
+    } else {
+        queue.pending.remove(&key);
+    }
+    true
+}
+
+fn compare_shed_candidate(left: &ScheduledReadRequest, right: &ScheduledReadRequest) -> Ordering {
+    left.priority
+        .cmp(&right.priority)
+        .then_with(|| left.created_at.cmp(&right.created_at))
+        .then_with(|| left.expires_at.cmp(&right.expires_at))
+        .then_with(|| left.key.cmp(&right.key))
 }
 
 fn compare_value(left: &ScheduledReadRequest, right: &ScheduledReadRequest) -> Ordering {
@@ -1357,12 +1424,76 @@ mod tests {
         low_value.priority = RequestPriority::Low;
         assert_eq!(
             scheduler.schedule(low_value),
-            ScheduleOutcome::RejectedQueueFull
+            ScheduleOutcome::ShedReplaceable
         );
         let mut high_value = request(&policy, 3, 12, 1_000);
         high_value.priority = RequestPriority::High;
         assert_eq!(scheduler.schedule(high_value), ScheduleOutcome::Enqueued);
         assert_eq!(scheduler.health().pending, 2);
+    }
+
+    #[test]
+    fn replaceable_refresh_backpressure_sheds_without_capacity_growth() {
+        let policy = policy(1_200, 360, 1, 2);
+        let clock = ManualClock::new(10);
+        let scheduler =
+            RequestScheduler::new(clock.clone(), policy.clone(), retry_policy()).unwrap();
+        assert_eq!(
+            scheduler.schedule(request(&policy, 1, 10, 1_000)),
+            ScheduleOutcome::Enqueued
+        );
+        assert_eq!(
+            scheduler.schedule(request(&policy, 2, 11, 1_000)),
+            ScheduleOutcome::Enqueued
+        );
+        assert_eq!(
+            scheduler.schedule(request(&policy, 3, 12, 1_000)),
+            ScheduleOutcome::Enqueued
+        );
+        assert_eq!(scheduler.health().pending, 2);
+        clock.set(12);
+        let mut dispatched = Vec::new();
+        for _ in 0..2 {
+            let dispatch = scheduler.begin_next().unwrap();
+            dispatched.push(dispatch.request().key.clone());
+            drop(dispatch);
+        }
+        assert!(!dispatched.contains(&key(1)));
+        assert!(dispatched.contains(&key(2)));
+        assert!(dispatched.contains(&key(3)));
+    }
+
+    #[test]
+    fn critical_work_still_fails_closed_when_queue_cannot_preserve_it() {
+        let policy = policy(1_200, 360, 1, 1);
+        let scheduler =
+            RequestScheduler::new(ManualClock::new(10), policy.clone(), retry_policy()).unwrap();
+        let critical = |id: &str, created_at| {
+            policy
+                .request(
+                    RequestKey {
+                        subject: RequestSubject::Follower(id.to_string()),
+                        kind: ReadRequestKind::FollowerState,
+                    },
+                    RequestPriority::Critical,
+                    BudgetClass::Critical,
+                    None,
+                    created_at,
+                    created_at,
+                    1_000,
+                    0,
+                )
+                .unwrap()
+        };
+        assert_eq!(
+            scheduler.schedule(critical("follower-a", 10)),
+            ScheduleOutcome::Enqueued
+        );
+        assert_eq!(
+            scheduler.schedule(critical("follower-b", 11)),
+            ScheduleOutcome::RejectedQueueFull
+        );
+        assert_eq!(scheduler.health().pending, 1);
     }
 
     #[test]

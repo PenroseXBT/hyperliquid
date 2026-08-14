@@ -1,4 +1,7 @@
-use crate::live_shadow::{LiveShadowEngine, SnapshotIdentity, UNSIGNED_SNAPSHOT_SCHEMA_VERSION};
+use crate::live_shadow::{
+    LiveShadowEngine, SnapshotIdentity, LEGACY_UNSIGNED_SNAPSHOT_SCHEMA_VERSION,
+    UNSIGNED_SNAPSHOT_SCHEMA_VERSION,
+};
 use fs2::FileExt;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -14,7 +17,7 @@ const MARKER_TEMP_FILE_NAME: &str = "initialized.tmp";
 const SNAPSHOT_TEMP_FILE_NAME: &str = "unsigned-observer-state.tmp";
 
 pub const UNSIGNED_PERSISTENCE_SCHEMA_DESCRIPTOR: &str = concat!(
-    "copytrade-observer-unsigned-persistence-v6\n",
+    "copytrade-observer-unsigned-persistence-v8\n",
     "lock=.observer-state.lock:exclusive-os-lock:lifetime\n",
     "marker=initialized.json:",
     "InitializationMarker{schema_version:u32,snapshot_schema_version:u32,generation:u64,",
@@ -32,8 +35,13 @@ pub const UNSIGNED_PERSISTENCE_SCHEMA_DESCRIPTOR: &str = concat!(
     "very_profitable_layer_artifact_sha256:Option<String>,decision_sequence:u64,",
     "continuations:BTreeMap<String,ContinuationIntent>,",
     "accrued_funding:BTreeMap<String,Decimal>,last_mids:Option<MarketSnapshotResponse>,",
-    "source_expectancy:BTreeMap<String,SourceExpectancyState>,",
-    "source_expectancy_time_high_watermark:Timestamp,",
+    "mfce:MfcePersistentState{schema_version:u32,source_epoch:u64,",
+    "next_transition_id:u64,next_sample_id:u64,last_retrain_attempt_sample_id:u64,",
+    "assets:BTreeMap<String,MfceAssetState>:max=512,",
+    "samples:VecDeque<MfceTrainingSample>:max=4096,",
+    "incumbent:Option<MfceModelState{q10_model:String:max_bytes=2097152,",
+    "q50_model:String:max_bytes=2097152}>},",
+    "mfce_time_high_watermark:Timestamp,",
     "ledger_time_high_watermark:Timestamp,executions:Vec<ShadowActionAccounting>,",
     "equity_buckets:Vec<EquityReturnBucket>,last_bucket:Option<EquityBoundary>,",
     "micro_density:MicroDensityCounters}\n",
@@ -44,6 +52,7 @@ pub const UNSIGNED_PERSISTENCE_SCHEMA_DESCRIPTOR: &str = concat!(
     "exit_notional:Decimal,gross_pnl:Decimal,fees:Decimal,funding:Decimal,slippage:Decimal,",
     "net_pnl:Decimal,gains:Decimal,losses:Decimal}>\n",
     "checksum=sha256(canonical-messagepack((schema_version,generation,identity,payload)))\n",
+    "migration=v7-source-ewma-to-v8-empty-mfce:checksum-first:ledger-preserving\n",
     "commit=temp-write,file-fsync,atomic-rename,directory-fsync,marker-update,directory-fsync\n",
 );
 
@@ -191,11 +200,13 @@ impl UnsignedStateRoot {
     }
 
     pub fn restore(&mut self, engine: &mut LiveShadowEngine) -> Result<u64, String> {
-        let marker_generation = self
+        let marker = self
             .marker
             .as_ref()
-            .ok_or("unsigned state root is not initialized")?
-            .generation;
+            .ok_or("unsigned state root is not initialized")?;
+        let marker_generation = marker.generation;
+        let legacy_schema =
+            marker.snapshot_schema_version == LEGACY_UNSIGNED_SNAPSHOT_SCHEMA_VERSION;
         let snapshot_generation = engine
             .restore_unsigned_state(&self.snapshot_path, &self.identity)
             .map_err(|error| error.to_string())?;
@@ -203,6 +214,16 @@ impl UnsignedStateRoot {
             return Err(format!(
                 "unsigned snapshot generation rollback: marker={marker_generation} snapshot={snapshot_generation}"
             ));
+        }
+        if legacy_schema {
+            // Commit the migrated MFCE payload before advertising schema v8 in
+            // the marker. The ordinary newer-snapshot recovery rule remains
+            // valid if the process stops between these two atomic commits.
+            let migrated_generation = engine
+                .persist_unsigned_state(&self.snapshot_path, &self.identity)
+                .map_err(|error| error.to_string())?;
+            self.write_marker(migrated_generation)?;
+            return Ok(migrated_generation);
         }
         if snapshot_generation > marker_generation {
             // The snapshot is renamed and directory-synced before its marker is
@@ -264,7 +285,10 @@ fn validate_marker(
     expected_identity: &SnapshotIdentity,
 ) -> Result<(), String> {
     if marker.schema_version != INITIALIZATION_MARKER_SCHEMA_VERSION
-        || marker.snapshot_schema_version != UNSIGNED_SNAPSHOT_SCHEMA_VERSION
+        || !matches!(
+            marker.snapshot_schema_version,
+            LEGACY_UNSIGNED_SNAPSHOT_SCHEMA_VERSION | UNSIGNED_SNAPSHOT_SCHEMA_VERSION
+        )
     {
         return Err("unsupported unsigned state marker schema".into());
     }
@@ -316,6 +340,17 @@ mod tests {
             80_000,
         )
         .unwrap()
+    }
+
+    #[test]
+    fn descriptor_identifies_schema_v8_and_the_mfce_artifact_bounds() {
+        assert!(UNSIGNED_PERSISTENCE_SCHEMA_DESCRIPTOR
+            .starts_with("copytrade-observer-unsigned-persistence-v8\n"));
+        assert!(UNSIGNED_PERSISTENCE_SCHEMA_DESCRIPTOR
+            .contains("samples:VecDeque<MfceTrainingSample>:max=4096"));
+        assert!(UNSIGNED_PERSISTENCE_SCHEMA_DESCRIPTOR.contains("max_bytes=2097152"));
+        assert!(!UNSIGNED_PERSISTENCE_SCHEMA_DESCRIPTOR
+            .contains("source_expectancy:BTreeMap<String,SourceExpectancyState>"));
     }
 
     #[test]
@@ -401,6 +436,36 @@ mod tests {
         drop(state_root);
 
         assert!(UnsignedStateRoot::acquire(&root, &identity("different")).is_err());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn legacy_marker_is_recommitted_as_schema_v8_after_restore() {
+        let root = temporary_root("legacy-marker");
+        let identity = identity("legacy-marker");
+        let mut engine = fixture_engine();
+        let mut state_root = UnsignedStateRoot::acquire(&root, &identity).unwrap();
+        assert_eq!(state_root.initialize(&mut engine).unwrap(), 0);
+        drop(state_root);
+
+        // This also represents a crash after a migrated v8 snapshot commit but
+        // before its v8 marker commit: the older marker is still authoritative
+        // enough to request migration, while the checksummed snapshot is newer.
+        let marker_path = root.join(MARKER_FILE_NAME);
+        let mut marker = read_marker(&marker_path).unwrap();
+        marker.snapshot_schema_version = LEGACY_UNSIGNED_SNAPSHOT_SCHEMA_VERSION;
+        std::fs::write(&marker_path, serde_json::to_vec(&marker).unwrap()).unwrap();
+
+        let mut restored = fixture_engine();
+        let mut state_root = UnsignedStateRoot::acquire(&root, &identity).unwrap();
+        assert_eq!(state_root.restore(&mut restored).unwrap(), 1);
+        let migrated_marker = read_marker(&marker_path).unwrap();
+        assert_eq!(
+            migrated_marker.snapshot_schema_version,
+            UNSIGNED_SNAPSHOT_SCHEMA_VERSION
+        );
+        assert_eq!(migrated_marker.generation, 1);
+        drop(state_root);
         std::fs::remove_dir_all(root).unwrap();
     }
 }

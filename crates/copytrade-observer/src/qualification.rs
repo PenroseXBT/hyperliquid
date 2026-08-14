@@ -2,7 +2,8 @@ use crate::ipc_client::{
     IntentDispatchState, ProductionDispatchHandle, ProductionIntentDispatcher,
 };
 use crate::live_shadow::{
-    EconomicAttribution, LiveShadowEngine, ProductionIntentIdentity, UnsignedShadowStateIdentity,
+    EconomicAttribution, LiveShadowEngine, ProductionIntentIdentity, UnresolvedRootStatus,
+    UnsignedShadowStateIdentity,
 };
 use crate::profitability::{summarize_profitability, ProfitabilitySummary};
 use crate::public_mainnet::{HyperliquidPublicTransport, PublicTransportPolicy};
@@ -205,6 +206,7 @@ pub struct ProductionObserverRuntime {
 #[derive(Debug, Default, Serialize)]
 struct Counters {
     schedule_rejections: u64,
+    replaceable_schedule_shed: u64,
     completed_fresh: u64,
     completed_stale: u64,
     retries: u64,
@@ -263,17 +265,19 @@ struct ContinuousStatus<'a> {
     projection_violations: u64,
     persistence_failures: u64,
     unresolved_roots: usize,
+    unresolved_root_details: Vec<UnresolvedRootStatus>,
     open_episodes: usize,
     closed_episodes_lifetime: u64,
     scheduler_pending: usize,
     scheduler_in_flight: usize,
     rate_limited_responses: u64,
-    source_transition_observations: u64,
-    active_source_observations: usize,
-    source_directions_above_cost_threshold: usize,
+    mfce_completed_transition_labels: usize,
+    mfce_active_transitions: usize,
+    mfce_awaiting_live_books: usize,
+    mfce_model_epoch: Option<u64>,
     source_risk_increases_admitted: u64,
     source_risk_increases_rejected_below_edge: u64,
-    source_expectancy: BTreeMap<String, crate::live_shadow::SourceExpectancyReport>,
+    mfce: crate::mfce::MfceReport,
     economics: Vec<RollingEconomicStatus>,
 }
 
@@ -321,6 +325,10 @@ pub async fn run_qualification(options: QualificationOptions) -> Result<PathBuf,
     )?;
     let config = observer_state.config().clone();
     let very_profitable_layer = observer_state.very_profitable_layer().cloned();
+    let expanded_source_candidates = very_profitable_layer
+        .as_ref()
+        .map(|layer| layer.qualified_members.clone())
+        .unwrap_or_default();
     let scheduler_config = ReadOnlySchedulerConfig::from_path(&options.request_policy_path)?;
     let transport_policy: PublicTransportPolicy =
         serde_json::from_slice(&std::fs::read(&options.transport_policy_path)?)?;
@@ -338,8 +346,10 @@ pub async fn run_qualification(options: QualificationOptions) -> Result<PathBuf,
     {
         return Err("configured freshness must equal the maximum derived tier deadline".into());
     }
-    let source_dispatch_plan = derive_source_dispatch_plan(
+    let source_dispatch_plan = derive_source_dispatch_plan_with_expansion(
         config.candidates.len(),
+        expanded_source_candidates.len(),
+        transport_policy.perp_dexes.len(),
         &scheduler_config,
         &transport_policy,
     )?;
@@ -467,6 +477,12 @@ pub async fn run_qualification(options: QualificationOptions) -> Result<PathBuf,
     )?;
     let transport = HyperliquidPublicTransport::new(clock.clone(), transport_policy.clone())
         .map_err(|error| format!("transport: {error:?}"))?;
+    transport
+        .set_fee_user(config.follower_address.as_deref())
+        .map_err(|error| format!("live fee subject: {error:?}"))?;
+    transport
+        .set_expanded_source_candidates(expanded_source_candidates.iter().cloned())
+        .map_err(|error| format!("expanded source cohort: {error:?}"))?;
     evidence.write_summary("source-dispatch-plan.json", &source_dispatch_plan)?;
     evidence.append_log(
         false,
@@ -532,11 +548,15 @@ pub async fn run_qualification(options: QualificationOptions) -> Result<PathBuf,
     if let Some(production) = &options.production {
         engine.enable_production_intents(production.identity.clone());
         let mut state = production.state.lock().await;
+        engine
+            .restore_mfce_persistent_state(state.mfce.clone(), state.mfce_time_high_watermark)
+            .map_err(|error| error.to_string())?;
         production
             .dispatcher
             .reconcile_into(&mut state, &production.state_path)
             .await?;
         engine.synchronize_production_state(&state);
+        state.save_atomic(&production.state_path)?;
     }
     let mut candidate_tiers = config
         .candidates
@@ -655,7 +675,7 @@ pub async fn run_qualification(options: QualificationOptions) -> Result<PathBuf,
                     SourceTier::Active => source_dispatch_plan.active_cadence_ms,
                     SourceTier::Inactive => source_dispatch_plan.inactive_cadence_ms,
                 };
-                enqueue(
+                enqueue_weighted(
                     &scheduler,
                     &scheduler_config,
                     RequestSubject::Candidate(id.clone()),
@@ -667,6 +687,11 @@ pub async fn run_qualification(options: QualificationOptions) -> Result<PathBuf,
                     now,
                     config.global_risk.source_snapshot_max_age_ms,
                     &mut counters,
+                    expanded_source_candidates.contains(&id).then_some(
+                        scheduler_config.api.endpoint_weights[&ReadRequestKind::SourceState]
+                            .checked_mul(u32::try_from(transport_policy.perp_dexes.len() + 1)?)
+                            .ok_or("expanded source request weight overflow")?,
+                    ),
                 )?;
                 scheduled.insert(id.clone());
                 let previous_due = source_due[&id];
@@ -699,7 +724,10 @@ pub async fn run_qualification(options: QualificationOptions) -> Result<PathBuf,
                 120_000,
                 &mut counters,
             )?;
-            metadata_due = now + 3_600_000;
+            // Funding context is admission-critical and the accepted response
+            // is valid for 120 seconds. Refresh at half-life so a normal
+            // delayed poll cannot leave MFCE pending for most of the hour.
+            metadata_due = now + 60_000;
         }
         if now >= book_enqueue_due {
             let urgent_assets = engine.urgent_book_assets().into_iter().collect::<Vec<_>>();
@@ -731,7 +759,8 @@ pub async fn run_qualification(options: QualificationOptions) -> Result<PathBuf,
                 )?;
             }
             // 30 books/minute = 60 weight. Together with allMids (6)
-            // and the hourly metadata burst (20), enrichment stays within 90.
+            // and the combined metadata + live-fee refresh (22), enrichment
+            // stays within the 90-weight non-source allowance.
             book_enqueue_due = next_cadence_deadline(book_enqueue_due, now, 2_000)?;
         }
         while tasks.len() < scheduler_config.api.max_concurrency {
@@ -1029,6 +1058,7 @@ pub async fn run_qualification(options: QualificationOptions) -> Result<PathBuf,
             None => return Err("initial equity boundary missing".into()),
         }
     }
+    persist_production_mfce_state(&engine, options.production.as_ref()).await?;
     evidence.flush_replay_events()?;
     if options.continuous {
         persist_unsigned_state(&mut engine, &mut state_root)?;
@@ -1246,22 +1276,7 @@ fn write_continuous_status(
     expired_candidate_count: u64,
     never_refreshed_candidate_count: u64,
 ) -> Result<(), Box<dyn Error>> {
-    let expectancy = engine.source_expectancy_report();
-    let source_transition_observations = expectancy
-        .values()
-        .map(|state| state.long.count.saturating_add(state.short.count))
-        .sum();
-    let active_source_observations = expectancy
-        .values()
-        .filter(|state| state.active.is_some())
-        .count();
-    let source_directions_above_cost_threshold = expectancy
-        .values()
-        .map(|state| {
-            usize::from(state.long.above_cost_threshold)
-                + usize::from(state.short.above_cost_threshold)
-        })
-        .sum();
+    let mfce = engine.mfce_report();
     let density = engine.executable_density_summary()?;
     let unresolved_roots = engine.unresolved_actionable_root_count();
     let economics = [
@@ -1292,18 +1307,20 @@ fn write_continuous_status(
         projection_violations: metrics.projection_violations,
         persistence_failures: metrics.persistence_failures,
         unresolved_roots,
+        unresolved_root_details: engine.unresolved_actionable_roots(),
         open_episodes: engine.ledger().portfolio_open_count(),
         closed_episodes_lifetime: engine.ledger().portfolio_closed_count(),
         scheduler_pending: scheduler.pending,
         scheduler_in_flight: scheduler.in_flight,
         rate_limited_responses,
-        source_transition_observations,
-        active_source_observations,
-        source_directions_above_cost_threshold,
+        mfce_completed_transition_labels: mfce.completed_samples,
+        mfce_active_transitions: mfce.active_transitions,
+        mfce_awaiting_live_books: mfce.awaiting_live_books,
+        mfce_model_epoch: mfce.incumbent_epoch,
         source_risk_increases_admitted: density.admitted_new_positions,
         source_risk_increases_rejected_below_edge: density
             .source_risk_increases_suppressed_below_cost_edge,
-        source_expectancy: expectancy,
+        mfce,
         economics,
     };
     let path = output.join("rolling-status.json");
@@ -1518,6 +1535,33 @@ fn manifest_stage_matches(production_enabled: bool, stage: &str) -> bool {
     }
 }
 
+fn synchronize_production_mfce_state(
+    engine: &LiveShadowEngine,
+    state: &mut crate::production_state::ProductionTradingState,
+) -> bool {
+    let (mfce, time_high_watermark) = engine.mfce_persistence_snapshot();
+    if state.mfce == mfce && state.mfce_time_high_watermark == time_high_watermark {
+        return false;
+    }
+    state.mfce = mfce;
+    state.mfce_time_high_watermark = time_high_watermark;
+    true
+}
+
+async fn persist_production_mfce_state(
+    engine: &LiveShadowEngine,
+    production: Option<&ProductionObserverRuntime>,
+) -> Result<(), Box<dyn Error>> {
+    let Some(production) = production else {
+        return Ok(());
+    };
+    let mut state = production.state.lock().await;
+    if synchronize_production_mfce_state(engine, &mut state) {
+        state.save_atomic(&production.state_path)?;
+    }
+    Ok(())
+}
+
 async fn dispatch_production_intents(
     engine: &mut LiveShadowEngine,
     production: Option<&ProductionObserverRuntime>,
@@ -1525,6 +1569,9 @@ async fn dispatch_production_intents(
     let Some(production) = production else {
         return Ok(());
     };
+    // Commit the observer-only model/sample snapshot before any newly prepared
+    // intent can reach the signing boundary.
+    persist_production_mfce_state(engine, Some(production)).await?;
     for intent in engine.take_prepared_authorized_intents() {
         let cloid = intent.planned_cloid;
         let outcome = production.dispatch_handle.persist_and_queue(intent).await?;
@@ -1545,18 +1592,35 @@ async fn dispatch_production_intents(
             reconciliation_timestamp.ok_or("production replan has no exchange event timestamp")?,
         )?;
         state.assets_requiring_replan.clear();
+    }
+    let mfce_changed_after_recompute = synchronize_production_mfce_state(engine, &mut state);
+    if requires_recompute || mfce_changed_after_recompute {
         state.save_atomic(&production.state_path)?;
     }
     Ok(())
 }
 
+#[cfg(test)]
 fn derive_source_dispatch_plan(
     candidate_count: usize,
     scheduler: &ReadOnlySchedulerConfig,
     transport: &PublicTransportPolicy,
 ) -> Result<SourceDispatchPlan, Box<dyn Error>> {
+    derive_source_dispatch_plan_with_expansion(candidate_count, 0, 0, scheduler, transport)
+}
+
+fn derive_source_dispatch_plan_with_expansion(
+    candidate_count: usize,
+    expanded_candidate_count: usize,
+    additional_perp_dex_count: usize,
+    scheduler: &ReadOnlySchedulerConfig,
+    transport: &PublicTransportPolicy,
+) -> Result<SourceDispatchPlan, Box<dyn Error>> {
     if candidate_count == 0 {
         return Err("effective source candidate universe must be nonempty".into());
+    }
+    if expanded_candidate_count > candidate_count {
+        return Err("expanded source cohort exceeds candidate universe".into());
     }
     let window_ms = scheduler.api.window_ms;
     let active_cadence_ms = transport.active_source_interval_ms;
@@ -1594,20 +1658,36 @@ fn derive_source_dispatch_plan(
     let base_inactive_dispatches = u64::try_from(candidate_count)?
         .checked_mul(inactive_dispatches_per_candidate)
         .ok_or("inactive source demand overflow")?;
-    if base_inactive_dispatches > source_call_capacity_per_window {
+    let expansion_calls = u64::try_from(expanded_candidate_count)?
+        .checked_mul(u64::try_from(additional_perp_dex_count)?)
+        .and_then(|value| value.checked_mul(inactive_dispatches_per_candidate))
+        .ok_or("expanded source demand overflow")?;
+    let base_weight = base_inactive_dispatches
+        .checked_add(expansion_calls)
+        .and_then(|calls| calls.checked_mul(u64::from(source_state_weight)))
+        .ok_or("expanded source weight overflow")?;
+    if base_weight > u64::from(scheduler.api.source_polling_weight_per_window) {
         return Err(format!(
-            "effective candidate count {candidate_count} cannot remain fresh: inactive source demand {base_inactive_dispatches} exceeds unchanged source-call capacity {source_call_capacity_per_window} per window"
+            "effective candidate count {candidate_count} with {expanded_candidate_count} expanded sources cannot remain fresh: source weight {base_weight} exceeds {} per window",
+            scheduler.api.source_polling_weight_per_window
         )
         .into());
     }
     let incremental_active_dispatches = active_dispatches_per_candidate
         .checked_sub(inactive_dispatches_per_candidate)
         .ok_or("active source dispatch increment underflow")?;
-    let budget_active_capacity = source_call_capacity_per_window
-        .checked_sub(base_inactive_dispatches)
-        .ok_or("source capacity underflow")?
-        .checked_div(incremental_active_dispatches)
-        .ok_or("active source dispatch increment must be positive")?;
+    // Multi-DEX source snapshots already consume the bounded source reserve.
+    // Keep every source at the existing safe inactive cadence instead of
+    // silently under-accounting an expanded active source's extra API calls.
+    let budget_active_capacity = if expansion_calls == 0 {
+        source_call_capacity_per_window
+            .checked_sub(base_inactive_dispatches)
+            .ok_or("source capacity underflow")?
+            .checked_div(incremental_active_dispatches)
+            .ok_or("active source dispatch increment must be positive")?
+    } else {
+        0
+    };
     let active_candidate_count =
         candidate_count
             .min(MAX_ACTIVE_SOURCE_CANDIDATES)
@@ -1918,7 +1998,34 @@ fn enqueue<C: Clock>(
     lifetime: u64,
     counters: &mut Counters,
 ) -> Result<(), Box<dyn Error>> {
-    let request = config.api.request(
+    enqueue_weighted(
+        scheduler,
+        config,
+        subject,
+        kind,
+        priority,
+        source_tier,
+        now,
+        lifetime,
+        counters,
+        None,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn enqueue_weighted<C: Clock>(
+    scheduler: &RequestScheduler<C>,
+    config: &ReadOnlySchedulerConfig,
+    subject: RequestSubject,
+    kind: ReadRequestKind,
+    priority: RequestPriority,
+    source_tier: Option<SourceTier>,
+    now: u64,
+    lifetime: u64,
+    counters: &mut Counters,
+    weight_override: Option<u32>,
+) -> Result<(), Box<dyn Error>> {
+    let mut request = config.api.request(
         RequestKey { subject, kind },
         priority,
         if kind == ReadRequestKind::SourceState {
@@ -1932,11 +2039,21 @@ fn enqueue<C: Clock>(
         now.checked_add(lifetime).ok_or("expiry overflow")?,
         0,
     )?;
+    if let Some(weight) = weight_override {
+        if weight == 0 {
+            return Err("request weight override must be positive".into());
+        }
+        request.weight = weight;
+    }
     match scheduler.schedule(request) {
         ScheduleOutcome::Enqueued
         | ScheduleOutcome::ReplacedOlder
         | ScheduleOutcome::SuccessorRecorded
         | ScheduleOutcome::RejectedOlder => Ok(()),
+        ScheduleOutcome::ShedReplaceable => {
+            counters.replaceable_schedule_shed += 1;
+            Ok(())
+        }
         other => {
             counters.schedule_rejections += 1;
             Err(format!("scheduler rejection: {other:?}").into())
@@ -2335,12 +2452,15 @@ mod tests {
 
     fn source_policies() -> (ReadOnlySchedulerConfig, PublicTransportPolicy) {
         let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
-        let scheduler =
+        let mut scheduler =
             ReadOnlySchedulerConfig::from_path(root.join("config/read-api-policy.json")).unwrap();
-        let transport = serde_json::from_slice(
+        scheduler.api.reserved_weight_per_window = 360;
+        scheduler.api.source_polling_weight_per_window = 750;
+        let mut transport: PublicTransportPolicy = serde_json::from_slice(
             &std::fs::read(root.join("config/public-mainnet-transport.json")).unwrap(),
         )
         .unwrap();
+        transport.perp_dexes.clear();
         (scheduler, transport)
     }
 
@@ -2351,11 +2471,74 @@ mod tests {
     }
 
     #[test]
+    fn production_sync_copies_mfce_state_and_time_as_one_snapshot() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let config = CopyTradeConfig::from_path(root.join("config/copytrade.json")).unwrap();
+        let mut engine =
+            LiveShadowEngine::new(config, b"mfce-production-sync", "test", 40_000, 80_000).unwrap();
+        let mut mfce = crate::mfce::MfcePersistentState::default();
+        mfce.source_epoch = 7;
+        engine
+            .restore_mfce_persistent_state(mfce.clone(), 91_000)
+            .unwrap();
+        let mut production = crate::production_state::ProductionTradingState::new(
+            copytrade_core::live_trading::LiveTradingState::new(Decimal::from(100), 0).unwrap(),
+        );
+
+        assert!(synchronize_production_mfce_state(&engine, &mut production));
+        assert_eq!(production.mfce, mfce);
+        assert_eq!(production.mfce_time_high_watermark, 91_000);
+        assert!(!synchronize_production_mfce_state(&engine, &mut production));
+    }
+
+    #[test]
     fn unsigned_runner_accepts_the_bound_production_manifest_stage() {
         assert!(manifest_stage_matches(false, "HL1J"));
         assert!(manifest_stage_matches(false, "PRODUCTION_RELEASE"));
         assert!(manifest_stage_matches(true, "PRODUCTION_RELEASE"));
         assert!(!manifest_stage_matches(true, "HL1J"));
+    }
+
+    #[test]
+    fn replaceable_refresh_queue_pressure_is_nonfatal_and_counted() {
+        let (mut scheduler_config, _) = source_policies();
+        scheduler_config.api.queue_capacity = 1;
+        let scheduler = RequestScheduler::new(
+            copytrade_core::scheduler::ManualClock::new(10),
+            scheduler_config.api.clone(),
+            scheduler_config.retry.clone(),
+        )
+        .unwrap();
+        let mut counters = Counters::default();
+
+        enqueue(
+            &scheduler,
+            &scheduler_config,
+            RequestSubject::Candidate("candidate-a".to_string()),
+            ReadRequestKind::SourceState,
+            RequestPriority::Normal,
+            Some(SourceTier::Active),
+            10,
+            40_000,
+            &mut counters,
+        )
+        .unwrap();
+        enqueue(
+            &scheduler,
+            &scheduler_config,
+            RequestSubject::Candidate("candidate-b".to_string()),
+            ReadRequestKind::SourceState,
+            RequestPriority::Low,
+            Some(SourceTier::Active),
+            11,
+            40_000,
+            &mut counters,
+        )
+        .unwrap();
+
+        assert_eq!(counters.schedule_rejections, 0);
+        assert_eq!(counters.replaceable_schedule_shed, 1);
+        assert_eq!(scheduler.health().pending, 1);
     }
 
     #[test]
@@ -2441,6 +2624,36 @@ mod tests {
         assert_eq!(boundary.inactive_candidate_count, 375);
         assert_eq!(boundary.combined_dispatches_per_window, 375);
         assert!(derive_source_dispatch_plan(376, &scheduler, &transport).is_err());
+    }
+
+    #[test]
+    fn expanded_xyz_sources_are_fully_weighted_and_remain_at_safe_cadence() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let scheduler =
+            ReadOnlySchedulerConfig::from_path(root.join("config/read-api-policy.json")).unwrap();
+        let transport: PublicTransportPolicy = serde_json::from_slice(
+            &std::fs::read(root.join("config/public-mainnet-transport.json")).unwrap(),
+        )
+        .unwrap();
+        let plan = derive_source_dispatch_plan_with_expansion(
+            375,
+            80,
+            transport.perp_dexes.len(),
+            &scheduler,
+            &transport,
+        )
+        .unwrap();
+        assert_eq!(plan.active_candidate_count, 0);
+        assert_eq!(plan.inactive_candidate_count, 375);
+        assert_eq!(plan.combined_dispatches_per_window, 375);
+        assert!(derive_source_dispatch_plan_with_expansion(
+            375,
+            86,
+            transport.perp_dexes.len(),
+            &scheduler,
+            &transport,
+        )
+        .is_err());
     }
 
     #[test]

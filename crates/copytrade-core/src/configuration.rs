@@ -275,6 +275,7 @@ impl CopyTradeConfig {
             0.0,
             100.0,
         )?;
+        finite_range("taker_fee_bps", self.taker_fee_bps, 0.0, 100.0)?;
         if self.starting_equity_usd <= 0.0
             || !self.max_total_leverage.is_finite()
             || self.max_total_leverage <= 0.0

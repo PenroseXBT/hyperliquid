@@ -197,6 +197,20 @@ pub struct TechnicalState {
     pub trigger_15m: TriggerState,
 }
 
+/// Raw, read-only technical features for conditioning another decision model.
+///
+/// Unlike [`TechnicalTarget`], this context has not passed through the entry
+/// threshold, position hysteresis, exit timing, sizing, or execution-cost
+/// admission in [`TechnicalEngine::evaluate`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TechnicalContext {
+    pub state: TechnicalState,
+    pub archetype: SignalArchetype,
+    pub raw_contextual_score: Decimal,
+    pub atr_fraction: Decimal,
+    pub candle_close_ms: u64,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TechnicalTarget {
     pub asset: String,
@@ -407,6 +421,31 @@ impl TechnicalEngine {
 
     pub fn configuration(&self) -> &TechnicalStrategyConfig {
         &self.config
+    }
+
+    /// Returns the latest raw technical features without changing engine state.
+    ///
+    /// This deliberately performs classification only. It does not update the
+    /// funnel or current score, and it does not apply trading thresholds,
+    /// hysteresis, exit timing, sizing, or execution-cost admission.
+    pub fn feature_context(&self, asset: &str) -> Result<Option<TechnicalContext>, TechnicalError> {
+        let Some(candles) = self.assets.get(asset) else {
+            return Ok(None);
+        };
+        let Some((state, archetype, candle_close_ms, atr_fraction)) =
+            classify(candles, &self.config)?
+        else {
+            return Ok(None);
+        };
+        Ok(Some(TechnicalContext {
+            raw_contextual_score: Decimal::from_f64_retain(contextual_score(&state))
+                .ok_or(TechnicalError::Arithmetic)?,
+            state,
+            archetype,
+            atr_fraction: Decimal::from_f64_retain(atr_fraction)
+                .ok_or(TechnicalError::Arithmetic)?,
+            candle_close_ms,
+        }))
     }
 
     pub fn accept_closed_candle(
@@ -683,11 +722,7 @@ fn technical_score(
     _archetype: SignalArchetype,
     enter_threshold: f64,
 ) -> f64 {
-    let contextual = 0.40 * f64::from(state.regime_12h.direction)
-        + 0.25 * f64::from(state.trend_4h.score())
-        + 0.20 * f64::from(state.trend_1h.score())
-        + 0.10 * f64::from(state.trigger_30m.score())
-        + 0.05 * f64::from(state.trigger_15m.score());
+    let contextual = contextual_score(state);
     let Some(direction) = confirmed_trigger_direction(state) else {
         return contextual;
     };
@@ -697,6 +732,14 @@ fn technical_score(
     } else {
         direction * enter_threshold
     }
+}
+
+fn contextual_score(state: &TechnicalState) -> f64 {
+    0.40 * f64::from(state.regime_12h.direction)
+        + 0.25 * f64::from(state.trend_4h.score())
+        + 0.20 * f64::from(state.trend_1h.score())
+        + 0.10 * f64::from(state.trigger_30m.score())
+        + 0.05 * f64::from(state.trigger_15m.score())
 }
 
 fn confirmed_trigger_direction(state: &TechnicalState) -> Option<i8> {
@@ -1263,6 +1306,63 @@ mod tests {
             ),
         );
         engine
+    }
+
+    #[test]
+    fn feature_context_returns_none_until_all_context_is_ready() {
+        let mut engine = TechnicalEngine::new(TechnicalStrategyConfig::default()).unwrap();
+
+        assert_eq!(engine.feature_context("BTC").unwrap(), None);
+
+        assert_eq!(
+            engine
+                .accept_closed_candle(candle(CandleInterval::FifteenMinutes, 1, 100))
+                .unwrap(),
+            CandleAcceptance::Accepted
+        );
+        assert_eq!(engine.feature_context("BTC").unwrap(), None);
+    }
+
+    #[test]
+    fn feature_context_is_serializable_deterministic_and_read_only() {
+        let engine = range_engine(true);
+        let engine_before = serde_json::to_vec(&engine).unwrap();
+        let funnel_before = engine.funnel().clone();
+        let score_before = engine.assets.get("BTC").unwrap().current_score;
+
+        let first = engine
+            .feature_context("BTC")
+            .unwrap()
+            .expect("warmed indicators must expose feature context");
+        let second = engine
+            .feature_context("BTC")
+            .unwrap()
+            .expect("repeated read must expose the same feature context");
+
+        assert_eq!(first, second);
+        assert_eq!(first.archetype, SignalArchetype::RangeMeanReversion);
+        assert_eq!(
+            first.raw_contextual_score,
+            Decimal::from_f64_retain(0.10_f64 + 0.05).unwrap()
+        );
+        assert!(
+            first.raw_contextual_score
+                < Decimal::from_f64_retain(engine.configuration().enter_threshold).unwrap()
+        );
+        assert_eq!(first.atr_fraction, Decimal::from_f64_retain(0.04).unwrap());
+        assert_eq!(first.candle_close_ms, 22_000);
+        let serialized = serde_json::to_vec(&first).unwrap();
+        assert_eq!(
+            serde_json::from_slice::<TechnicalContext>(&serialized).unwrap(),
+            first
+        );
+
+        assert_eq!(serde_json::to_vec(&engine).unwrap(), engine_before);
+        assert_eq!(engine.funnel(), &funnel_before);
+        assert_eq!(
+            engine.assets.get("BTC").unwrap().current_score,
+            score_before
+        );
     }
 
     #[test]

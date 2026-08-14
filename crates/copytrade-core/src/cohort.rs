@@ -707,6 +707,11 @@ pub struct CohortSignalInput {
     pub aggregate: CohortAssetAggregate,
     pub filtered_wallet_consensus: Decimal,
     pub active_twap: Option<ActiveTwapContext>,
+    /// When set, market context is retained as diagnostics but cannot veto a
+    /// source-authoritative transition candidate. This is false by default so
+    /// older serialized inputs preserve the legacy admission behavior.
+    #[serde(default)]
+    pub defer_market_context_admission: bool,
     pub market_confirmation: Decimal,
     pub penalties: CohortPenalties,
     pub risk_flags: CohortRiskFlags,
@@ -960,7 +965,7 @@ impl VeryProfitableCohortEngine {
         let chase_distance_r = (proposed_direction != 0)
             .then_some(input.aggregate.observed_entry_opportunity)
             .flatten()
-            .filter(|_| input.r_unit > Decimal::ZERO)
+            .filter(|_| input.current_price > Decimal::ZERO && input.r_unit > Decimal::ZERO)
             .and_then(|opportunity| {
                 let distance = if proposed_direction > 0 {
                     input.current_price.checked_sub(opportunity)
@@ -992,14 +997,17 @@ impl VeryProfitableCohortEngine {
         if input.risk_flags.incomplete_authoritative_wallet_state {
             reasons.insert(CohortDecisionReason::IncompleteAuthoritativeWalletState);
         }
-        if proposed_direction != 0 && chase_distance_r.is_none() {
-            reasons.insert(CohortDecisionReason::MissingEntryOpportunity);
-        }
-        if chase_distance_r.is_some_and(|distance| distance > COHORT_CHASE_LIMIT_R) {
-            reasons.insert(CohortDecisionReason::ChaseLimit);
-        }
-        if input.risk_flags.stale_unrealized_profit_dominated || derived_stale_unrealized_profit {
-            reasons.insert(CohortDecisionReason::StaleUnrealizedProfit);
+        if !input.defer_market_context_admission {
+            if proposed_direction != 0 && chase_distance_r.is_none() {
+                reasons.insert(CohortDecisionReason::MissingEntryOpportunity);
+            }
+            if chase_distance_r.is_some_and(|distance| distance > COHORT_CHASE_LIMIT_R) {
+                reasons.insert(CohortDecisionReason::ChaseLimit);
+            }
+            if input.risk_flags.stale_unrealized_profit_dominated || derived_stale_unrealized_profit
+            {
+                reasons.insert(CohortDecisionReason::StaleUnrealizedProfit);
+            }
         }
         if input
             .active_twap
@@ -1013,7 +1021,7 @@ impl VeryProfitableCohortEngine {
         {
             reasons.insert(CohortDecisionReason::ShortCovering);
         }
-        if input.risk_flags.adverse_funding {
+        if !input.defer_market_context_admission && input.risk_flags.adverse_funding {
             reasons.insert(CohortDecisionReason::AdverseFunding);
         }
         if input.risk_flags.liquidation_cascade {
@@ -1031,7 +1039,9 @@ impl VeryProfitableCohortEngine {
         if input.risk_flags.original_filtered_wallets_closed {
             reasons.insert(CohortDecisionReason::OriginalFilteredWalletsClosed);
         }
-        if input.expected_move_fraction <= input.estimated_round_trip_cost_fraction {
+        if !input.defer_market_context_admission
+            && input.expected_move_fraction <= input.estimated_round_trip_cost_fraction
+        {
             reasons.insert(CohortDecisionReason::ExpectedMoveDoesNotCoverCosts);
         }
         let eligible = reasons.is_empty();
@@ -1190,8 +1200,11 @@ fn validate_signal_input(input: &CohortSignalInput) -> Result<(), CohortError> {
             .any(|penalty| !(Decimal::ZERO..=Decimal::ONE).contains(&penalty))
         || input.maximum_position_change_age_ms == 0
         || !(Decimal::ZERO..=Decimal::from(100)).contains(&input.dominant_wallet_limit_pct)
-        || input.current_price <= Decimal::ZERO
-        || input.r_unit <= Decimal::ZERO
+        || if input.defer_market_context_admission {
+            input.current_price < Decimal::ZERO || input.r_unit < Decimal::ZERO
+        } else {
+            input.current_price <= Decimal::ZERO || input.r_unit <= Decimal::ZERO
+        }
         || input.estimated_round_trip_cost_fraction < Decimal::ZERO
         || input.expected_move_fraction < Decimal::ZERO
         || !(Decimal::ZERO..=Decimal::ONE).contains(&input.source_budget_fraction)
@@ -1636,6 +1649,7 @@ mod tests {
                 progress: Decimal::new(2, 1),
                 nearly_completed: false,
             }),
+            defer_market_context_admission: false,
             market_confirmation: Decimal::new(8, 1),
             penalties: CohortPenalties::default(),
             risk_flags: CohortRiskFlags::default(),
@@ -1707,6 +1721,82 @@ mod tests {
         assert!(record
             .reasons
             .contains(&CohortDecisionReason::LiquidationCascade));
+    }
+
+    #[test]
+    fn deferred_market_context_cannot_veto_but_source_protections_remain() {
+        let base = ONE_HOUR_MS + 10;
+        let evaluate = |input: CohortSignalInput| {
+            let mut engine = VeryProfitableCohortEngine::default();
+            engine.evaluate(signal_input(base, 89, 11)).unwrap();
+            engine.evaluate(input).unwrap()
+        };
+        let adverse_input = || {
+            let mut input = signal_input(base + ONE_HOUR_MS, 90, 10);
+            input.current_price = Decimal::from(108);
+            input.aggregate.unrealized_profit_fraction = Decimal::new(1, 2);
+            input.risk_flags.adverse_funding = true;
+            input.estimated_round_trip_cost_fraction = Decimal::new(2, 3);
+            input.expected_move_fraction = Decimal::new(1, 3);
+            input
+        };
+
+        let legacy = evaluate(adverse_input());
+        assert_eq!(legacy.source_target, Decimal::ZERO);
+        for reason in [
+            CohortDecisionReason::ChaseLimit,
+            CohortDecisionReason::StaleUnrealizedProfit,
+            CohortDecisionReason::AdverseFunding,
+            CohortDecisionReason::ExpectedMoveDoesNotCoverCosts,
+        ] {
+            assert!(legacy.reasons.contains(&reason));
+        }
+
+        let mut deferred_input = adverse_input();
+        deferred_input.defer_market_context_admission = true;
+        let deferred = evaluate(deferred_input);
+        assert!(deferred.source_target > Decimal::ZERO);
+        assert_eq!(deferred.chase_distance_r, Some(Decimal::new(8, 1)));
+        assert!(deferred
+            .reasons
+            .contains(&CohortDecisionReason::EligibleLong));
+        for reason in [
+            CohortDecisionReason::MissingEntryOpportunity,
+            CohortDecisionReason::ChaseLimit,
+            CohortDecisionReason::StaleUnrealizedProfit,
+            CohortDecisionReason::AdverseFunding,
+            CohortDecisionReason::ExpectedMoveDoesNotCoverCosts,
+        ] {
+            assert!(!deferred.reasons.contains(&reason));
+        }
+
+        let mut missing_market_context = adverse_input();
+        missing_market_context.defer_market_context_admission = true;
+        missing_market_context.current_price = Decimal::ZERO;
+        missing_market_context.r_unit = Decimal::ZERO;
+        missing_market_context.aggregate.observed_entry_opportunity = None;
+        let missing_market_context = evaluate(missing_market_context);
+        assert!(missing_market_context.source_target > Decimal::ZERO);
+        assert_eq!(missing_market_context.chase_distance_r, None);
+
+        let mut protected_input = adverse_input();
+        protected_input.defer_market_context_admission = true;
+        protected_input.filtered_wallet_consensus = -Decimal::new(8, 1);
+        protected_input
+            .risk_flags
+            .incomplete_authoritative_wallet_state = true;
+        protected_input.position_change_age_ms = protected_input.maximum_position_change_age_ms + 1;
+        protected_input.aggregate.dominant_wallet_percentage = Decimal::from(90);
+        let protected = evaluate(protected_input);
+        assert_eq!(protected.source_target, Decimal::ZERO);
+        for reason in [
+            CohortDecisionReason::DirectionalDisagreement,
+            CohortDecisionReason::IncompleteAuthoritativeWalletState,
+            CohortDecisionReason::DominantWallet,
+            CohortDecisionReason::StalePositionChange,
+        ] {
+            assert!(protected.reasons.contains(&reason));
+        }
     }
 
     #[test]

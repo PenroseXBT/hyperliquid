@@ -4,6 +4,7 @@ pub mod cohort_layer;
 pub mod ingestion;
 pub mod ipc_client;
 pub mod live_shadow;
+pub mod mfce;
 pub mod production_state;
 pub mod profitability;
 pub mod public_mainnet;

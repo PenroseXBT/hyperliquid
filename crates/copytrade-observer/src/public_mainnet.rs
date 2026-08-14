@@ -35,6 +35,11 @@ pub struct PublicTransportPolicy {
     pub queue_delay_allowance_ms: u64,
     pub transport_p99_allowance_ms: u64,
     pub market_validity_ms: u64,
+    /// Additional builder-deployed perpetual DEXes whose markets are merged
+    /// into the default Hyperliquid perpetual universe. The empty/default DEX
+    /// is always queried and must not be listed here.
+    #[serde(default)]
+    pub perp_dexes: Vec<String>,
 }
 
 impl PublicTransportPolicy {
@@ -49,6 +54,16 @@ impl PublicTransportPolicy {
             || self.queue_delay_allowance_ms == 0
             || self.transport_p99_allowance_ms == 0
             || self.market_validity_ms == 0
+            || self.perp_dexes.len() > 4
+            || self.perp_dexes.iter().any(|dex| {
+                dex != "xyz"
+                    || dex.is_empty()
+                    || dex.len() > 32
+                    || !dex
+                        .bytes()
+                        .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit())
+            })
+            || self.perp_dexes.iter().collect::<BTreeSet<_>>().len() != self.perp_dexes.len()
         {
             return Err(PublicReadError::InvalidPolicy);
         }
@@ -122,6 +137,12 @@ struct PositionWire {
     unrealized_pnl: Option<String>,
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct UserFeesWire {
+    user_cross_rate: String,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MarketSnapshotResponse {
     pub mids: BTreeMap<String, Decimal>,
@@ -131,6 +152,10 @@ pub struct MarketSnapshotResponse {
 pub struct MarketMetadataResponse {
     pub universe: Vec<MarketMetadataAsset>,
     pub contexts: BTreeMap<String, MarketAssetContext>,
+    /// Current follower crossing/taker rate from the public `userFees` info
+    /// endpoint, converted from a unit fraction to basis points.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub live_taker_fee_bps: Option<Decimal>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -212,6 +237,8 @@ pub struct HyperliquidPublicTransport<C: Clock> {
     market_assets: Arc<Mutex<BTreeSet<String>>>,
     candidate_audit: Arc<Mutex<CandidateAuditSnapshot>>,
     technical_fetch: Arc<Mutex<TechnicalCandleFetchState>>,
+    fee_user: Arc<Mutex<Option<String>>>,
+    expanded_source_candidates: Arc<Mutex<BTreeSet<String>>>,
 }
 
 const TECHNICAL_UNIVERSE_LIMIT: usize = 25;
@@ -281,7 +308,36 @@ impl<C: Clock> HyperliquidPublicTransport<C> {
             market_assets: Arc::new(Mutex::new(BTreeSet::new())),
             candidate_audit: Arc::new(Mutex::new(BTreeMap::new())),
             technical_fetch: Arc::new(Mutex::new(TechnicalCandleFetchState::default())),
+            fee_user: Arc::new(Mutex::new(None)),
+            expanded_source_candidates: Arc::new(Mutex::new(BTreeSet::new())),
         })
+    }
+
+    /// Selects the already-bounded source cohort whose authoritative state is
+    /// read across the configured builder perpetual DEXes as one logical
+    /// snapshot. Other candidates retain default-perp polling.
+    pub fn set_expanded_source_candidates(
+        &self,
+        candidates: impl IntoIterator<Item = String>,
+    ) -> Result<(), PublicReadError> {
+        let mut validated = BTreeSet::new();
+        for candidate in candidates {
+            validate_candidate_address(&candidate).map_err(|_| PublicReadError::InvalidSubject)?;
+            validated.insert(candidate.to_ascii_lowercase());
+        }
+        *self
+            .expanded_source_candidates
+            .lock()
+            .expect("expanded source candidate mutex poisoned") = validated;
+        Ok(())
+    }
+
+    pub fn set_fee_user(&self, user: Option<&str>) -> Result<(), PublicReadError> {
+        if let Some(user) = user {
+            validate_candidate_address(user).map_err(|_| PublicReadError::InvalidSubject)?;
+        }
+        *self.fee_user.lock().expect("fee user mutex poisoned") = user.map(str::to_ascii_lowercase);
+        Ok(())
     }
 
     pub fn take_accepted(&self, request: &ScheduledReadRequest) -> Option<AcceptedPublicResponse> {
@@ -312,6 +368,73 @@ impl<C: Clock> HyperliquidPublicTransport<C> {
             .lock()
             .expect("candidate audit mutex poisoned")
             .clone()
+    }
+
+    async fn fetch_live_taker_fee_bps(&self, user: &str) -> Result<Decimal, ReadFailure> {
+        self.metrics.requests_started.fetch_add(1, Ordering::SeqCst);
+        let response = self
+            .client
+            .post(self.endpoint.clone())
+            .header(reqwest::header::CONTENT_TYPE, "application/json")
+            .header(
+                reqwest::header::USER_AGENT,
+                "copytrade-observer-mfce-fees/1",
+            )
+            .json(&json!({"type":"userFees","user":user}))
+            .send()
+            .await
+            .map_err(classify_transport_error)?;
+        if response.status() == StatusCode::TOO_MANY_REQUESTS {
+            self.metrics.rate_limited.fetch_add(1, Ordering::SeqCst);
+            return Err(ReadFailure::RateLimited {
+                retry_after_ms: retry_after_ms(response.headers()),
+            });
+        }
+        if response.status().is_server_error() {
+            return Err(ReadFailure::Server);
+        }
+        if !response.status().is_success()
+            || response
+                .content_length()
+                .is_some_and(|length| length > self.policy.maximum_response_bytes as u64)
+        {
+            return Err(ReadFailure::InvalidResponse);
+        }
+        let bytes = read_bounded(response, self.policy.maximum_response_bytes).await?;
+        parse_user_taker_fee_bps(&bytes).map_err(|_| ReadFailure::InvalidResponse)
+    }
+
+    async fn fetch_auxiliary_info(&self, body: &Value) -> Result<Vec<u8>, ReadFailure> {
+        self.metrics.requests_started.fetch_add(1, Ordering::SeqCst);
+        let response = self
+            .client
+            .post(self.endpoint.clone())
+            .header(reqwest::header::CONTENT_TYPE, "application/json")
+            .header(
+                reqwest::header::USER_AGENT,
+                "copytrade-observer-multi-perp/1",
+            )
+            .json(body)
+            .send()
+            .await
+            .map_err(classify_transport_error)?;
+        if response.status() == StatusCode::TOO_MANY_REQUESTS {
+            self.metrics.rate_limited.fetch_add(1, Ordering::SeqCst);
+            return Err(ReadFailure::RateLimited {
+                retry_after_ms: retry_after_ms(response.headers()),
+            });
+        }
+        if response.status().is_server_error() {
+            return Err(ReadFailure::Server);
+        }
+        if !response.status().is_success()
+            || response
+                .content_length()
+                .is_some_and(|length| length > self.policy.maximum_response_bytes as u64)
+        {
+            return Err(ReadFailure::InvalidResponse);
+        }
+        read_bounded(response, self.policy.maximum_response_bytes).await
     }
 
     /// Initializes a technical series from Hyperliquid's public candle snapshot
@@ -573,6 +696,71 @@ impl<C: Clock> HyperliquidPublicTransport<C> {
                     }
                     ReadFailure::InvalidResponse
                 })?;
+        match &mut payload {
+            PublicPayload::SourceState(state)
+                if self
+                    .expanded_source_candidates
+                    .lock()
+                    .expect("expanded source candidate mutex poisoned")
+                    .contains(&subject) =>
+            {
+                let assets = self
+                    .market_assets
+                    .lock()
+                    .expect("market asset mutex poisoned")
+                    .clone();
+                for dex in &self.policy.perp_dexes {
+                    let auxiliary = self
+                        .fetch_auxiliary_info(
+                            &json!({"type":"clearinghouseState","user":subject,"dex":dex}),
+                        )
+                        .await?;
+                    let additional =
+                        parse_source_state_with_metadata(&subject, &auxiliary, &assets)
+                            .map_err(|_| ReadFailure::InvalidResponse)?;
+                    merge_source_states(state, additional)?;
+                }
+            }
+            PublicPayload::MarketSnapshot(snapshot) => {
+                for dex in &self.policy.perp_dexes {
+                    let auxiliary = self
+                        .fetch_auxiliary_info(&json!({"type":"allMids","dex":dex}))
+                        .await?;
+                    let additional =
+                        parse_mids(&auxiliary).map_err(|_| ReadFailure::InvalidResponse)?;
+                    merge_market_snapshot(snapshot, additional)?;
+                }
+            }
+            PublicPayload::MarketMetadata(metadata) => {
+                for dex in &self.policy.perp_dexes {
+                    let auxiliary = self
+                        .fetch_auxiliary_info(&json!({"type":"metaAndAssetCtxs","dex":dex}))
+                        .await?;
+                    let (additional, _) = parse_metadata_with_technical_universe(&auxiliary)
+                        .map_err(|_| ReadFailure::InvalidResponse)?;
+                    merge_market_metadata(metadata, additional)?;
+                }
+                *self
+                    .market_assets
+                    .lock()
+                    .expect("market asset mutex poisoned") = metadata
+                    .universe
+                    .iter()
+                    .map(|asset| asset.name.clone())
+                    .collect();
+            }
+            _ => {}
+        }
+        if let PublicPayload::MarketMetadata(metadata) = &mut payload {
+            let fee_user = self
+                .fee_user
+                .lock()
+                .expect("fee user mutex poisoned")
+                .clone();
+            if let Some(fee_user) = fee_user {
+                metadata.live_taker_fee_bps = Some(self.fetch_live_taker_fee_bps(&fee_user).await?);
+            }
+        }
         if let PublicPayload::SourceState(state) = &payload {
             let maximum_age = self
                 .policy
@@ -993,6 +1181,26 @@ fn parse_source_state_with_metadata(
     })
 }
 
+fn merge_source_states(
+    aggregate: &mut SourceStateResponse,
+    additional: SourceStateResponse,
+) -> Result<(), ReadFailure> {
+    if aggregate.candidate_id != additional.candidate_id {
+        return Err(ReadFailure::InvalidResponse);
+    }
+    aggregate.account_value = aggregate
+        .account_value
+        .checked_add(additional.account_value)
+        .ok_or(ReadFailure::InvalidResponse)?;
+    aggregate.source_time_ms = aggregate.source_time_ms.min(additional.source_time_ms);
+    for (asset, position) in additional.positions {
+        if aggregate.positions.insert(asset, position).is_some() {
+            return Err(ReadFailure::InvalidResponse);
+        }
+    }
+    Ok(())
+}
+
 fn validate_candidate_address(candidate: &str) -> Result<(), IngestionFailure> {
     if candidate.len() == 42
         && candidate.starts_with("0x")
@@ -1047,6 +1255,54 @@ fn parse_mids(bytes: &[u8]) -> Result<MarketSnapshotResponse, PublicReadError> {
         return Err(PublicReadError::InvalidPayload);
     }
     Ok(MarketSnapshotResponse { mids })
+}
+
+fn merge_market_snapshot(
+    aggregate: &mut MarketSnapshotResponse,
+    additional: MarketSnapshotResponse,
+) -> Result<(), ReadFailure> {
+    for (asset, mid) in additional.mids {
+        if aggregate.mids.insert(asset, mid).is_some() {
+            return Err(ReadFailure::InvalidResponse);
+        }
+    }
+    Ok(())
+}
+
+fn merge_market_metadata(
+    aggregate: &mut MarketMetadataResponse,
+    additional: MarketMetadataResponse,
+) -> Result<(), ReadFailure> {
+    let mut names = aggregate
+        .universe
+        .iter()
+        .map(|asset| asset.name.as_str())
+        .collect::<BTreeSet<_>>();
+    if additional
+        .universe
+        .iter()
+        .any(|asset| !names.insert(asset.name.as_str()))
+    {
+        return Err(ReadFailure::InvalidResponse);
+    }
+    drop(names);
+    aggregate.universe.extend(additional.universe);
+    for (asset, context) in additional.contexts {
+        if aggregate.contexts.insert(asset, context).is_some() {
+            return Err(ReadFailure::InvalidResponse);
+        }
+    }
+    Ok(())
+}
+
+fn parse_user_taker_fee_bps(bytes: &[u8]) -> Result<Decimal, PublicReadError> {
+    let wire: UserFeesWire =
+        serde_json::from_slice(bytes).map_err(|_| PublicReadError::InvalidPayload)?;
+    Decimal::from_str(&wire.user_cross_rate)
+        .ok()
+        .and_then(|rate| rate.checked_mul(Decimal::from(10_000)))
+        .filter(|fee| *fee >= Decimal::ZERO && *fee <= Decimal::from(100))
+        .ok_or(PublicReadError::InvalidPayload)
 }
 
 #[cfg(test)]
@@ -1118,6 +1374,7 @@ fn parse_metadata_with_technical_universe(
         MarketMetadataResponse {
             universe: parsed,
             contexts,
+            live_taker_fee_bps: None,
         },
         technical_assets,
     ))
@@ -1255,6 +1512,7 @@ mod tests {
             queue_delay_allowance_ms: 5_000,
             transport_p99_allowance_ms: 10_000,
             market_validity_ms: 20_000,
+            perp_dexes: Vec::new(),
         }
     }
 
@@ -1269,6 +1527,16 @@ mod tests {
             validate_endpoint(&Url::parse("https://api.hyperliquid.xyz/exchange").unwrap())
                 .is_err()
         );
+    }
+
+    #[test]
+    fn live_user_cross_rate_is_parsed_as_bounded_taker_bps() {
+        assert_eq!(
+            parse_user_taker_fee_bps(br#"{"userCrossRate":"0.000315"}"#).unwrap(),
+            Decimal::new(315, 2)
+        );
+        assert!(parse_user_taker_fee_bps(br#"{"userCrossRate":"-0.1"}"#).is_err());
+        assert!(parse_user_taker_fee_bps(br#"{"userCrossRate":"nan"}"#).is_err());
     }
 
     #[test]
@@ -1303,6 +1571,52 @@ mod tests {
             Decimal::from(3)
         );
         assert!(parse_book("ETH", book).is_err());
+    }
+
+    #[test]
+    fn default_and_xyz_perpetual_surfaces_merge_without_collisions() {
+        let mut metadata = parse_metadata(
+            br#"[{"universe":[{"name":"BTC","szDecimals":5}]},[{"funding":"0.00001"}]]"#,
+        )
+        .unwrap();
+        let xyz = parse_metadata(
+            br#"[{"universe":[{"name":"xyz:SP500","szDecimals":2},{"name":"xyz:GOLD","szDecimals":3}]},[{"funding":"0.00002"},{"funding":"-0.00001"}]]"#,
+        )
+        .unwrap();
+        merge_market_metadata(&mut metadata, xyz).unwrap();
+        assert_eq!(metadata.universe.len(), 3);
+        assert!(metadata.contexts.contains_key("xyz:SP500"));
+
+        let mut mids = parse_mids(br#"{"BTC":"65000"}"#).unwrap();
+        merge_market_snapshot(
+            &mut mids,
+            parse_mids(br#"{"xyz:SP500":"6400","xyz:GOLD":"3400"}"#).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(mids.mids["xyz:GOLD"], Decimal::from(3_400));
+        assert!(
+            merge_market_snapshot(&mut mids, parse_mids(br#"{"BTC":"65001"}"#).unwrap()).is_err()
+        );
+    }
+
+    #[test]
+    fn multi_dex_source_states_merge_as_one_atomic_candidate_snapshot() {
+        let address = "0x1111111111111111111111111111111111111111";
+        let mut aggregate = parse_source_state(
+            address,
+            br#"{"marginSummary":{"accountValue":"100"},"assetPositions":[{"position":{"coin":"BTC","szi":"0.01","positionValue":"65"}}],"time":100}"#,
+        )
+        .unwrap();
+        let xyz = parse_source_state(
+            address,
+            br#"{"marginSummary":{"accountValue":"40"},"assetPositions":[{"position":{"coin":"xyz:SP500","szi":"0.02","positionValue":"128"}}],"time":95}"#,
+        )
+        .unwrap();
+        merge_source_states(&mut aggregate, xyz).unwrap();
+        assert_eq!(aggregate.account_value, Decimal::from(140));
+        assert_eq!(aggregate.source_time_ms, 95);
+        assert!(aggregate.positions.contains_key("BTC"));
+        assert!(aggregate.positions.contains_key("xyz:SP500"));
     }
 
     #[test]

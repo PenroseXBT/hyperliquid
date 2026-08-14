@@ -6,14 +6,16 @@ cd "$repository_root"
 
 mkdir -p target/hl1c
 
-cargo build --release -p copytrade-core -p copytrade-observer
-cargo test -p copytrade-core -p copytrade-observer
-cargo test --doc -p copytrade-observer
+cargo build --locked --release -p copytrade-core -p copytrade-observer
+cargo test --locked -p copytrade-core -p copytrade-observer
+cargo test --locked --doc -p copytrade-observer
 
-cargo tree -p copytrade-core --edges normal,build \
+cargo tree --locked -p copytrade-core --edges normal,build \
   > target/hl1c/core-dependencies.txt
-cargo tree -p copytrade-observer --edges normal,build \
+cargo tree --locked -p copytrade-observer --edges normal,build \
   > target/hl1c/observer-dependencies.txt
+cargo tree --locked -p copytrade-signer --edges normal,build \
+  > target/hl1c/signer-dependencies.txt
 
 while IFS= read -r package; do
   [[ -z "$package" || "$package" == \#* ]] && continue
@@ -25,12 +27,23 @@ while IFS= read -r package; do
   fi
 
   reverse_report="target/hl1c/reverse-${package}.txt"
-  cargo tree -p copytrade-observer -i "$package" >"$reverse_report" 2>&1 || true
+  cargo tree --locked -p copytrade-observer -i "$package" >"$reverse_report" 2>&1 || true
   if grep -F "copytrade-observer v" "$reverse_report" >/dev/null; then
     echo "forbidden reverse dependency reaches observer: $package" >&2
     exit 1
   fi
 done < policy/hl1c-forbidden-packages.txt
+
+# MFCE owns native model execution in the observer only. The signer depends on
+# core, so this closure check also prevents LightGBM from entering core and
+# crossing the signing boundary transitively.
+for package in copytrade-mfce lightgbm3 lightgbm3-sys; do
+  if sed -E 's/^[^[:alnum:]_]+//' target/hl1c/signer-dependencies.txt \
+    | awk '{print $1}' | grep -F -x "$package" >/dev/null; then
+    echo "observer-only model package present in signer dependency closure: $package" >&2
+    exit 1
+  fi
+done
 
 while IFS= read -r symbol; do
   [[ -z "$symbol" || "$symbol" == \#* ]] && continue

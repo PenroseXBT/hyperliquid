@@ -1,5 +1,6 @@
 //! Durable observer-side production state and idempotent signer-event application.
 
+use crate::mfce::MfcePersistentState;
 use copytrade_core::decision::PlannedCloid;
 use copytrade_core::ipc::{
     canonical_payload_hash, VerifiedReconciliationEvent, VerifiedReconciliationPayload,
@@ -13,7 +14,8 @@ use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 
-const PRODUCTION_STATE_SCHEMA_VERSION: u32 = 1;
+const LEGACY_PRODUCTION_STATE_SCHEMA_VERSION: u32 = 1;
+const PRODUCTION_STATE_SCHEMA_VERSION: u32 = 2;
 const MAXIMUM_REORDER_WINDOW: usize = 256;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -38,6 +40,13 @@ pub enum ObserverIntentState {
 pub struct ProductionTradingState {
     schema_version: u32,
     pub live: LiveTradingState,
+    /// Observer-only MFCE samples and model strings. The default preserves
+    /// compatibility with production-state schema v1 files written before
+    /// MFCE1 was embedded.
+    #[serde(default)]
+    pub mfce: MfcePersistentState,
+    #[serde(default)]
+    pub mfce_time_high_watermark: u64,
     pub intents: BTreeMap<PlannedCloid, ObserverIntentState>,
     pub highest_contiguous_signer_sequence: u64,
     applied_event_hashes: BTreeMap<u64, [u8; 32]>,
@@ -79,6 +88,8 @@ impl ProductionTradingState {
         Self {
             schema_version: PRODUCTION_STATE_SCHEMA_VERSION,
             live,
+            mfce: MfcePersistentState::default(),
+            mfce_time_high_watermark: 0,
             intents: BTreeMap::new(),
             highest_contiguous_signer_sequence: 0,
             applied_event_hashes: BTreeMap::new(),
@@ -91,6 +102,7 @@ impl ProductionTradingState {
     }
 
     pub fn save_atomic(&self, path: impl AsRef<Path>) -> Result<(), ReconciliationApplyError> {
+        self.validate()?;
         let path = path.as_ref();
         let parent = path.parent().ok_or_else(|| {
             ReconciliationApplyError::Persistence("production state path has no parent".into())
@@ -118,22 +130,55 @@ impl ProductionTradingState {
     }
 
     pub fn load(path: impl AsRef<Path>) -> Result<Self, ReconciliationApplyError> {
-        let state: Self = serde_json::from_slice(
-            &std::fs::read(path)
-                .map_err(|error| ReconciliationApplyError::Persistence(error.to_string()))?,
-        )
-        .map_err(|error| ReconciliationApplyError::Persistence(error.to_string()))?;
-        if state.schema_version != PRODUCTION_STATE_SCHEMA_VERSION
-            || state.reorder_buffer.len() > MAXIMUM_REORDER_WINDOW
-            || state
+        let bytes = std::fs::read(path)
+            .map_err(|error| ReconciliationApplyError::Persistence(error.to_string()))?;
+        let encoded: serde_json::Value = serde_json::from_slice(&bytes)
+            .map_err(|error| ReconciliationApplyError::Persistence(error.to_string()))?;
+        let encoded_schema = encoded
+            .get("schema_version")
+            .and_then(serde_json::Value::as_u64)
+            .and_then(|version| u32::try_from(version).ok())
+            .ok_or(ReconciliationApplyError::SchemaMismatch)?;
+        if encoded_schema == PRODUCTION_STATE_SCHEMA_VERSION
+            && (encoded.get("mfce").is_none() || encoded.get("mfce_time_high_watermark").is_none())
+        {
+            // Defaults exist only so schema v1 can be decoded. Once a writer
+            // advertises v2, omitting either MFCE field is corruption rather
+            // than a request to reset durable training state.
+            return Err(ReconciliationApplyError::SchemaMismatch);
+        }
+        let mut state: Self = serde_json::from_value(encoded)
+            .map_err(|error| ReconciliationApplyError::Persistence(error.to_string()))?;
+        match state.schema_version {
+            LEGACY_PRODUCTION_STATE_SCHEMA_VERSION => {
+                // Schema v1 predates MFCE. Ignore any unknown fields a
+                // noncanonical v1 writer may have supplied and migrate to the
+                // bounded empty engine state.
+                state.schema_version = PRODUCTION_STATE_SCHEMA_VERSION;
+                state.mfce = MfcePersistentState::default();
+                state.mfce_time_high_watermark = 0;
+            }
+            PRODUCTION_STATE_SCHEMA_VERSION => {}
+            _ => return Err(ReconciliationApplyError::SchemaMismatch),
+        }
+        state.validate()?;
+        Ok(state)
+    }
+
+    fn validate(&self) -> Result<(), ReconciliationApplyError> {
+        if self.schema_version != PRODUCTION_STATE_SCHEMA_VERSION
+            || self.mfce.validate().is_err()
+            || self.mfce_time_high_watermark < self.mfce.time_high_watermark()
+            || self.reorder_buffer.len() > MAXIMUM_REORDER_WINDOW
+            || self
                 .applied_event_hashes
                 .keys()
                 .next_back()
-                .is_some_and(|sequence| *sequence != state.highest_contiguous_signer_sequence)
+                .is_some_and(|sequence| *sequence != self.highest_contiguous_signer_sequence)
         {
             return Err(ReconciliationApplyError::SchemaMismatch);
         }
-        Ok(state)
+        Ok(())
     }
 }
 
@@ -316,6 +361,17 @@ mod tests {
         ExchangeFillIdentity, ExchangeOrderId, ExchangeTradeId, FundingEventId,
         LiquidityClassification, VerifiedExchangeFill, VerifiedFundingEvent,
     };
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static TEMPORARY_STATE_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+
+    fn temporary_state_path(name: &str) -> std::path::PathBuf {
+        std::env::temp_dir().join(format!(
+            "copytrade-production-state-{name}-{}-{}.json",
+            std::process::id(),
+            TEMPORARY_STATE_SEQUENCE.fetch_add(1, Ordering::Relaxed)
+        ))
+    }
 
     fn event(sequence: u64, payload: VerifiedReconciliationPayload) -> VerifiedReconciliationEvent {
         VerifiedReconciliationEvent {
@@ -420,5 +476,62 @@ mod tests {
         );
         apply_reconciliation_event(&mut state, first).unwrap();
         assert_eq!(state.highest_contiguous_signer_sequence, 2);
+    }
+
+    #[test]
+    fn mfce_state_round_trips_atomically_and_legacy_v1_defaults() {
+        let path = temporary_state_path("mfce-round-trip");
+        let mut state =
+            ProductionTradingState::new(LiveTradingState::new(Decimal::from(100), 0).unwrap());
+        state.mfce.source_epoch = 41;
+        state.mfce_time_high_watermark = 92_000;
+        state.save_atomic(&path).unwrap();
+        let committed = std::fs::read(&path).unwrap();
+
+        let restored = ProductionTradingState::load(&path).unwrap();
+        assert_eq!(restored.mfce, state.mfce);
+        assert_eq!(restored.mfce_time_high_watermark, 92_000);
+
+        let mut invalid = state.clone();
+        invalid.mfce.schema_version = u32::MAX;
+        assert_eq!(
+            invalid.save_atomic(&path),
+            Err(ReconciliationApplyError::SchemaMismatch)
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), committed);
+
+        let mut corrupt = serde_json::from_slice::<serde_json::Value>(&committed).unwrap();
+        corrupt["mfce"]["schema_version"] = serde_json::json!(u32::MAX);
+        std::fs::write(&path, serde_json::to_vec(&corrupt).unwrap()).unwrap();
+        assert_eq!(
+            ProductionTradingState::load(&path),
+            Err(ReconciliationApplyError::SchemaMismatch)
+        );
+
+        let mut incomplete_v2 = serde_json::from_slice::<serde_json::Value>(&committed).unwrap();
+        incomplete_v2.as_object_mut().unwrap().remove("mfce");
+        std::fs::write(&path, serde_json::to_vec(&incomplete_v2).unwrap()).unwrap();
+        assert_eq!(
+            ProductionTradingState::load(&path),
+            Err(ReconciliationApplyError::SchemaMismatch)
+        );
+
+        let mut legacy = serde_json::to_value(&state).unwrap();
+        {
+            let legacy_object = legacy.as_object_mut().unwrap();
+            legacy_object.insert(
+                "schema_version".into(),
+                serde_json::json!(LEGACY_PRODUCTION_STATE_SCHEMA_VERSION),
+            );
+            legacy_object.remove("mfce");
+            legacy_object.remove("mfce_time_high_watermark");
+        }
+        std::fs::write(&path, serde_json::to_vec(&legacy).unwrap()).unwrap();
+        let migrated = ProductionTradingState::load(&path).unwrap();
+        assert_eq!(migrated.mfce, MfcePersistentState::default());
+        assert_eq!(migrated.mfce_time_high_watermark, 0);
+        assert_eq!(migrated.schema_version, PRODUCTION_STATE_SCHEMA_VERSION);
+
+        std::fs::remove_file(&path).unwrap();
     }
 }

@@ -6,5 +6,6 @@
   "inactive_source_interval_ms": 60000,
   "queue_delay_allowance_ms": 5000,
   "transport_p99_allowance_ms": 10000,
-  "market_validity_ms": 40000
+  "market_validity_ms": 40000,
+  "perp_dexes": ["xyz"]
 }

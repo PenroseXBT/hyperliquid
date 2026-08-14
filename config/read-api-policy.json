@@ -1,8 +1,8 @@
 {
   "api": {
     "total_weight_per_window": 1200,
-    "reserved_weight_per_window": 360,
-    "source_polling_weight_per_window": 750,
+    "reserved_weight_per_window": 120,
+    "source_polling_weight_per_window": 920,
     "window_ms": 60000,
     "max_concurrency": 8,
     "queue_capacity": 256,
@@ -12,8 +12,8 @@
     },
     "endpoint_weights": {
       "source_state": 2,
-      "market_mids": 2,
-      "exchange_metadata": 20,
+      "market_mids": 4,
+      "exchange_metadata": 42,
       "order_book": 2,
       "follower_state": 2,
       "follower_open_orders": 20

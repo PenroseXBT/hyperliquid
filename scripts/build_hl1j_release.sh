@@ -5,8 +5,9 @@ repository_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$repository_root"
 
 mkdir -p target/hl1j
+cp THIRD_PARTY_NOTICES.md target/hl1j/THIRD_PARTY_NOTICES.md
 bash scripts/check_hl1i_qualification.sh
-cargo build --release -p copytrade-observer
+cargo build --locked --release -p copytrade-observer
 
 printf '%s\n' \
   'format=hl1j-test-report-v1' \
@@ -21,7 +22,7 @@ if [[ -n "$(git status --porcelain)" ]]; then
   git_tree_state="dirty"
 fi
 source_tree_sha256="$({
-  find Cargo.toml Cargo.lock crates config policy scripts .github fixtures -type f -print
+  find Cargo.toml Cargo.lock README.md THIRD_PARTY_NOTICES.md Dockerfile.railway .dockerignore crates config policy scripts .github fixtures -type f -print
 } | LC_ALL=C sort | while IFS= read -r file; do
   shasum -a 256 "$file"
 done | shasum -a 256 | awk '{print $1}')"

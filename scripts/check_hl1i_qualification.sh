@@ -5,8 +5,8 @@ repository_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$repository_root"
 
 cargo fmt --all -- --check
-cargo test --workspace
-cargo check --workspace
+cargo test --locked --workspace
+cargo check --locked --workspace
 bash scripts/check_hl1c_isolation.sh
 
 if rg -n \

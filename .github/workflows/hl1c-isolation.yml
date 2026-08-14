@@ -11,6 +11,6 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - name: Install artifact inspection tools
-        run: sudo apt-get update && sudo apt-get install -y binutils ripgrep
+        run: sudo apt-get update && sudo apt-get install -y binutils build-essential clang cmake libclang-dev ripgrep
       - name: Verify signer-free dependency and release boundary
         run: bash scripts/check_hl1i_qualification.sh

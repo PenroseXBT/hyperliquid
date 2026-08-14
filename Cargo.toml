@@ -8,12 +8,14 @@ default-run = "hyperliquid"
 members = [
     ".",
     "crates/copytrade-core",
+    "crates/copytrade-mfce",
     "crates/copytrade-observer",
     "crates/copytrade-signer",
 ]
 default-members = [
     ".",
     "crates/copytrade-core",
+    "crates/copytrade-mfce",
     "crates/copytrade-observer",
     "crates/copytrade-signer",
 ]
