@@ -563,7 +563,15 @@ impl<C: Clock> HyperliquidPublicTransport<C> {
         request: &ScheduledReadRequest,
     ) -> Result<AcceptedPublicResponse, ReadFailure> {
         let (subject, body) = modeled_body(request)?;
-        if request.kind == ReadRequestKind::SourceState {
+        let expanded_source = self
+            .expanded_source_candidates
+            .lock()
+            .expect("expanded source candidate mutex poisoned")
+            .contains(&subject);
+        if request.kind == ReadRequestKind::ExpandedSourceState && !expanded_source {
+            return Err(ReadFailure::InvalidResponse);
+        }
+        if request.kind.is_source_state() {
             validate_candidate_address(&subject).map_err(|failure| {
                 self.record_candidate_failure(request, &subject, failure);
                 ReadFailure::InvalidResponse
@@ -580,7 +588,7 @@ impl<C: Clock> HyperliquidPublicTransport<C> {
             .send()
             .await
             .map_err(|error| {
-                if request.kind == ReadRequestKind::SourceState {
+                if request.kind.is_source_state() {
                     self.record_candidate_failure(
                         request,
                         &subject,
@@ -593,14 +601,14 @@ impl<C: Clock> HyperliquidPublicTransport<C> {
                 }
                 classify_transport_error(error)
             })?;
-        if request.kind == ReadRequestKind::SourceState {
+        if request.kind.is_source_state() {
             self.with_candidate_audit(request, &subject, |audit| {
                 audit.record_http(response.status().as_u16())
             });
         }
         if response.status() == StatusCode::TOO_MANY_REQUESTS {
             self.metrics.rate_limited.fetch_add(1, Ordering::SeqCst);
-            if request.kind == ReadRequestKind::SourceState {
+            if request.kind.is_source_state() {
                 self.record_candidate_failure(
                     request,
                     &subject,
@@ -616,7 +624,7 @@ impl<C: Clock> HyperliquidPublicTransport<C> {
             });
         }
         if response.status().is_server_error() {
-            if request.kind == ReadRequestKind::SourceState {
+            if request.kind.is_source_state() {
                 self.record_candidate_failure(
                     request,
                     &subject,
@@ -630,7 +638,7 @@ impl<C: Clock> HyperliquidPublicTransport<C> {
             return Err(ReadFailure::Server);
         }
         if !response.status().is_success() {
-            if request.kind == ReadRequestKind::SourceState {
+            if request.kind.is_source_state() {
                 let classification = if response.status() == StatusCode::NOT_FOUND {
                     IngestionFailureClassification::AccountGenuinelyAbsent
                 } else {
@@ -652,7 +660,7 @@ impl<C: Clock> HyperliquidPublicTransport<C> {
             .content_length()
             .is_some_and(|length| length > self.policy.maximum_response_bytes as u64)
         {
-            if request.kind == ReadRequestKind::SourceState {
+            if request.kind.is_source_state() {
                 self.record_candidate_failure(
                     request,
                     &subject,
@@ -668,7 +676,7 @@ impl<C: Clock> HyperliquidPublicTransport<C> {
         let bytes = read_bounded(response, self.policy.maximum_response_bytes)
             .await
             .map_err(|error| {
-                if request.kind == ReadRequestKind::SourceState {
+                if request.kind.is_source_state() {
                     self.record_candidate_failure(
                         request,
                         &subject,
@@ -681,7 +689,7 @@ impl<C: Clock> HyperliquidPublicTransport<C> {
                 }
                 error
             })?;
-        if request.kind == ReadRequestKind::SourceState {
+        if request.kind.is_source_state() {
             let hash = hash_payload_bytes(&bytes);
             self.with_candidate_audit(request, &subject, |audit| audit.record_payload(hash));
         }
@@ -691,18 +699,14 @@ impl<C: Clock> HyperliquidPublicTransport<C> {
                     self.metrics
                         .invalid_responses
                         .fetch_add(1, Ordering::SeqCst);
-                    if request.kind == ReadRequestKind::SourceState {
+                    if request.kind.is_source_state() {
                         self.record_candidate_failure(request, &subject, failure);
                     }
                     ReadFailure::InvalidResponse
                 })?;
         match &mut payload {
             PublicPayload::SourceState(state)
-                if self
-                    .expanded_source_candidates
-                    .lock()
-                    .expect("expanded source candidate mutex poisoned")
-                    .contains(&subject) =>
+                if request.kind == ReadRequestKind::ExpandedSourceState && expanded_source =>
             {
                 let assets = self
                     .market_assets
@@ -785,7 +789,7 @@ impl<C: Clock> HyperliquidPublicTransport<C> {
         }
         let received_at_mono = self.clock.now_ms();
         let validity = match request.kind {
-            ReadRequestKind::SourceState => self
+            ReadRequestKind::SourceState | ReadRequestKind::ExpandedSourceState => self
                 .policy
                 .source_deadline_ms(request.source_tier.ok_or(ReadFailure::InvalidResponse)?)
                 .ok_or(ReadFailure::InvalidResponse)?,
@@ -794,7 +798,7 @@ impl<C: Clock> HyperliquidPublicTransport<C> {
         let valid_until_mono = received_at_mono
             .checked_add(validity)
             .ok_or(ReadFailure::InvalidResponse)?;
-        if request.kind == ReadRequestKind::SourceState {
+        if request.kind.is_source_state() {
             let (account_value, position_count) = match &payload {
                 PublicPayload::SourceState(state) => (state.account_value, state.positions.len()),
                 _ => return Err(ReadFailure::InvalidResponse),
@@ -821,7 +825,7 @@ impl<C: Clock> HyperliquidPublicTransport<C> {
         bytes: &[u8],
     ) -> Result<PublicPayload, IngestionFailure> {
         match kind {
-            ReadRequestKind::SourceState => {
+            ReadRequestKind::SourceState | ReadRequestKind::ExpandedSourceState => {
                 let assets = self
                     .market_assets
                     .lock()
@@ -1033,7 +1037,10 @@ fn validate_endpoint(endpoint: &Url) -> Result<(), PublicReadError> {
 
 fn modeled_body(request: &ScheduledReadRequest) -> Result<(String, Value), ReadFailure> {
     match (&request.kind, &request.key.subject) {
-        (ReadRequestKind::SourceState, RequestSubject::Candidate(candidate)) => Ok((
+        (
+            ReadRequestKind::SourceState | ReadRequestKind::ExpandedSourceState,
+            RequestSubject::Candidate(candidate),
+        ) => Ok((
             candidate.clone(),
             json!({"type":"clearinghouseState","user":candidate}),
         )),

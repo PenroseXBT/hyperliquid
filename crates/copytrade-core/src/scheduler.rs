@@ -18,6 +18,7 @@ pub type CandidateId = String;
 #[serde(rename_all = "snake_case")]
 pub enum ReadRequestKind {
     SourceState,
+    ExpandedSourceState,
     MarketMids,
     ExchangeMetadata,
     OrderBook,
@@ -26,8 +27,9 @@ pub enum ReadRequestKind {
 }
 
 impl ReadRequestKind {
-    pub const REQUIRED: [Self; 6] = [
+    pub const REQUIRED: [Self; 7] = [
         Self::SourceState,
+        Self::ExpandedSourceState,
         Self::MarketMids,
         Self::ExchangeMetadata,
         Self::OrderBook,
@@ -39,10 +41,15 @@ impl ReadRequestKind {
         matches!(self, Self::FollowerState | Self::FollowerOpenOrders)
     }
 
+    pub fn is_source_state(self) -> bool {
+        matches!(self, Self::SourceState | Self::ExpandedSourceState)
+    }
+
     fn is_replaceable_refresh(self) -> bool {
         matches!(
             self,
             Self::SourceState
+                | Self::ExpandedSourceState
                 | Self::MarketMids
                 | Self::ExchangeMetadata
                 | Self::OrderBook
@@ -215,9 +222,7 @@ impl ReadApiPolicy {
                 key.kind
             )));
         }
-        if (key.kind == ReadRequestKind::SourceState)
-            != (budget_class == BudgetClass::SourcePolling)
-        {
+        if key.kind.is_source_state() != (budget_class == BudgetClass::SourcePolling) {
             return Err(PolicyError(
                 "source_state requires the source polling budget class".to_string(),
             ));
@@ -230,7 +235,7 @@ impl ReadApiPolicy {
             RequestSubject::Candidate(candidate) => Some(candidate.clone()),
             RequestSubject::Follower(_) | RequestSubject::Asset(_) | RequestSubject::Market => None,
         };
-        if (key.kind == ReadRequestKind::SourceState) != source_tier.is_some() {
+        if key.kind.is_source_state() != source_tier.is_some() {
             return Err(PolicyError(
                 "source_state requires exactly one source tier".to_string(),
             ));
@@ -925,7 +930,7 @@ impl<C: Clock> RequestScheduler<C> {
             || request.expires_at <= request.created_at
             || (request.budget_class == BudgetClass::Critical
                 && !request.kind.permits_reserved_budget())
-            || ((request.kind == ReadRequestKind::SourceState)
+            || (request.kind.is_source_state()
                 != (request.budget_class == BudgetClass::SourcePolling))
             || request.candidate_id
                 != match &request.key.subject {
@@ -934,7 +939,7 @@ impl<C: Clock> RequestScheduler<C> {
                     | RequestSubject::Asset(_)
                     | RequestSubject::Market => None,
                 }
-            || (request.kind == ReadRequestKind::SourceState) != request.source_tier.is_some()
+            || request.kind.is_source_state() != request.source_tier.is_some()
         {
             return Some(ScheduleOutcome::RejectedInvalid);
         }

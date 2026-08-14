@@ -675,11 +675,16 @@ pub async fn run_qualification(options: QualificationOptions) -> Result<PathBuf,
                     SourceTier::Active => source_dispatch_plan.active_cadence_ms,
                     SourceTier::Inactive => source_dispatch_plan.inactive_cadence_ms,
                 };
-                enqueue_weighted(
+                let source_kind = if expanded_source_candidates.contains(&id) {
+                    ReadRequestKind::ExpandedSourceState
+                } else {
+                    ReadRequestKind::SourceState
+                };
+                enqueue(
                     &scheduler,
                     &scheduler_config,
                     RequestSubject::Candidate(id.clone()),
-                    ReadRequestKind::SourceState,
+                    source_kind,
                     // Source cadence is the qualification invariant. Public order-book
                     // enrichment may use only the normal-budget capacity left after it.
                     RequestPriority::High,
@@ -687,11 +692,6 @@ pub async fn run_qualification(options: QualificationOptions) -> Result<PathBuf,
                     now,
                     config.global_risk.source_snapshot_max_age_ms,
                     &mut counters,
-                    expanded_source_candidates.contains(&id).then_some(
-                        scheduler_config.api.endpoint_weights[&ReadRequestKind::SourceState]
-                            .checked_mul(u32::try_from(transport_policy.perp_dexes.len() + 1)?)
-                            .ok_or("expanded source request weight overflow")?,
-                    ),
                 )?;
                 scheduled.insert(id.clone());
                 let previous_due = source_due[&id];
@@ -1642,6 +1642,20 @@ fn derive_source_dispatch_plan_with_expansion(
     if source_state_weight == 0 {
         return Err("source-state endpoint weight must be positive".into());
     }
+    let expanded_source_state_weight = scheduler
+        .api
+        .endpoint_weights
+        .get(&ReadRequestKind::ExpandedSourceState)
+        .copied()
+        .ok_or("expanded source-state endpoint weight missing")?;
+    if expanded_candidate_count > 0
+        && expanded_source_state_weight
+            != source_state_weight
+                .checked_mul(u32::try_from(additional_perp_dex_count + 1)?)
+                .ok_or("expanded source-state weight overflow")?
+    {
+        return Err("expanded source-state weight does not match physical DEX calls".into());
+    }
     let source_call_capacity_per_window =
         u64::from(scheduler.api.source_polling_weight_per_window / source_state_weight);
     let active_dispatch_target = u64::from(
@@ -1662,9 +1676,19 @@ fn derive_source_dispatch_plan_with_expansion(
         .checked_mul(u64::try_from(additional_perp_dex_count)?)
         .and_then(|value| value.checked_mul(inactive_dispatches_per_candidate))
         .ok_or("expanded source demand overflow")?;
-    let base_weight = base_inactive_dispatches
-        .checked_add(expansion_calls)
-        .and_then(|calls| calls.checked_mul(u64::from(source_state_weight)))
+    let standard_dispatches = u64::try_from(candidate_count - expanded_candidate_count)?
+        .checked_mul(inactive_dispatches_per_candidate)
+        .ok_or("standard source demand overflow")?;
+    let expanded_dispatches = u64::try_from(expanded_candidate_count)?
+        .checked_mul(inactive_dispatches_per_candidate)
+        .ok_or("expanded source demand overflow")?;
+    let base_weight = standard_dispatches
+        .checked_mul(u64::from(source_state_weight))
+        .and_then(|weight| {
+            expanded_dispatches
+                .checked_mul(u64::from(expanded_source_state_weight))?
+                .checked_add(weight)
+        })
         .ok_or("expanded source weight overflow")?;
     if base_weight > u64::from(scheduler.api.source_polling_weight_per_window) {
         return Err(format!(
@@ -1998,37 +2022,10 @@ fn enqueue<C: Clock>(
     lifetime: u64,
     counters: &mut Counters,
 ) -> Result<(), Box<dyn Error>> {
-    enqueue_weighted(
-        scheduler,
-        config,
-        subject,
-        kind,
-        priority,
-        source_tier,
-        now,
-        lifetime,
-        counters,
-        None,
-    )
-}
-
-#[allow(clippy::too_many_arguments)]
-fn enqueue_weighted<C: Clock>(
-    scheduler: &RequestScheduler<C>,
-    config: &ReadOnlySchedulerConfig,
-    subject: RequestSubject,
-    kind: ReadRequestKind,
-    priority: RequestPriority,
-    source_tier: Option<SourceTier>,
-    now: u64,
-    lifetime: u64,
-    counters: &mut Counters,
-    weight_override: Option<u32>,
-) -> Result<(), Box<dyn Error>> {
-    let mut request = config.api.request(
+    let request = config.api.request(
         RequestKey { subject, kind },
         priority,
-        if kind == ReadRequestKind::SourceState {
+        if kind.is_source_state() {
             BudgetClass::SourcePolling
         } else {
             BudgetClass::Normal
@@ -2039,12 +2036,6 @@ fn enqueue_weighted<C: Clock>(
         now.checked_add(lifetime).ok_or("expiry overflow")?,
         0,
     )?;
-    if let Some(weight) = weight_override {
-        if weight == 0 {
-            return Err("request weight override must be positive".into());
-        }
-        request.weight = weight;
-    }
     match scheduler.schedule(request) {
         ScheduleOutcome::Enqueued
         | ScheduleOutcome::ReplacedOlder
@@ -2449,6 +2440,7 @@ fn evaluate_transport_gate(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use copytrade_core::scheduler::ManualClock;
 
     fn source_policies() -> (ReadOnlySchedulerConfig, PublicTransportPolicy) {
         let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
@@ -2646,6 +2638,33 @@ mod tests {
         assert_eq!(plan.active_candidate_count, 0);
         assert_eq!(plan.inactive_candidate_count, 375);
         assert_eq!(plan.combined_dispatches_per_window, 375);
+        let request = scheduler
+            .api
+            .request(
+                RequestKey {
+                    subject: RequestSubject::Candidate("expanded".into()),
+                    kind: ReadRequestKind::ExpandedSourceState,
+                },
+                RequestPriority::High,
+                BudgetClass::SourcePolling,
+                Some(SourceTier::Inactive),
+                0,
+                0,
+                75_000,
+                0,
+            )
+            .unwrap();
+        assert_eq!(request.weight, 4);
+        let request_scheduler = RequestScheduler::new(
+            ManualClock::new(0),
+            scheduler.api.clone(),
+            scheduler.retry.clone(),
+        )
+        .unwrap();
+        assert_eq!(
+            request_scheduler.schedule(request),
+            ScheduleOutcome::Enqueued
+        );
         assert!(derive_source_dispatch_plan_with_expansion(
             375,
             86,
