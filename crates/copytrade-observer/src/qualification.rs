@@ -275,8 +275,11 @@ struct ContinuousStatus<'a> {
     mfce_active_transitions: usize,
     mfce_awaiting_live_books: usize,
     mfce_model_epoch: Option<u64>,
-    source_risk_increases_admitted: u64,
-    source_risk_increases_rejected_below_edge: u64,
+    mfce_policy_exploit: u64,
+    mfce_policy_explore: u64,
+    mfce_policy_reject: u64,
+    source_risk_increases_allocated: u64,
+    source_risk_increases_rejected_by_mfce: u64,
     mfce: crate::mfce::MfceReport,
     economics: Vec<RollingEconomicStatus>,
 }
@@ -1277,7 +1280,6 @@ fn write_continuous_status(
     never_refreshed_candidate_count: u64,
 ) -> Result<(), Box<dyn Error>> {
     let mfce = engine.mfce_report();
-    let density = engine.executable_density_summary()?;
     let unresolved_roots = engine.unresolved_actionable_root_count();
     let economics = [
         ("since_process_start", start),
@@ -1288,6 +1290,21 @@ fn write_continuous_status(
     .into_iter()
     .map(|(horizon, cutoff)| runtime_economic_status(horizon, cutoff, config, engine))
     .collect::<Result<Vec<_>, _>>()?;
+    let mfce_policy_exploit = mfce
+        .policy_outputs
+        .iter()
+        .filter(|output| output.policy_state == crate::mfce::MfcePolicyState::Exploit)
+        .count() as u64;
+    let mfce_policy_explore = mfce
+        .policy_outputs
+        .iter()
+        .filter(|output| output.policy_state == crate::mfce::MfcePolicyState::Explore)
+        .count() as u64;
+    let mfce_policy_reject = mfce
+        .policy_outputs
+        .iter()
+        .filter(|output| output.policy_state == crate::mfce::MfcePolicyState::Reject)
+        .count() as u64;
     let metrics = engine.metrics();
     let status = ContinuousStatus {
         mode: "continuous_unsigned_planned_only",
@@ -1317,9 +1334,15 @@ fn write_continuous_status(
         mfce_active_transitions: mfce.active_transitions,
         mfce_awaiting_live_books: mfce.awaiting_live_books,
         mfce_model_epoch: mfce.incumbent_epoch,
-        source_risk_increases_admitted: density.admitted_new_positions,
-        source_risk_increases_rejected_below_edge: density
-            .source_risk_increases_suppressed_below_cost_edge,
+        mfce_policy_exploit,
+        mfce_policy_explore,
+        mfce_policy_reject,
+        source_risk_increases_allocated: mfce
+            .policy_outputs
+            .iter()
+            .filter(|output| output.admitted)
+            .count() as u64,
+        source_risk_increases_rejected_by_mfce: mfce_policy_reject,
         mfce,
         economics,
     };

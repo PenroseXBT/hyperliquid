@@ -1,7 +1,10 @@
 use crate::cohort_layer::{is_cohort_candidate_label, PreparedVeryProfitableLayer};
+#[cfg(test)]
+use crate::mfce::evaluate_allocation_policy;
 use crate::mfce::{
-    evaluate_admission, MfceAdmissionInput, MfceDirection, MfceEngine, MfceError,
-    MfceFeatureVector, MfcePersistentState, MfceRejectionReason, MfceReport, MFCE_FEATURE_COUNT,
+    allocate_cross_sectional, allocation_baseline_target, MfceAllocationInput,
+    MfceCrossSectionalCandidate, MfceDirection, MfceEngine, MfceError, MfceFeatureVector,
+    MfcePersistentState, MfceRejectionReason, MfceReport, MFCE_FEATURE_COUNT,
 };
 use crate::public_mainnet::{
     AcceptedPublicResponse, BookLevel, CandleResponse, MarketMetadataResponse,
@@ -232,6 +235,13 @@ struct MfceLiveMarketContext {
     entry_depth_ratio: Decimal,
     exit_depth_ratio: Decimal,
     depth_imbalance: Decimal,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct MfceTargetContext {
+    raw_desired_source_target: Decimal,
+    current_source_target: Decimal,
+    current_source_targets: BTreeMap<String, Decimal>,
 }
 
 fn mfce_leg_cost(
@@ -3071,10 +3081,15 @@ impl LiveShadowEngine {
                 )
                 .ok_or(LiveShadowError::Arithmetic)?;
         }
-        let mut remaining_tail_budget = total_tail_budget
+        let remaining_tail_budget = total_tail_budget
             .checked_sub(existing_tail_reservations)
             .unwrap_or(Decimal::ZERO)
             .max(Decimal::ZERO);
+        let source_capacity = available_gross
+            .checked_mul(source_budget_decimal)
+            .ok_or(LiveShadowError::Arithmetic)?;
+        let mut allocation_candidates = Vec::new();
+        let mut target_contexts = BTreeMap::new();
         for (asset, inputs) in &mut consensus_inputs {
             if !mfce_sources_hydrated {
                 inputs.clear();
@@ -3139,6 +3154,14 @@ impl LiveShadowEngine {
                     .try_fold(Decimal::ZERO, |sum, target| sum.checked_add(*target))
                     .ok_or(LiveShadowError::Arithmetic)?
             };
+            target_contexts.insert(
+                asset.clone(),
+                MfceTargetContext {
+                    raw_desired_source_target,
+                    current_source_target,
+                    current_source_targets: current_source_targets.clone(),
+                },
+            );
             let previous_source_exposure = self.mfce.previous_source_exposure(asset);
             let technical = self
                 .technical_engine
@@ -3246,39 +3269,21 @@ impl LiveShadowEngine {
                                     .mfce
                                     .reserved_tail_loss_usd(asset, current_source_target)
                                     .map_err(mfce_error)?;
-                                let asset_tail_budget = remaining_tail_budget
-                                    .checked_add(prior_tail_reservation)
-                                    .ok_or(LiveShadowError::Arithmetic)?;
-                                let decision = evaluate_admission(&MfceAdmissionInput {
-                                    prediction: prediction.clone(),
-                                    friction_bps: live_context.friction_bps,
-                                    proposed_position_notional: admission_target,
-                                    remaining_tail_loss_budget_usd: asset_tail_budget,
-                                })
-                                .map_err(mfce_error)?;
-                                self.mfce
-                                    .record_admission(
-                                        asset,
-                                        transition_id,
-                                        &decision,
-                                        &prediction,
-                                        current_source_target,
-                                    )
-                                    .map_err(mfce_error)?;
-                                remaining_tail_budget = remaining_tail_budget
-                                    .checked_add(prior_tail_reservation)
-                                    .and_then(|value| {
-                                        value.checked_sub(
-                                            self.mfce
-                                                .reserved_tail_loss_usd(
-                                                    asset,
-                                                    current_source_target,
-                                                )
-                                                .ok()?,
-                                        )
-                                    })
-                                    .ok_or(LiveShadowError::Arithmetic)?
-                                    .max(Decimal::ZERO);
+                                allocation_candidates.push(MfceCrossSectionalCandidate {
+                                    asset: asset.clone(),
+                                    transition_id,
+                                    input: MfceAllocationInput {
+                                        prediction,
+                                        friction_bps: live_context.friction_bps,
+                                        copytrade_conviction: raw_source_exposure
+                                            .abs()
+                                            .min(Decimal::ONE),
+                                        current_position_notional: current_source_target,
+                                        proposed_position_notional: admission_target,
+                                        remaining_tail_loss_budget_usd: remaining_tail_budget,
+                                    },
+                                    prior_tail_loss_usd: prior_tail_reservation,
+                                });
                             }
                             Err(MfceError::InvalidState(_)) => self
                                 .mfce
@@ -3300,18 +3305,77 @@ impl LiveShadowEngine {
                     }
                 }
             }
-            let effective_target =
+        }
+        if mfce_sources_hydrated {
+            let ranked_assets = allocation_candidates
+                .iter()
+                .map(|candidate| candidate.asset.as_str())
+                .collect::<BTreeSet<_>>();
+            let committed_source_gross =
+                target_contexts
+                    .iter()
+                    .try_fold(Decimal::ZERO, |total, (asset, context)| {
+                        let committed_target = if ranked_assets.contains(asset.as_str()) {
+                            allocation_baseline_target(
+                                context.current_source_target,
+                                context.raw_desired_source_target,
+                            )
+                        } else {
+                            self.mfce.effective_target(
+                                asset,
+                                context.current_source_target,
+                                context.raw_desired_source_target,
+                            )
+                        };
+                        total
+                            .checked_add(committed_target.abs())
+                            .ok_or(LiveShadowError::Arithmetic)
+                    })?;
+            let available_increment_notional = source_capacity
+                .checked_sub(committed_source_gross)
+                .unwrap_or(Decimal::ZERO)
+                .max(Decimal::ZERO);
+            let decisions = allocate_cross_sectional(
+                &allocation_candidates,
+                available_increment_notional,
+                remaining_tail_budget,
+            )
+            .map_err(mfce_error)?;
+            for candidate in &allocation_candidates {
+                let decision = decisions.get(&candidate.asset).ok_or_else(|| {
+                    LiveShadowError::Core("cross-sectional MFCE decision missing".into())
+                })?;
                 self.mfce
-                    .effective_target(asset, current_source_target, raw_desired_source_target);
-            if effective_target == raw_desired_source_target {
-                continue;
+                    .record_allocation(
+                        &candidate.asset,
+                        candidate.transition_id,
+                        decision,
+                        &candidate.input.prediction,
+                        candidate.input.current_position_notional,
+                    )
+                    .map_err(mfce_error)?;
             }
-            inputs.clear();
-            if !effective_target.is_zero() && !source_budget_decimal.is_zero() {
-                let source_capacity = available_gross
-                    .checked_mul(source_budget_decimal)
-                    .ok_or(LiveShadowError::Arithmetic)?;
-                if !source_capacity.is_zero() {
+
+            // Only after the complete candidate set is ranked do model-sized
+            // targets replace raw source targets. This makes allocation
+            // independent of BTreeMap iteration and tail-reservation mutation.
+            for (asset, inputs) in &mut consensus_inputs {
+                let Some(context) = target_contexts.get(asset) else {
+                    continue;
+                };
+                let effective_target = self.mfce.effective_target(
+                    asset,
+                    context.current_source_target,
+                    context.raw_desired_source_target,
+                );
+                if effective_target == context.raw_desired_source_target {
+                    continue;
+                }
+                inputs.clear();
+                if !effective_target.is_zero()
+                    && !source_budget_decimal.is_zero()
+                    && !source_capacity.is_zero()
+                {
                     inputs.push(ConsensusInput {
                         candidate_id: "source:aggregate".into(),
                         allocation_weight: source_budget,
@@ -3327,25 +3391,18 @@ impl LiveShadowEngine {
                         snapshot_age_ms: 0,
                     });
                 }
+                let contributions = source_contributions.entry(asset.clone()).or_default();
+                if effective_target.is_zero() {
+                    contributions.clear();
+                } else if self.mfce.uses_current_position_attribution(asset) {
+                    *contributions = context.current_source_targets.clone();
+                }
+                self.micro_density
+                    .source_risk_increases_suppressed_below_cost_edge = self
+                    .micro_density
+                    .source_risk_increases_suppressed_below_cost_edge
+                    .saturating_add(1);
             }
-            let contributions = source_contributions.entry(asset.clone()).or_default();
-            if effective_target.is_zero() {
-                contributions.clear();
-            } else if self.mfce.uses_current_position_attribution(asset) {
-                // Pending/rejected risk increases may keep only the follower's
-                // existing position and therefore its durable attribution.
-                *contributions = current_source_targets;
-            }
-            // Admitted and risk-reducing bypass targets retain the raw source
-            // weights. This is essential when an admitted opening has not yet
-            // filled: there is no current-position attribution to borrow.
-            self.micro_density
-                .source_risk_increases_suppressed_below_cost_edge = self
-                .micro_density
-                .source_risk_increases_suppressed_below_cost_edge
-                .saturating_add(1);
-        }
-        if mfce_sources_hydrated {
             self.mfce.finish_source_observation_cycle();
             self.mfce_authorized_assets.clear();
         }
@@ -5862,16 +5919,20 @@ mod tests {
             asset_direction_sample_count: 8,
             used_model: true,
         };
-        let low_cost_decision = evaluate_admission(&MfceAdmissionInput {
+        let low_cost_decision = evaluate_allocation_policy(&MfceAllocationInput {
             prediction: gross_prediction.clone(),
             friction_bps: low_fee.friction_bps,
+            copytrade_conviction: Decimal::ONE,
+            current_position_notional: Decimal::ZERO,
             proposed_position_notional: Decimal::from(1_000),
             remaining_tail_loss_budget_usd: Decimal::from(10_000),
         })
         .unwrap();
-        let high_cost_decision = evaluate_admission(&MfceAdmissionInput {
+        let high_cost_decision = evaluate_allocation_policy(&MfceAllocationInput {
             prediction: gross_prediction.clone(),
             friction_bps: high_fee.friction_bps,
+            copytrade_conviction: Decimal::ONE,
+            current_position_notional: Decimal::ZERO,
             proposed_position_notional: Decimal::from(1_000),
             remaining_tail_loss_budget_usd: Decimal::from(10_000),
         })
@@ -8086,6 +8147,7 @@ mod tests {
         let mut config = CopyTradeConfig::from_path(path).unwrap();
         let candidate = config.candidates[0].address.to_ascii_lowercase();
         config.candidates.truncate(1);
+        config.starting_equity_usd = 200.0;
         // This fixture exercises book retention, partial execution, and
         // snapshot continuity. Keep technical demand out of the economic
         // decision now that it cannot independently authorize risk.
@@ -8213,11 +8275,11 @@ mod tests {
             source_time_ms: 2_000,
             bids: vec![BookLevel {
                 price: Decimal::new(9_999, 2),
-                quantity: Decimal::new(5, 2),
+                quantity: Decimal::new(1, 2),
             }],
             asks: vec![BookLevel {
                 price: Decimal::new(10_001, 2),
-                quantity: Decimal::new(5, 2),
+                quantity: Decimal::new(1, 2),
             }],
         };
         engine

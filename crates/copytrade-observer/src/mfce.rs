@@ -1,8 +1,10 @@
-//! Embedded multi-factor conditional quantile expectancy state and admission.
+//! Embedded multi-factor conditional quantile expectancy state and allocation.
 //!
 //! Gross transition returns are learned from accepted raw source transitions.
 //! Execution friction is deliberately absent from labels and predictions; the
-//! caller supplies a separately computed live friction estimate to admission.
+//! caller supplies a separately computed live friction estimate to policy
+//! evaluation. MFCE owns economic classification and sizing; portfolio risk
+//! and accounting invariants remain downstream.
 
 use rust_decimal::prelude::{FromPrimitive, ToPrimitive};
 use rust_decimal::Decimal;
@@ -32,6 +34,14 @@ const MFCE_MIN_BACKOFF_SAMPLES: usize = 8;
 const MFCE_ASSET_SHRINKAGE: f64 = 24.0;
 const MFCE_DIRECTION_SHRINKAGE: f64 = 48.0;
 const BPS_PER_UNIT_RETURN: Decimal = Decimal::from_parts(10_000, 0, 0, false, 0);
+const MFCE_EXPLORE_POOL_FRACTION: Decimal = Decimal::from_parts(25, 0, 0, false, 2);
+const MFCE_MIN_EXPLORE_PRIOR_FRACTION: Decimal = Decimal::from_parts(15, 0, 0, false, 2);
+const MFCE_EXPLORE_CONVICTION_RANGE: Decimal = Decimal::from_parts(10, 0, 0, false, 2);
+const MFCE_EXPLORE_RISK_SCALE_BPS: Decimal = Decimal::from_parts(500, 0, 0, false, 0);
+const MFCE_SCORE_EPSILON_BPS: Decimal = Decimal::ONE;
+const MFCE_BOOTSTRAP_Q10_BPS: Decimal = Decimal::from_parts(100, 0, 0, true, 0);
+const MFCE_BOOTSTRAP_Q50_BPS: Decimal = Decimal::ZERO;
+const MFCE_BOOTSTRAP_UNCERTAINTY_BPS: Decimal = Decimal::from_parts(100, 0, 0, false, 0);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -163,6 +173,8 @@ pub enum MfceRejectionReason {
     MissingLiveBook,
     InvalidPrediction,
     MedianBelowFrictionAndUncertainty,
+    StrongNegativeExpectancy,
+    AllocationBudgetExhausted,
     TailBudgetExceeded,
 }
 
@@ -270,19 +282,74 @@ pub struct MfcePrediction {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct MfceAdmissionInput {
+pub struct MfceAllocationInput {
     pub prediction: MfcePrediction,
     pub friction_bps: Decimal,
+    /// Absolute aggregate copytrade conviction, normalized to [0, 1]. It is
+    /// the cold-start allocation prior; it never bypasses downstream risk.
+    pub copytrade_conviction: Decimal,
+    pub current_position_notional: Decimal,
     pub proposed_position_notional: Decimal,
     pub remaining_tail_loss_budget_usd: Decimal,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct MfceAdmissionDecision {
+pub struct MfceCrossSectionalCandidate {
+    pub asset: String,
+    pub transition_id: u64,
+    pub input: MfceAllocationInput,
+    /// Tail dollars already reserved for the incumbent position in this asset.
+    /// A replacement allocation consumes only the positive increment.
+    pub prior_tail_loss_usd: Decimal,
+}
+
+/// Economic state selected by MFCE before downstream portfolio constraints.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MfcePolicyState {
+    Exploit,
+    Explore,
+    Reject,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MfceAllocationDecision {
+    pub policy_state: MfcePolicyState,
     pub admitted: bool,
     pub reason: Option<MfceRejectionReason>,
+    /// Fraction of the source-authorized risk increase requested by MFCE.
+    /// Hard portfolio projection may reduce it further.
+    pub allocation_fraction: Decimal,
+    /// After-cost median divided by conditional q50-q10 downside width.
+    pub opportunity_score: Decimal,
+    pub net_q50_bps: Decimal,
+    pub conservative_edge_bps: Decimal,
     pub net_q10_bps: Decimal,
     pub required_median_bps: Decimal,
+    pub modeled_tail_loss_usd: Decimal,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct MfcePolicyOutput {
+    pub asset: String,
+    pub transition_id: u64,
+    pub model_epoch: u64,
+    pub policy_state: MfcePolicyState,
+    pub admitted: bool,
+    pub reason: Option<MfceRejectionReason>,
+    pub q10_gross_bps: Decimal,
+    pub q50_gross_bps: Decimal,
+    pub friction_bps: Decimal,
+    pub uncertainty_bps: Decimal,
+    pub used_model: bool,
+    pub pooled_sample_count: u64,
+    pub direction_sample_count: u64,
+    pub asset_direction_sample_count: u64,
+    pub net_q10_bps: Decimal,
+    pub net_q50_bps: Decimal,
+    pub conservative_edge_bps: Decimal,
+    pub opportunity_score: Decimal,
+    pub allocation_fraction: Decimal,
     pub modeled_tail_loss_usd: Decimal,
 }
 
@@ -294,6 +361,7 @@ pub struct MfceReport {
     pub incumbent_epoch: Option<u64>,
     pub trained_through_sample_id: Option<u64>,
     pub labels_since_retrain_attempt: u64,
+    pub policy_outputs: Vec<MfcePolicyOutput>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -325,6 +393,7 @@ pub struct MfceEngine {
     models: Option<copytrade_mfce::QuantileModelPair>,
     training: Option<Receiver<CompletedTraining>>,
     completed_source_epoch: u64,
+    policy_outputs: BTreeMap<String, MfcePolicyOutput>,
 }
 
 impl Default for MfceEngine {
@@ -334,6 +403,7 @@ impl Default for MfceEngine {
             models: None,
             training: None,
             completed_source_epoch: 0,
+            policy_outputs: BTreeMap::new(),
         }
     }
 }
@@ -542,6 +612,7 @@ impl MfcePersistentState {
                 .next_sample_id
                 .saturating_sub(1)
                 .saturating_sub(self.last_retrain_attempt_sample_id),
+            policy_outputs: Vec::new(),
         }
     }
 }
@@ -567,6 +638,7 @@ impl MfceEngine {
             state,
             models,
             training: None,
+            policy_outputs: BTreeMap::new(),
         })
     }
 
@@ -592,7 +664,21 @@ impl MfceEngine {
     }
 
     pub fn report(&self) -> MfceReport {
-        self.state.report()
+        let mut report = self.state.report();
+        report.policy_outputs = self
+            .policy_outputs
+            .iter()
+            .filter(|(asset, output)| {
+                self.state.assets.get(*asset).is_some_and(|state| {
+                    state
+                        .active
+                        .as_ref()
+                        .is_some_and(|active| active.transition_id == output.transition_id)
+                })
+            })
+            .map(|(_, output)| output.clone())
+            .collect();
+        report
     }
 
     pub fn awaiting_book_assets(&self) -> impl Iterator<Item = &String> {
@@ -684,6 +770,7 @@ impl MfceEngine {
                 .map(|(asset, _)| asset.clone());
             if let Some(evictable) = evictable {
                 self.state.assets.remove(&evictable);
+                self.policy_outputs.remove(&evictable);
             } else {
                 return Err(MfceError::InvalidState("MFCE asset bound exceeded".into()));
             }
@@ -913,14 +1000,18 @@ impl MfceEngine {
         self.predict(asset, active.direction, &active.features)
     }
 
-    pub fn record_admission(
+    pub fn record_allocation(
         &mut self,
         asset: &str,
         transition_id: u64,
-        decision: &MfceAdmissionDecision,
+        decision: &MfceAllocationDecision,
         prediction: &MfcePrediction,
         current_position_notional: Decimal,
     ) -> Result<(), MfceError> {
+        let friction_bps = prediction
+            .q50_gross_bps
+            .checked_sub(decision.net_q50_bps)
+            .ok_or(MfceError::Arithmetic)?;
         let state = self
             .state
             .assets
@@ -940,7 +1031,11 @@ impl MfceEngine {
             if active.transition_id == transition_id {
                 active.admitted = decision.admitted;
                 if decision.admitted {
-                    state.approved_target_notional = active.proposed_target_notional;
+                    state.approved_target_notional = allocated_target(
+                        current_position_notional,
+                        active.proposed_target_notional,
+                        decision.allocation_fraction,
+                    )?;
                 }
             }
         }
@@ -970,6 +1065,31 @@ impl MfceEngine {
                 q50_gross_bps: Some(prediction.q50_gross_bps),
             }
         };
+        self.policy_outputs.insert(
+            asset.to_string(),
+            MfcePolicyOutput {
+                asset: asset.to_string(),
+                transition_id,
+                model_epoch: prediction.model_epoch,
+                policy_state: decision.policy_state,
+                admitted: decision.admitted,
+                reason: decision.reason,
+                q10_gross_bps: prediction.q10_gross_bps,
+                q50_gross_bps: prediction.q50_gross_bps,
+                friction_bps,
+                uncertainty_bps: prediction.uncertainty_bps,
+                used_model: prediction.used_model,
+                pooled_sample_count: prediction.pooled_sample_count,
+                direction_sample_count: prediction.direction_sample_count,
+                asset_direction_sample_count: prediction.asset_direction_sample_count,
+                net_q10_bps: decision.net_q10_bps,
+                net_q50_bps: decision.net_q50_bps,
+                conservative_edge_bps: decision.conservative_edge_bps,
+                opportunity_score: decision.opportunity_score,
+                allocation_fraction: decision.allocation_fraction,
+                modeled_tail_loss_usd: decision.modeled_tail_loss_usd,
+            },
+        );
         Ok(())
     }
 
@@ -1208,6 +1328,23 @@ impl MfceEngine {
         direction: MfceDirection,
         features: &MfceFeatureVector,
     ) -> Result<MfcePrediction, MfceError> {
+        validate_features(features)?;
+        if self.models.is_none() && self.state.samples.len() < MFCE_MIN_BACKOFF_SAMPLES {
+            // Cold start must collect realized copytrade outcomes rather than
+            // deadlock behind a model that cannot exist yet. These deliberately
+            // conservative prior quantiles only size Explore; they cannot earn
+            // Exploit or override the q10 portfolio tail budget.
+            return Ok(MfcePrediction {
+                model_epoch: 0,
+                q10_gross_bps: MFCE_BOOTSTRAP_Q10_BPS,
+                q50_gross_bps: MFCE_BOOTSTRAP_Q50_BPS,
+                uncertainty_bps: MFCE_BOOTSTRAP_UNCERTAINTY_BPS,
+                pooled_sample_count: self.state.samples.len() as u64,
+                direction_sample_count: 0,
+                asset_direction_sample_count: 0,
+                used_model: false,
+            });
+        }
         let (base_quantiles, used_model) = match &self.models {
             Some(models) => {
                 let values = features.as_f64()?;
@@ -1336,16 +1473,234 @@ fn validate_quantile_pair(q10: f64, q50: f64) -> Result<(), MfceError> {
     }
 }
 
-pub fn evaluate_admission(input: &MfceAdmissionInput) -> Result<MfceAdmissionDecision, MfceError> {
+pub fn evaluate_allocation_policy(
+    input: &MfceAllocationInput,
+) -> Result<MfceAllocationDecision, MfceError> {
+    let requested_increment = requested_risk_increase(
+        input.current_position_notional,
+        input.proposed_position_notional,
+    )?;
+    let candidate = MfceCrossSectionalCandidate {
+        asset: "single".into(),
+        transition_id: 1,
+        input: input.clone(),
+        prior_tail_loss_usd: Decimal::ZERO,
+    };
+    let mut decisions = allocate_cross_sectional(
+        &[candidate],
+        requested_increment,
+        input.remaining_tail_loss_budget_usd,
+    )?;
+    decisions
+        .remove("single")
+        .ok_or_else(|| MfceError::InvalidState("single MFCE allocation disappeared".into()))
+}
+
+/// Ranks one timestamp-consistent transition set and divides the remaining
+/// source sleeve among it. Explore may use at most one bounded global pool;
+/// it is never multiplied by the number of uncertain opportunities.
+pub fn allocate_cross_sectional(
+    candidates: &[MfceCrossSectionalCandidate],
+    available_increment_notional: Decimal,
+    remaining_tail_loss_budget_usd: Decimal,
+) -> Result<BTreeMap<String, MfceAllocationDecision>, MfceError> {
+    if available_increment_notional < Decimal::ZERO
+        || remaining_tail_loss_budget_usd < Decimal::ZERO
+    {
+        return Err(MfceError::InvalidState(
+            "negative MFCE portfolio allocation capacity".into(),
+        ));
+    }
+    let mut decisions = BTreeMap::new();
+    let mut requested = BTreeMap::new();
+    for candidate in candidates {
+        if decisions.contains_key(&candidate.asset) || candidate.prior_tail_loss_usd < Decimal::ZERO
+        {
+            return Err(MfceError::InvalidState(
+                "duplicate or invalid MFCE cross-sectional candidate".into(),
+            ));
+        }
+        let decision = evaluate_distribution(&candidate.input)?;
+        let increment = requested_risk_increase(
+            candidate.input.current_position_notional,
+            candidate.input.proposed_position_notional,
+        )?;
+        requested.insert(candidate.asset.clone(), increment);
+        decisions.insert(candidate.asset.clone(), decision);
+    }
+
+    let explore_demand = candidates
+        .iter()
+        .try_fold(Decimal::ZERO, |total, candidate| {
+            let decision = decisions
+                .get(&candidate.asset)
+                .ok_or_else(|| MfceError::InvalidState("missing MFCE policy decision".into()))?;
+            if decision.policy_state == MfcePolicyState::Explore {
+                let explore_fraction = explore_target_fraction(decision, &candidate.input)?;
+                total
+                    .checked_add(
+                        requested[&candidate.asset]
+                            .checked_mul(explore_fraction)
+                            .ok_or(MfceError::Arithmetic)?,
+                    )
+                    .ok_or(MfceError::Arithmetic)
+            } else {
+                Ok(total)
+            }
+        })?;
+    let explore_budget = available_increment_notional
+        .checked_mul(MFCE_EXPLORE_POOL_FRACTION)
+        .ok_or(MfceError::Arithmetic)?
+        .min(explore_demand);
+    let exploit_budget = available_increment_notional
+        .checked_sub(explore_budget)
+        .ok_or(MfceError::Arithmetic)?;
+
+    let mut allocated_increment = BTreeMap::new();
+    for (state, budget) in [
+        (MfcePolicyState::Exploit, exploit_budget),
+        (MfcePolicyState::Explore, explore_budget),
+    ] {
+        let mut group = Vec::new();
+        for candidate in candidates {
+            let decision = &decisions[&candidate.asset];
+            if decision.policy_state != state {
+                continue;
+            }
+            let weight = cross_sectional_weight(decision, &candidate.input)?;
+            let cap = if state == MfcePolicyState::Explore {
+                requested[&candidate.asset]
+                    .checked_mul(explore_target_fraction(decision, &candidate.input)?)
+                    .ok_or(MfceError::Arithmetic)?
+            } else {
+                requested[&candidate.asset]
+            };
+            group.push((candidate.asset.clone(), weight, cap));
+        }
+        let group_allocations = if state == MfcePolicyState::Explore {
+            // Proportional dust across a large cold-start cross-section is not
+            // useful exploration. Fund the highest-conviction small probes up
+            // to their individual caps, then continue down the stable ranking.
+            ranked_capped_allocations(&group, budget)?
+        } else {
+            weighted_capped_allocations(&group, budget)?
+        };
+        for (asset, allocation) in group_allocations {
+            allocated_increment.insert(asset, allocation);
+        }
+    }
+
+    for candidate in candidates {
+        let decision = decisions
+            .get_mut(&candidate.asset)
+            .ok_or_else(|| MfceError::InvalidState("missing MFCE decision".into()))?;
+        if decision.policy_state == MfcePolicyState::Reject {
+            continue;
+        }
+        let request = requested[&candidate.asset];
+        let allocation = allocated_increment
+            .get(&candidate.asset)
+            .copied()
+            .unwrap_or_default();
+        if request.is_zero() || allocation.is_zero() {
+            decision.admitted = false;
+            decision.reason = Some(MfceRejectionReason::AllocationBudgetExhausted);
+            decision.allocation_fraction = Decimal::ZERO;
+            decision.modeled_tail_loss_usd = Decimal::ZERO;
+            continue;
+        }
+        decision.allocation_fraction = conservative_ratio(allocation, request)?;
+    }
+
+    // Tail capacity is sovereign. Consume it in economic rank order so the
+    // best after-cost distributions receive scarce downside capacity first.
+    let mut ranked = candidates.iter().collect::<Vec<_>>();
+    ranked.sort_by(|left, right| {
+        let left_decision = &decisions[&left.asset];
+        let right_decision = &decisions[&right.asset];
+        policy_rank(right_decision.policy_state)
+            .cmp(&policy_rank(left_decision.policy_state))
+            .then_with(|| {
+                right_decision
+                    .opportunity_score
+                    .cmp(&left_decision.opportunity_score)
+            })
+            .then_with(|| left.asset.cmp(&right.asset))
+            .then_with(|| left.transition_id.cmp(&right.transition_id))
+    });
+    let mut remaining_tail = remaining_tail_loss_budget_usd;
+    for candidate in ranked {
+        let decision = decisions
+            .get_mut(&candidate.asset)
+            .ok_or_else(|| MfceError::InvalidState("missing ranked MFCE decision".into()))?;
+        if decision.policy_state == MfcePolicyState::Reject
+            || decision.allocation_fraction.is_zero()
+        {
+            continue;
+        }
+        let tail_rate_bps = (-decision.net_q10_bps).max(Decimal::ZERO);
+        if tail_rate_bps.is_zero() {
+            decision.admitted = true;
+            continue;
+        }
+        let maximum_total_tail = candidate
+            .prior_tail_loss_usd
+            .checked_add(remaining_tail)
+            .ok_or(MfceError::Arithmetic)?;
+        let maximum_target_notional = maximum_total_tail
+            .checked_mul(BPS_PER_UNIT_RETURN)
+            .and_then(|value| value.checked_div(tail_rate_bps))
+            .ok_or(MfceError::Arithmetic)?;
+        let tail_fraction = maximum_allocation_fraction(
+            candidate.input.current_position_notional,
+            candidate.input.proposed_position_notional,
+            maximum_target_notional,
+        )?;
+        decision.allocation_fraction = decision.allocation_fraction.min(tail_fraction);
+        if decision.allocation_fraction.is_zero() {
+            reject_decision(decision, MfceRejectionReason::TailBudgetExceeded);
+            continue;
+        }
+        let target = allocated_target(
+            candidate.input.current_position_notional,
+            candidate.input.proposed_position_notional,
+            decision.allocation_fraction,
+        )?;
+        let total_tail = target
+            .abs()
+            .checked_mul(tail_rate_bps)
+            .and_then(|value| value.checked_div(BPS_PER_UNIT_RETURN))
+            .ok_or(MfceError::Arithmetic)?;
+        let incremental_tail = total_tail
+            .checked_sub(candidate.prior_tail_loss_usd)
+            .unwrap_or(Decimal::ZERO)
+            .max(Decimal::ZERO);
+        remaining_tail = remaining_tail
+            .checked_sub(incremental_tail)
+            .unwrap_or(Decimal::ZERO)
+            .max(Decimal::ZERO);
+        decision.modeled_tail_loss_usd = total_tail;
+        decision.admitted = true;
+    }
+    Ok(decisions)
+}
+
+fn evaluate_distribution(input: &MfceAllocationInput) -> Result<MfceAllocationDecision, MfceError> {
     if input.friction_bps < Decimal::ZERO
+        || !(Decimal::ZERO..=Decimal::ONE).contains(&input.copytrade_conviction)
         || input.prediction.uncertainty_bps < Decimal::ZERO
         || input.proposed_position_notional.is_zero()
         || input.remaining_tail_loss_budget_usd < Decimal::ZERO
         || input.prediction.q10_gross_bps > input.prediction.q50_gross_bps
     {
-        return Ok(MfceAdmissionDecision {
+        return Ok(MfceAllocationDecision {
+            policy_state: MfcePolicyState::Reject,
             admitted: false,
             reason: Some(MfceRejectionReason::InvalidPrediction),
+            allocation_fraction: Decimal::ZERO,
+            opportunity_score: Decimal::MIN,
+            net_q50_bps: Decimal::MIN,
+            conservative_edge_bps: Decimal::MIN,
             net_q10_bps: Decimal::MIN,
             required_median_bps: Decimal::MAX,
             modeled_tail_loss_usd: Decimal::MAX,
@@ -1355,35 +1710,304 @@ pub fn evaluate_admission(input: &MfceAdmissionInput) -> Result<MfceAdmissionDec
         .friction_bps
         .checked_add(input.prediction.uncertainty_bps)
         .ok_or(MfceError::Arithmetic)?;
+    let net_q50_bps = input
+        .prediction
+        .q50_gross_bps
+        .checked_sub(input.friction_bps)
+        .ok_or(MfceError::Arithmetic)?;
+    let conservative_edge_bps = net_q50_bps
+        .checked_sub(input.prediction.uncertainty_bps)
+        .ok_or(MfceError::Arithmetic)?;
     let net_q10_bps = input
         .prediction
         .q10_gross_bps
         .checked_sub(input.friction_bps)
         .ok_or(MfceError::Arithmetic)?;
-    let modeled_tail_loss_usd = if net_q10_bps < Decimal::ZERO {
-        input
-            .proposed_position_notional
-            .abs()
-            .checked_mul(-net_q10_bps)
-            .and_then(|value| value.checked_div(BPS_PER_UNIT_RETURN))
-            .ok_or(MfceError::Arithmetic)?
+    let downside_width_bps = input
+        .prediction
+        .q50_gross_bps
+        .checked_sub(input.prediction.q10_gross_bps)
+        .ok_or(MfceError::Arithmetic)?
+        .max(MFCE_SCORE_EPSILON_BPS);
+    let opportunity_score = conservative_edge_bps
+        .max(Decimal::ZERO)
+        .checked_div(downside_width_bps)
+        .ok_or(MfceError::Arithmetic)?;
+
+    let upper_edge_bps = net_q50_bps
+        .checked_add(input.prediction.uncertainty_bps)
+        .ok_or(MfceError::Arithmetic)?;
+    let (policy_state, reason) = if !input.prediction.used_model {
+        // Without a promoted conditional model, every structurally valid
+        // source transition explores. Empirical backoff still shrinks size,
+        // but it cannot create a cold-start no-trade fixed point.
+        (MfcePolicyState::Explore, None)
+    } else if upper_edge_bps <= Decimal::ZERO {
+        (
+            MfcePolicyState::Reject,
+            Some(MfceRejectionReason::StrongNegativeExpectancy),
+        )
+    } else if conservative_edge_bps <= Decimal::ZERO {
+        (MfcePolicyState::Explore, None)
     } else {
-        Decimal::ZERO
+        (MfcePolicyState::Exploit, None)
     };
-    let reason = if input.prediction.q50_gross_bps <= required_median_bps {
-        Some(MfceRejectionReason::MedianBelowFrictionAndUncertainty)
-    } else if modeled_tail_loss_usd > input.remaining_tail_loss_budget_usd {
-        Some(MfceRejectionReason::TailBudgetExceeded)
-    } else {
-        None
-    };
-    Ok(MfceAdmissionDecision {
-        admitted: reason.is_none(),
+    Ok(MfceAllocationDecision {
+        policy_state,
+        admitted: false,
         reason,
+        allocation_fraction: Decimal::ZERO,
+        opportunity_score,
+        net_q50_bps,
+        conservative_edge_bps,
         net_q10_bps,
         required_median_bps,
-        modeled_tail_loss_usd,
+        modeled_tail_loss_usd: Decimal::ZERO,
     })
+}
+
+fn reject_decision(decision: &mut MfceAllocationDecision, reason: MfceRejectionReason) {
+    decision.policy_state = MfcePolicyState::Reject;
+    decision.admitted = false;
+    decision.reason = Some(reason);
+    decision.allocation_fraction = Decimal::ZERO;
+    decision.modeled_tail_loss_usd = Decimal::ZERO;
+}
+
+fn cross_sectional_weight(
+    decision: &MfceAllocationDecision,
+    input: &MfceAllocationInput,
+) -> Result<Decimal, MfceError> {
+    let weight = match decision.policy_state {
+        MfcePolicyState::Exploit => decision.opportunity_score,
+        MfcePolicyState::Explore => explore_target_fraction(decision, input)?,
+        MfcePolicyState::Reject => Decimal::ZERO,
+    };
+    Ok(weight.max(MFCE_SCORE_EPSILON_BPS / BPS_PER_UNIT_RETURN))
+}
+
+fn explore_target_fraction(
+    decision: &MfceAllocationDecision,
+    input: &MfceAllocationInput,
+) -> Result<Decimal, MfceError> {
+    let conviction_prior = MFCE_MIN_EXPLORE_PRIOR_FRACTION
+        .checked_add(
+            MFCE_EXPLORE_CONVICTION_RANGE
+                .checked_mul(input.copytrade_conviction)
+                .ok_or(MfceError::Arithmetic)?,
+        )
+        .ok_or(MfceError::Arithmetic)?;
+    let downside = (-decision.net_q10_bps).max(Decimal::ZERO);
+    let risk_denominator = MFCE_EXPLORE_RISK_SCALE_BPS
+        .checked_add(input.prediction.uncertainty_bps)
+        .and_then(|value| value.checked_add(downside))
+        .ok_or(MfceError::Arithmetic)?;
+    let risk_multiplier = MFCE_EXPLORE_RISK_SCALE_BPS
+        .checked_div(risk_denominator)
+        .ok_or(MfceError::Arithmetic)?;
+    conviction_prior
+        .checked_mul(risk_multiplier)
+        .ok_or(MfceError::Arithmetic)
+        .map(|fraction| fraction.clamp(Decimal::ZERO, MFCE_EXPLORE_POOL_FRACTION))
+}
+
+const fn policy_rank(state: MfcePolicyState) -> u8 {
+    match state {
+        MfcePolicyState::Exploit => 2,
+        MfcePolicyState::Explore => 1,
+        MfcePolicyState::Reject => 0,
+    }
+}
+
+fn requested_risk_increase(current: Decimal, proposed: Decimal) -> Result<Decimal, MfceError> {
+    proposed
+        .abs()
+        .checked_sub(rejected_target(current, proposed).abs())
+        .ok_or(MfceError::Arithmetic)
+        .map(|value| value.max(Decimal::ZERO))
+}
+
+fn maximum_allocation_fraction(
+    current: Decimal,
+    proposed: Decimal,
+    maximum_target_notional: Decimal,
+) -> Result<Decimal, MfceError> {
+    if maximum_target_notional <= Decimal::ZERO || proposed.is_zero() {
+        return Ok(Decimal::ZERO);
+    }
+    let fraction = if !current.is_zero()
+        && current.is_sign_positive() == proposed.is_sign_positive()
+        && proposed.abs() > current.abs()
+    {
+        conservative_ratio(
+            maximum_target_notional
+                .checked_sub(current.abs())
+                .unwrap_or(Decimal::MIN)
+                .max(Decimal::ZERO),
+            proposed
+                .abs()
+                .checked_sub(current.abs())
+                .ok_or(MfceError::Arithmetic)?,
+        )?
+    } else {
+        conservative_ratio(maximum_target_notional, proposed.abs())?
+    };
+    Ok(fraction.clamp(Decimal::ZERO, Decimal::ONE))
+}
+
+fn conservative_ratio(numerator: Decimal, denominator: Decimal) -> Result<Decimal, MfceError> {
+    if numerator <= Decimal::ZERO || denominator <= Decimal::ZERO {
+        return Ok(Decimal::ZERO);
+    }
+    let mut ratio = numerator
+        .checked_div(denominator)
+        .ok_or(MfceError::Arithmetic)?
+        .clamp(Decimal::ZERO, Decimal::ONE);
+    if denominator
+        .checked_mul(ratio)
+        .ok_or(MfceError::Arithmetic)?
+        > numerator
+    {
+        ratio = ratio
+            .checked_sub(Decimal::from_parts(1, 0, 0, false, 28))
+            .unwrap_or(Decimal::ZERO)
+            .max(Decimal::ZERO);
+    }
+    Ok(ratio)
+}
+
+fn ranked_capped_allocations(
+    candidates: &[(String, Decimal, Decimal)],
+    budget: Decimal,
+) -> Result<BTreeMap<String, Decimal>, MfceError> {
+    let mut ranked = candidates.to_vec();
+    ranked.sort_by(|left, right| right.1.cmp(&left.1).then_with(|| left.0.cmp(&right.0)));
+    let mut remaining = budget.max(Decimal::ZERO);
+    let mut output = BTreeMap::new();
+    for (asset, _, cap) in ranked {
+        let allocation = cap.max(Decimal::ZERO).min(remaining);
+        output.insert(asset, allocation);
+        remaining = remaining
+            .checked_sub(allocation)
+            .ok_or(MfceError::Arithmetic)?;
+    }
+    Ok(output)
+}
+
+fn weighted_capped_allocations(
+    candidates: &[(String, Decimal, Decimal)],
+    budget: Decimal,
+) -> Result<BTreeMap<String, Decimal>, MfceError> {
+    let mut output = candidates
+        .iter()
+        .map(|(asset, _, _)| (asset.clone(), Decimal::ZERO))
+        .collect::<BTreeMap<_, _>>();
+    let mut active = candidates
+        .iter()
+        .filter(|(_, weight, cap)| *weight > Decimal::ZERO && *cap > Decimal::ZERO)
+        .cloned()
+        .collect::<Vec<_>>();
+    active.sort_by(|left, right| left.0.cmp(&right.0));
+    let mut remaining = budget.max(Decimal::ZERO);
+    while !active.is_empty() && remaining > Decimal::ZERO {
+        let total_weight = active
+            .iter()
+            .try_fold(Decimal::ZERO, |total, (_, weight, _)| {
+                total.checked_add(*weight).ok_or(MfceError::Arithmetic)
+            })?;
+        if total_weight <= Decimal::ZERO {
+            break;
+        }
+        let mut capped_any = false;
+        let mut next = Vec::new();
+        let round_budget = remaining;
+        for (asset, weight, cap) in active {
+            let already = output[&asset];
+            let capacity = cap
+                .checked_sub(already)
+                .ok_or(MfceError::Arithmetic)?
+                .max(Decimal::ZERO);
+            let share = round_budget
+                .checked_mul(weight)
+                .and_then(|value| value.checked_div(total_weight))
+                .ok_or(MfceError::Arithmetic)?;
+            let allocation = share.min(capacity).min(remaining);
+            output.insert(
+                asset.clone(),
+                already
+                    .checked_add(allocation)
+                    .ok_or(MfceError::Arithmetic)?,
+            );
+            remaining = remaining
+                .checked_sub(allocation)
+                .ok_or(MfceError::Arithmetic)?;
+            if allocation == capacity {
+                capped_any = true;
+            } else if capacity > allocation {
+                next.push((asset, weight, cap));
+            }
+        }
+        if !capped_any {
+            break;
+        }
+        active = next;
+    }
+    if remaining > Decimal::ZERO {
+        let mut residual_order = candidates.to_vec();
+        residual_order
+            .sort_by(|left, right| right.1.cmp(&left.1).then_with(|| left.0.cmp(&right.0)));
+        for (asset, _, cap) in residual_order {
+            let already = output[&asset];
+            let capacity = cap
+                .checked_sub(already)
+                .ok_or(MfceError::Arithmetic)?
+                .max(Decimal::ZERO);
+            let allocation = capacity.min(remaining);
+            output.insert(
+                asset,
+                already
+                    .checked_add(allocation)
+                    .ok_or(MfceError::Arithmetic)?,
+            );
+            remaining = remaining
+                .checked_sub(allocation)
+                .ok_or(MfceError::Arithmetic)?;
+            if remaining.is_zero() {
+                break;
+            }
+        }
+    }
+    Ok(output)
+}
+
+fn allocated_target(
+    current: Decimal,
+    proposed: Decimal,
+    allocation_fraction: Decimal,
+) -> Result<Decimal, MfceError> {
+    if allocation_fraction <= Decimal::ZERO || proposed.is_zero() {
+        return Ok(rejected_target(current, proposed));
+    }
+    let fraction = allocation_fraction.min(Decimal::ONE);
+    if current.is_zero() || current.is_sign_positive() != proposed.is_sign_positive() {
+        return proposed.checked_mul(fraction).ok_or(MfceError::Arithmetic);
+    }
+    let increment = proposed.checked_sub(current).ok_or(MfceError::Arithmetic)?;
+    current
+        .checked_add(
+            increment
+                .checked_mul(fraction)
+                .ok_or(MfceError::Arithmetic)?,
+        )
+        .ok_or(MfceError::Arithmetic)
+}
+
+/// Returns the position-preserving/reducing target that requires no new MFCE
+/// risk allocation. Cross-sectional capacity is measured above this baseline
+/// so an incumbent candidate can be ranked again without counting its prior
+/// allocation twice.
+pub fn allocation_baseline_target(current: Decimal, proposed: Decimal) -> Decimal {
+    rejected_target(current, proposed)
 }
 
 fn train_candidate(
@@ -1460,7 +2084,12 @@ fn train_candidate(
         &candidate_predictions,
         &incumbent_predictions,
     )?;
-    if !validation_score.passes(validation.len()) {
+    let validation_passes = if incumbent.is_some() {
+        validation_score.passes_incumbent_comparison(validation.len())
+    } else {
+        validation_score.passes_cold_start(validation.len())
+    };
+    if !validation_passes {
         return Ok(None);
     }
     if candidate_strings.q10().len() > MFCE_MAX_MODEL_BYTES
@@ -1530,11 +2159,34 @@ struct ChronologicalValidationScore {
     incumbent_q10_pinball: f64,
     incumbent_q50_pinball: f64,
     candidate_q10_below_fraction: f64,
+    candidate_q50_below_fraction: f64,
     incumbent_q10_below_fraction: f64,
 }
 
 impl ChronologicalValidationScore {
-    fn passes(self, validation_samples: usize) -> bool {
+    fn q10_is_calibrated(self, validation_samples: usize) -> bool {
+        if validation_samples == 0 {
+            return false;
+        }
+        let loss_tolerance = 1e-9;
+        let finite_sample_tolerance = 1.0 / validation_samples as f64;
+        self.candidate_q10_below_fraction <= 0.10 + finite_sample_tolerance + loss_tolerance
+    }
+
+    fn passes_cold_start(self, validation_samples: usize) -> bool {
+        if validation_samples == 0 || !self.q10_is_calibrated(validation_samples) {
+            return false;
+        }
+        let finite_sample_tolerance = 1.0 / validation_samples as f64;
+        let median_tolerance = 0.25 + finite_sample_tolerance;
+        self.candidate_q10_pinball.is_finite()
+            && self.candidate_q50_pinball.is_finite()
+            && self.candidate_q10_pinball >= 0.0
+            && self.candidate_q50_pinball >= 0.0
+            && (self.candidate_q50_below_fraction - 0.50).abs() <= median_tolerance
+    }
+
+    fn passes_incumbent_comparison(self, validation_samples: usize) -> bool {
         if validation_samples == 0 {
             return false;
         }
@@ -1549,11 +2201,9 @@ impl ChronologicalValidationScore {
         // fall below q10. One holdout observation is allowed for finite-sample
         // resolution, but the candidate also cannot under-cover the incumbent
         // by more than that same single-observation tolerance.
-        let q10_calibrated =
-            self.candidate_q10_below_fraction <= 0.10 + finite_sample_tolerance + loss_tolerance;
         let q10_non_inferior = self.candidate_q10_below_fraction
             <= self.incumbent_q10_below_fraction + finite_sample_tolerance + loss_tolerance;
-        loss_non_inferior && q10_calibrated && q10_non_inferior
+        loss_non_inferior && self.q10_is_calibrated(validation_samples) && q10_non_inferior
     }
 }
 
@@ -1588,6 +2238,7 @@ fn chronological_validation_score(
         incumbent_q10_pinball: pinball_loss(labels, &incumbent_q10, 0.10)?,
         incumbent_q50_pinball: pinball_loss(labels, &incumbent_q50, 0.50)?,
         candidate_q10_below_fraction: below_fraction(&candidate_q10),
+        candidate_q50_below_fraction: below_fraction(&candidate_q50),
         incumbent_q10_below_fraction: below_fraction(&incumbent_q10),
     })
 }
@@ -1903,12 +2554,17 @@ mod tests {
                     used_model: false,
                 };
                 engine
-                    .record_admission(
+                    .record_allocation(
                         "BTC",
                         transition_id,
-                        &MfceAdmissionDecision {
+                        &MfceAllocationDecision {
+                            policy_state: MfcePolicyState::Exploit,
                             admitted: true,
                             reason: None,
+                            allocation_fraction: Decimal::ONE,
+                            opportunity_score: Decimal::ONE,
+                            net_q50_bps: Decimal::from(20),
+                            conservative_edge_bps: Decimal::from(20),
                             net_q10_bps: Decimal::from(10),
                             required_median_bps: Decimal::ZERO,
                             modeled_tail_loss_usd: Decimal::ZERO,
@@ -2215,12 +2871,17 @@ mod tests {
             used_model: false,
         };
         engine
-            .record_admission(
+            .record_allocation(
                 "BTC",
                 transition_id,
-                &MfceAdmissionDecision {
+                &MfceAllocationDecision {
+                    policy_state: MfcePolicyState::Exploit,
                     admitted: true,
                     reason: None,
+                    allocation_fraction: Decimal::ONE,
+                    opportunity_score: Decimal::ONE,
+                    net_q50_bps: Decimal::from(20),
+                    conservative_edge_bps: Decimal::from(20),
                     net_q10_bps: Decimal::from(10),
                     required_median_bps: Decimal::ZERO,
                     modeled_tail_loss_usd: Decimal::ZERO,
@@ -2236,41 +2897,317 @@ mod tests {
     }
 
     #[test]
-    fn admission_is_strict_on_median_and_position_aware_on_tail() {
-        let prediction = MfcePrediction {
+    fn policy_separates_exploit_explore_economic_reject_and_hard_tail_reject() {
+        let base = MfcePrediction {
             model_epoch: 1,
-            q10_gross_bps: Decimal::from(-100),
-            q50_gross_bps: Decimal::from(30),
+            q10_gross_bps: Decimal::from(-21),
+            q50_gross_bps: Decimal::from(72),
             uncertainty_bps: Decimal::from(10),
             pooled_sample_count: 64,
             direction_sample_count: 32,
             asset_direction_sample_count: 8,
             used_model: true,
         };
-        let equal = evaluate_admission(&MfceAdmissionInput {
-            prediction: prediction.clone(),
-            friction_bps: Decimal::from(20),
+        let exploit = evaluate_allocation_policy(&MfceAllocationInput {
+            prediction: base.clone(),
+            friction_bps: Decimal::from(14),
+            copytrade_conviction: Decimal::ONE,
+            current_position_notional: Decimal::ZERO,
             proposed_position_notional: Decimal::from(1_000),
-            remaining_tail_loss_budget_usd: Decimal::from(100),
+            remaining_tail_loss_budget_usd: Decimal::from(1_000),
         })
         .unwrap();
-        assert_eq!(
-            equal.reason,
-            Some(MfceRejectionReason::MedianBelowFrictionAndUncertainty)
-        );
+        assert_eq!(exploit.policy_state, MfcePolicyState::Exploit);
+        assert_eq!(exploit.conservative_edge_bps, Decimal::from(48));
+        assert!(exploit.allocation_fraction > Decimal::from_parts(7, 0, 0, false, 1));
 
-        let tail = evaluate_admission(&MfceAdmissionInput {
+        let explore = evaluate_allocation_policy(&MfceAllocationInput {
             prediction: MfcePrediction {
-                q50_gross_bps: Decimal::from(31),
-                ..prediction
+                q10_gross_bps: Decimal::from(-30),
+                q50_gross_bps: Decimal::from(36),
+                uncertainty_bps: Decimal::from(24),
+                ..base.clone()
+            },
+            friction_bps: Decimal::from(17),
+            copytrade_conviction: Decimal::ONE,
+            current_position_notional: Decimal::ZERO,
+            proposed_position_notional: Decimal::from(1_000),
+            remaining_tail_loss_budget_usd: Decimal::from(1_000),
+        })
+        .unwrap();
+        assert_eq!(explore.policy_state, MfcePolicyState::Explore);
+        assert_eq!(explore.conservative_edge_bps, Decimal::from(-5));
+        assert!(explore.allocation_fraction <= MFCE_EXPLORE_POOL_FRACTION);
+        assert!(explore.allocation_fraction > Decimal::from_parts(2, 0, 0, false, 1));
+
+        let negative = evaluate_allocation_policy(&MfceAllocationInput {
+            prediction: MfcePrediction {
+                q10_gross_bps: Decimal::from(-144),
+                q50_gross_bps: Decimal::from(-19),
+                ..base.clone()
+            },
+            friction_bps: Decimal::from(31),
+            copytrade_conviction: Decimal::ONE,
+            current_position_notional: Decimal::ZERO,
+            proposed_position_notional: Decimal::from(1_000),
+            remaining_tail_loss_budget_usd: Decimal::from(1_000),
+        })
+        .unwrap();
+        assert_eq!(negative.policy_state, MfcePolicyState::Reject);
+        assert_eq!(
+            negative.reason,
+            Some(MfceRejectionReason::StrongNegativeExpectancy)
+        );
+        let zero_edge = evaluate_allocation_policy(&MfceAllocationInput {
+            prediction: MfcePrediction {
+                q10_gross_bps: Decimal::from(-20),
+                q50_gross_bps: Decimal::from(20),
+                ..base.clone()
             },
             friction_bps: Decimal::from(20),
-            proposed_position_notional: Decimal::from(10_000),
-            remaining_tail_loss_budget_usd: Decimal::from(100),
+            copytrade_conviction: Decimal::ONE,
+            current_position_notional: Decimal::ZERO,
+            proposed_position_notional: Decimal::from(1_000),
+            remaining_tail_loss_budget_usd: Decimal::from(1_000),
         })
         .unwrap();
+        assert_eq!(zero_edge.policy_state, MfcePolicyState::Explore);
+
+        let tail = evaluate_allocation_policy(&MfceAllocationInput {
+            prediction: MfcePrediction {
+                q10_gross_bps: Decimal::from(-120),
+                q50_gross_bps: Decimal::from(80),
+                ..base
+            },
+            friction_bps: Decimal::from(20),
+            copytrade_conviction: Decimal::ONE,
+            current_position_notional: Decimal::ZERO,
+            proposed_position_notional: Decimal::from(10_000),
+            remaining_tail_loss_budget_usd: Decimal::ZERO,
+        })
+        .unwrap();
+        assert_eq!(tail.policy_state, MfcePolicyState::Reject);
         assert_eq!(tail.reason, Some(MfceRejectionReason::TailBudgetExceeded));
-        assert_eq!(tail.modeled_tail_loss_usd, Decimal::from(120));
+        assert_eq!(tail.allocation_fraction, Decimal::ZERO);
+        assert_eq!(tail.modeled_tail_loss_usd, Decimal::ZERO);
+    }
+
+    fn allocation_candidate(
+        asset: &str,
+        transition_id: u64,
+        q10: i64,
+        q50: i64,
+        friction: i64,
+        uncertainty: i64,
+        requested: i64,
+    ) -> MfceCrossSectionalCandidate {
+        MfceCrossSectionalCandidate {
+            asset: asset.into(),
+            transition_id,
+            input: MfceAllocationInput {
+                prediction: MfcePrediction {
+                    model_epoch: 1,
+                    q10_gross_bps: Decimal::from(q10),
+                    q50_gross_bps: Decimal::from(q50),
+                    uncertainty_bps: Decimal::from(uncertainty),
+                    pooled_sample_count: 128,
+                    direction_sample_count: 64,
+                    asset_direction_sample_count: 16,
+                    used_model: true,
+                },
+                friction_bps: Decimal::from(friction),
+                copytrade_conviction: Decimal::new(5, 1),
+                current_position_notional: Decimal::ZERO,
+                proposed_position_notional: Decimal::from(requested),
+                remaining_tail_loss_budget_usd: Decimal::from(1_000),
+            },
+            prior_tail_loss_usd: Decimal::ZERO,
+        }
+    }
+
+    #[test]
+    fn cross_sectional_allocation_is_order_independent_and_favors_score() {
+        let strong = allocation_candidate("BTC", 1, 10, 120, 10, 10, 1_000);
+        let weak = allocation_candidate("ETH", 2, 10, 50, 10, 20, 1_000);
+        let forward = allocate_cross_sectional(
+            &[strong.clone(), weak.clone()],
+            Decimal::from(1_000),
+            Decimal::from(1_000),
+        )
+        .unwrap();
+        let reverse =
+            allocate_cross_sectional(&[weak, strong], Decimal::from(1_000), Decimal::from(1_000))
+                .unwrap();
+        assert_eq!(forward, reverse);
+        assert_eq!(forward["BTC"].policy_state, MfcePolicyState::Exploit);
+        assert_eq!(forward["ETH"].policy_state, MfcePolicyState::Exploit);
+        assert!(forward["BTC"].allocation_fraction > forward["ETH"].allocation_fraction);
+        let total_fraction = forward["BTC"]
+            .allocation_fraction
+            .checked_add(forward["ETH"].allocation_fraction)
+            .unwrap();
+        assert!(total_fraction <= Decimal::ONE);
+        assert!(total_fraction > Decimal::from_parts(999_999, 0, 0, false, 6));
+    }
+
+    #[test]
+    fn no_incumbent_explores_negative_backoff_and_conviction_sets_the_prior() {
+        let mut low_conviction = allocation_candidate("LOW", 1, -100, -50, 10, 20, 1_000);
+        low_conviction.input.prediction.used_model = false;
+        low_conviction.input.copytrade_conviction = Decimal::ZERO;
+        let mut high_conviction = allocation_candidate("HIGH", 2, -100, -50, 10, 20, 1_000);
+        high_conviction.input.prediction.used_model = false;
+        high_conviction.input.copytrade_conviction = Decimal::ONE;
+
+        let decisions = allocate_cross_sectional(
+            &[low_conviction, high_conviction],
+            Decimal::from(10_000),
+            Decimal::from(10_000),
+        )
+        .unwrap();
+        assert_eq!(decisions["LOW"].policy_state, MfcePolicyState::Explore);
+        assert_eq!(decisions["HIGH"].policy_state, MfcePolicyState::Explore);
+        assert!(decisions["LOW"].admitted);
+        assert!(decisions["HIGH"].admitted);
+        assert!(decisions["HIGH"].allocation_fraction > decisions["LOW"].allocation_fraction);
+
+        let model_backed = allocation_candidate("MODEL", 3, -100, -50, 10, 20, 1_000);
+        let decision = allocate_cross_sectional(
+            &[model_backed],
+            Decimal::from(10_000),
+            Decimal::from(10_000),
+        )
+        .unwrap();
+        assert_eq!(decision["MODEL"].policy_state, MfcePolicyState::Reject);
+        assert_eq!(
+            decision["MODEL"].reason,
+            Some(MfceRejectionReason::StrongNegativeExpectancy)
+        );
+    }
+
+    #[test]
+    fn incumbent_candidate_capacity_is_measured_above_its_no_new_risk_baseline() {
+        for (current, proposed, expected_baseline) in
+            [(0, 100, 0), (40, 100, 40), (40, -100, 0), (100, 40, 40)]
+        {
+            let current = Decimal::from(current);
+            let proposed = Decimal::from(proposed);
+            let baseline = allocation_baseline_target(current, proposed);
+            assert_eq!(baseline, Decimal::from(expected_baseline));
+            let requested = requested_risk_increase(current, proposed).unwrap();
+            assert_eq!(
+                baseline.abs().checked_add(requested).unwrap(),
+                proposed.abs()
+            );
+        }
+
+        let incumbent = allocation_candidate("BTC", 1, 10, 120, 10, 10, 100);
+        let source_capacity = Decimal::from(100);
+        let committed_baseline = allocation_baseline_target(
+            incumbent.input.current_position_notional,
+            incumbent.input.proposed_position_notional,
+        )
+        .abs();
+        let available = source_capacity.checked_sub(committed_baseline).unwrap();
+        let decisions =
+            allocate_cross_sectional(&[incumbent], available, Decimal::from(1_000)).unwrap();
+        assert_eq!(decisions["BTC"].allocation_fraction, Decimal::ONE);
+    }
+
+    #[test]
+    fn many_explore_states_share_one_bounded_global_pool() {
+        let candidates = (0..30)
+            .map(|index| {
+                allocation_candidate(&format!("A{index:02}"), index + 1, -40, 30, 10, 25, 100)
+            })
+            .collect::<Vec<_>>();
+        let decisions =
+            allocate_cross_sectional(&candidates, Decimal::from(1_000), Decimal::from(1_000))
+                .unwrap();
+        let allocated = decisions
+            .values()
+            .try_fold(Decimal::ZERO, |total, decision| {
+                total
+                    .checked_add(
+                        Decimal::from(100)
+                            .checked_mul(decision.allocation_fraction)
+                            .unwrap(),
+                    )
+                    .ok_or(MfceError::Arithmetic)
+            });
+        let allocated = allocated.unwrap();
+        assert!(allocated <= Decimal::from(250));
+        assert!(allocated > Decimal::from_parts(249_999_999, 0, 0, false, 6));
+        assert!(
+            decisions
+                .values()
+                .all(|decision| decision.policy_state == MfcePolicyState::Explore),
+            "unexpected decisions: {decisions:?}"
+        );
+    }
+
+    #[test]
+    fn a_single_uncertain_explore_state_is_limited_below_the_pool_ceiling() {
+        let candidate = allocation_candidate("MEME", 1, -1_000, 11, 10, 100, 1_000);
+        let decisions =
+            allocate_cross_sectional(&[candidate], Decimal::from(1_000), Decimal::from(1_000))
+                .unwrap();
+        let decision = &decisions["MEME"];
+        assert_eq!(decision.policy_state, MfcePolicyState::Explore);
+        assert!(decision.allocation_fraction > Decimal::ZERO);
+        assert!(decision.allocation_fraction < Decimal::from_parts(1, 0, 0, false, 1));
+        assert!(decision.allocation_fraction < MFCE_EXPLORE_POOL_FRACTION);
+    }
+
+    #[test]
+    fn explore_pool_cannot_crowd_out_exploit_and_tail_budget_stays_global() {
+        let exploit = allocation_candidate("BTC", 1, -90, 100, 10, 10, 1_000);
+        let explore = allocation_candidate("ETH", 2, -90, 30, 10, 25, 1_000);
+        let decisions =
+            allocate_cross_sectional(&[exploit, explore], Decimal::from(1_000), Decimal::from(15))
+                .unwrap();
+        assert_eq!(decisions["BTC"].policy_state, MfcePolicyState::Exploit);
+        assert_eq!(decisions["ETH"].policy_state, MfcePolicyState::Explore);
+        let total_tail = decisions
+            .values()
+            .try_fold(Decimal::ZERO, |total, decision| {
+                total
+                    .checked_add(decision.modeled_tail_loss_usd)
+                    .ok_or(MfceError::Arithmetic)
+            });
+        assert!(total_tail.unwrap() <= Decimal::from(15));
+        assert!(decisions["BTC"].allocation_fraction > decisions["ETH"].allocation_fraction);
+    }
+
+    #[test]
+    fn model_allocation_scales_openings_expansions_and_reversals() {
+        assert_eq!(
+            allocated_target(
+                Decimal::ZERO,
+                Decimal::from(100),
+                MFCE_EXPLORE_POOL_FRACTION,
+            )
+            .unwrap(),
+            Decimal::from(25)
+        );
+        assert_eq!(
+            allocated_target(
+                Decimal::from(50),
+                Decimal::from(100),
+                MFCE_EXPLORE_POOL_FRACTION,
+            )
+            .unwrap(),
+            Decimal::new(625, 1)
+        );
+        assert_eq!(
+            allocated_target(
+                Decimal::from(50),
+                Decimal::from(-100),
+                MFCE_EXPLORE_POOL_FRACTION,
+            )
+            .unwrap(),
+            Decimal::from(-25)
+        );
     }
 
     #[test]
@@ -2472,6 +3409,31 @@ mod tests {
     }
 
     #[test]
+    fn empty_engine_serves_a_conservative_exploration_prior() {
+        let engine = MfceEngine::default();
+        let prediction = engine
+            .predict("BTC", MfceDirection::Long, &features(1))
+            .unwrap();
+        assert!(!prediction.used_model);
+        assert_eq!(prediction.pooled_sample_count, 0);
+        assert_eq!(prediction.q10_gross_bps, MFCE_BOOTSTRAP_Q10_BPS);
+        assert_eq!(prediction.q50_gross_bps, MFCE_BOOTSTRAP_Q50_BPS);
+        assert_eq!(prediction.uncertainty_bps, MFCE_BOOTSTRAP_UNCERTAINTY_BPS);
+        let decision = evaluate_allocation_policy(&MfceAllocationInput {
+            prediction,
+            friction_bps: Decimal::from(10),
+            copytrade_conviction: Decimal::ONE,
+            current_position_notional: Decimal::ZERO,
+            proposed_position_notional: Decimal::from(1_000),
+            remaining_tail_loss_budget_usd: Decimal::from(1_000),
+        })
+        .unwrap();
+        assert_eq!(decision.policy_state, MfcePolicyState::Explore);
+        assert!(decision.admitted);
+        assert!(decision.allocation_fraction > Decimal::ZERO);
+    }
+
+    #[test]
     fn tail_reservation_scales_with_mark_and_partial_reduction() {
         let mut engine = MfceEngine::default();
         engine.note_accepted_source_snapshot().unwrap();
@@ -2498,12 +3460,17 @@ mod tests {
             used_model: false,
         };
         engine
-            .record_admission(
+            .record_allocation(
                 "BTC",
                 opened.transition_id.unwrap(),
-                &MfceAdmissionDecision {
+                &MfceAllocationDecision {
+                    policy_state: MfcePolicyState::Exploit,
                     admitted: true,
                     reason: None,
+                    allocation_fraction: Decimal::ONE,
+                    opportunity_score: Decimal::ONE,
+                    net_q50_bps: Decimal::from(100),
+                    conservative_edge_bps: Decimal::from(100),
                     net_q10_bps: Decimal::from(-100),
                     required_median_bps: Decimal::ZERO,
                     modeled_tail_loss_usd: Decimal::ONE,
@@ -2694,6 +3661,28 @@ mod tests {
         assert!(score.candidate_q10_pinball < score.incumbent_q10_pinball);
         assert!(score.candidate_q50_pinball < score.incumbent_q50_pinball);
         assert_eq!(score.candidate_q10_below_fraction, 1.0);
-        assert!(!score.passes(labels.len()));
+        assert!(!score.passes_incumbent_comparison(labels.len()));
+        assert!(!score.passes_cold_start(labels.len()));
+    }
+
+    #[test]
+    fn cold_start_promotion_requires_calibration_not_incumbent_superiority() {
+        let score = ChronologicalValidationScore {
+            candidate_q10_pinball: 10.0,
+            candidate_q50_pinball: 10.0,
+            incumbent_q10_pinball: 1.0,
+            incumbent_q50_pinball: 1.0,
+            candidate_q10_below_fraction: 0.10,
+            candidate_q50_below_fraction: 0.50,
+            incumbent_q10_below_fraction: 0.10,
+        };
+        assert!(score.passes_cold_start(20));
+        assert!(!score.passes_incumbent_comparison(20));
+
+        let uncalibrated = ChronologicalValidationScore {
+            candidate_q10_below_fraction: 0.30,
+            ..score
+        };
+        assert!(!uncalibrated.passes_cold_start(20));
     }
 }
