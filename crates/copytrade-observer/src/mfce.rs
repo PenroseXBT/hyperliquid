@@ -713,9 +713,30 @@ impl MfceEngine {
             })
             .map(|(_, output)| output.clone())
             .collect();
+        // `AwaitingLiveBook` is also used internally to request a fresh
+        // friction evaluation for an already-evaluated transition. Keep that
+        // refresh demand out of the external funnel: a transition is truly
+        // book-awaiting only until its first complete policy output exists.
+        report.awaiting_live_books = self
+            .state
+            .assets
+            .iter()
+            .filter(|(asset, state)| {
+                let MfceAdmissionState::AwaitingLiveBook { transition_id } = state.admission else {
+                    return false;
+                };
+                !self
+                    .policy_outputs
+                    .get(*asset)
+                    .is_some_and(|output| output.transition_id == transition_id)
+            })
+            .count();
         report
     }
 
+    /// Assets whose live context should be refreshed. This deliberately
+    /// includes evaluated transitions and is therefore broader than the
+    /// externally reported `awaiting_live_books` funnel count.
     pub fn awaiting_book_assets(&self) -> impl Iterator<Item = &String> {
         self.state.assets.iter().filter_map(|(asset, state)| {
             matches!(state.admission, MfceAdmissionState::AwaitingLiveBook { .. }).then_some(asset)
@@ -1574,9 +1595,10 @@ pub fn evaluate_allocation_policy(
         .ok_or_else(|| MfceError::InvalidState("single MFCE allocation disappeared".into()))
 }
 
-/// Ranks one timestamp-consistent transition set and divides the remaining
-/// source sleeve among it. Explore may use at most one bounded global pool;
-/// it is never multiplied by the number of uncertain opportunities.
+/// Ranks one timestamp-consistent transition set and divides remaining hard
+/// portfolio capacity among it. Proven Exploit states receive first claim;
+/// Explore may borrow what remains, while the shared q10 tail-loss budget and
+/// deterministic portfolio projection stay sovereign.
 pub fn allocate_cross_sectional(
     candidates: &[MfceCrossSectionalCandidate],
     available_increment_notional: Decimal,
@@ -1607,38 +1629,9 @@ pub fn allocate_cross_sectional(
         decisions.insert(candidate.asset.clone(), decision);
     }
 
-    let explore_demand = candidates
-        .iter()
-        .try_fold(Decimal::ZERO, |total, candidate| {
-            let decision = decisions
-                .get(&candidate.asset)
-                .ok_or_else(|| MfceError::InvalidState("missing MFCE policy decision".into()))?;
-            if decision.policy_state == MfcePolicyState::Explore {
-                let explore_fraction = explore_target_fraction(decision, &candidate.input)?;
-                total
-                    .checked_add(
-                        requested[&candidate.asset]
-                            .checked_mul(explore_fraction)
-                            .ok_or(MfceError::Arithmetic)?,
-                    )
-                    .ok_or(MfceError::Arithmetic)
-            } else {
-                Ok(total)
-            }
-        })?;
-    let explore_budget = available_increment_notional
-        .checked_mul(MFCE_EXPLORE_POOL_FRACTION)
-        .ok_or(MfceError::Arithmetic)?
-        .min(explore_demand);
-    let exploit_budget = available_increment_notional
-        .checked_sub(explore_budget)
-        .ok_or(MfceError::Arithmetic)?;
-
     let mut allocated_increment = BTreeMap::new();
-    for (state, budget) in [
-        (MfcePolicyState::Exploit, exploit_budget),
-        (MfcePolicyState::Explore, explore_budget),
-    ] {
+    let mut remaining_notional = available_increment_notional;
+    for state in [MfcePolicyState::Exploit, MfcePolicyState::Explore] {
         let mut group = Vec::new();
         for candidate in candidates {
             let decision = &decisions[&candidate.asset];
@@ -1659,10 +1652,18 @@ pub fn allocate_cross_sectional(
             // Proportional dust across a large cold-start cross-section is not
             // useful exploration. Fund the highest-conviction small probes up
             // to their individual caps, then continue down the stable ranking.
-            ranked_capped_allocations(&group, budget)?
+            ranked_capped_allocations(&group, remaining_notional)?
         } else {
-            weighted_capped_allocations(&group, budget)?
+            weighted_capped_allocations(&group, remaining_notional)?
         };
+        let group_usage = group_allocations
+            .values()
+            .try_fold(Decimal::ZERO, |total, allocation| {
+                total.checked_add(*allocation).ok_or(MfceError::Arithmetic)
+            })?;
+        remaining_notional = remaining_notional
+            .checked_sub(group_usage)
+            .ok_or(MfceError::Arithmetic)?;
         for (asset, allocation) in group_allocations {
             allocated_increment.insert(asset, allocation);
         }
@@ -2910,6 +2911,8 @@ mod tests {
             )
             .unwrap();
         let transition_id = opened.transition_id.unwrap();
+        assert_eq!(engine.report().awaiting_live_books, 1);
+        assert!(engine.report().policy_outputs.is_empty());
         assert_eq!(
             engine
                 .pending_position_notional("BTC", transition_id, Decimal::from(80))
@@ -2975,6 +2978,8 @@ mod tests {
         assert_eq!(engine.report().observed_transitions, 1);
         assert_eq!(engine.report().decision_counts.exploit, 1);
         assert_eq!(engine.report().decision_counts.allocated, 1);
+        assert_eq!(engine.report().awaiting_live_books, 0);
+        assert_eq!(engine.report().policy_outputs.len(), 1);
 
         // Repricing and a fresh book may reevaluate the same transition, but
         // the rolling funnel must continue to count one unique opportunity.
@@ -2991,6 +2996,9 @@ mod tests {
             )
             .unwrap();
         assert_eq!(recheck.transition_id, Some(transition_id));
+        assert_eq!(engine.awaiting_book_assets().count(), 1);
+        assert_eq!(engine.report().awaiting_live_books, 0);
+        assert_eq!(engine.report().policy_outputs.len(), 1);
         engine
             .record_allocation(
                 "BTC",
@@ -3234,7 +3242,7 @@ mod tests {
     }
 
     #[test]
-    fn many_explore_states_share_one_bounded_global_pool() {
+    fn cold_start_explore_can_borrow_idle_gross_but_remains_cross_sectionally_bounded() {
         let candidates = (0..30)
             .map(|index| {
                 allocation_candidate(&format!("A{index:02}"), index + 1, -40, 30, 10, 25, 100)
@@ -3255,13 +3263,32 @@ mod tests {
                     .ok_or(MfceError::Arithmetic)
             });
         let allocated = allocated.unwrap();
-        assert!(allocated <= Decimal::from(250));
-        assert!(allocated > Decimal::from_parts(249_999_999, 0, 0, false, 6));
+        assert!(allocated <= Decimal::from(1_000));
+        assert!(allocated > Decimal::from(250));
         assert!(
             decisions
                 .values()
                 .all(|decision| decision.policy_state == MfcePolicyState::Explore),
             "unexpected decisions: {decisions:?}"
+        );
+    }
+
+    #[test]
+    fn exploit_has_first_claim_and_explore_uses_only_idle_notional_capacity() {
+        let exploit = allocation_candidate("PROVEN", 1, -90, 100, 10, 10, 1_000);
+        let explore = allocation_candidate("UNKNOWN", 2, -40, 30, 10, 25, 100);
+        let decisions = allocate_cross_sectional(
+            &[exploit, explore],
+            Decimal::from(100),
+            Decimal::from(1_000),
+        )
+        .unwrap();
+        assert!(decisions["PROVEN"].admitted);
+        assert_eq!(decisions["PROVEN"].allocation_fraction, Decimal::new(1, 1));
+        assert!(!decisions["UNKNOWN"].admitted);
+        assert_eq!(
+            decisions["UNKNOWN"].reason,
+            Some(MfceRejectionReason::AllocationBudgetExhausted)
         );
     }
 

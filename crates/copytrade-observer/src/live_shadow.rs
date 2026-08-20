@@ -36,7 +36,9 @@ use copytrade_core::exit_planning::{
 };
 use copytrade_core::ledger::DualLedger;
 use copytrade_core::portfolio_risk::project_and_validate_portfolio;
-use copytrade_core::portfolio_risk::{MarketRules, PortfolioProjectionInput};
+use copytrade_core::portfolio_risk::{
+    MarketRules, OpenOrderExposure, OpenOrderLifecycle, OrderSide, PortfolioProjectionInput,
+};
 use copytrade_core::scheduler::SourceTier;
 use copytrade_core::scheduler::{SnapshotAcceptance, SnapshotStore, SourceSnapshot, Timestamp};
 use copytrade_core::shadow::{
@@ -1227,6 +1229,32 @@ struct PendingBookIntent {
     first_seen_at_mono: Timestamp,
 }
 
+fn projected_exposure_notional(
+    current: Decimal,
+    pending_signed: Option<Decimal>,
+    admitted_target: Option<Decimal>,
+    replaces_outstanding: bool,
+) -> Result<Decimal, LiveShadowError> {
+    if replaces_outstanding {
+        return Ok(current);
+    }
+    let mut projected = current;
+    if let Some(pending_signed) = pending_signed {
+        let endpoint = current
+            .checked_add(pending_signed)
+            .ok_or(LiveShadowError::Arithmetic)?;
+        if endpoint.abs() > projected.abs() {
+            projected = endpoint;
+        }
+    }
+    if let Some(admitted_target) = admitted_target {
+        if admitted_target.abs() > projected.abs() {
+            projected = admitted_target;
+        }
+    }
+    Ok(projected)
+}
+
 fn pending_action_is_immaterial_replacement(
     previous: &copytrade_core::decision::PlannedAction,
     next: &copytrade_core::decision::PlannedAction,
@@ -1873,6 +1901,48 @@ impl LiveShadowEngine {
             .as_ref()
             .map(|positions| positions.keys().cloned().collect())
             .unwrap_or_else(|| self.ledger.portfolio_assets())
+    }
+
+    fn pending_open_orders_excluding(
+        &self,
+        replaced_assets: &BTreeSet<String>,
+    ) -> Vec<OpenOrderExposure> {
+        self.pending
+            .iter()
+            .filter(|(asset, _)| !replaced_assets.contains(asset.as_str()))
+            .map(|(asset, pending)| OpenOrderExposure {
+                asset: asset.clone(),
+                side: Some(match pending.action.side {
+                    Side::Buy => OrderSide::Buy,
+                    Side::Sell => OrderSide::Sell,
+                }),
+                notional: Some(pending.action.rounded_notional),
+                lifecycle: OpenOrderLifecycle::Acknowledged,
+            })
+            .collect()
+    }
+
+    fn projected_existing_notional(
+        &self,
+        asset: &str,
+        current: Decimal,
+        replaces_outstanding: bool,
+    ) -> Result<Decimal, LiveShadowError> {
+        let pending_signed = self
+            .pending
+            .get(asset)
+            .map(|pending| match pending.action.side {
+                Side::Buy => pending.action.rounded_notional,
+                Side::Sell => -pending.action.rounded_notional,
+            });
+        projected_exposure_notional(
+            current,
+            pending_signed,
+            self.target_ledger
+                .get(asset)
+                .map(|target| target.admitted_target_notional),
+            replaces_outstanding,
+        )
     }
 
     pub fn ingest(
@@ -2874,39 +2944,6 @@ impl LiveShadowEngine {
         let maximum_slippage_bps = Decimal::from_f64(self.config.execution.max_slippage_bps)
             .ok_or(LiveShadowError::Arithmetic)?;
         let total_tail_budget = remaining_mfce_tail_budget(&self.config, deployment)?;
-        let mut existing_tail_reservations = Decimal::ZERO;
-        for asset in self.mfce.tracked_assets() {
-            let Some(mark) = mids.mids.get(asset).copied() else {
-                continue;
-            };
-            let current_source_notional = if self.production_positions.is_some() {
-                self.authoritative_position(asset)
-                    .checked_mul(mark)
-                    .ok_or(LiveShadowError::Arithmetic)?
-            } else {
-                self.ledger
-                    .source_positions_for_asset(asset)
-                    .into_iter()
-                    .filter(|(component, _)| !component.starts_with("technical:"))
-                    .try_fold(Decimal::ZERO, |total, (_, quantity)| {
-                        quantity
-                            .checked_mul(mark)
-                            .and_then(|notional| total.checked_add(notional))
-                            .ok_or(LiveShadowError::Arithmetic)
-                    })?
-            };
-            existing_tail_reservations = existing_tail_reservations
-                .checked_add(
-                    self.mfce
-                        .reserved_tail_loss_usd(asset, current_source_notional)
-                        .map_err(mfce_error)?,
-                )
-                .ok_or(LiveShadowError::Arithmetic)?;
-        }
-        let remaining_tail_budget = total_tail_budget
-            .checked_sub(existing_tail_reservations)
-            .unwrap_or(Decimal::ZERO)
-            .max(Decimal::ZERO);
         let source_capacity = available_gross;
         let mut allocation_candidates = Vec::new();
         let mut target_contexts = BTreeMap::new();
@@ -3107,7 +3144,7 @@ impl LiveShadowEngine {
                                             .min(Decimal::ONE),
                                         current_position_notional: current_source_target,
                                         proposed_position_notional: admission_target,
-                                        remaining_tail_loss_budget_usd: remaining_tail_budget,
+                                        remaining_tail_loss_budget_usd: total_tail_budget,
                                     },
                                     prior_tail_loss_usd: prior_tail_reservation,
                                 });
@@ -3133,33 +3170,51 @@ impl LiveShadowEngine {
                 }
             }
         }
+        let mut allocation_replacement_assets = BTreeSet::new();
         if mfce_sources_hydrated {
-            let ranked_assets = allocation_candidates
+            allocation_replacement_assets = allocation_candidates
                 .iter()
-                .map(|candidate| candidate.asset.as_str())
+                .map(|candidate| candidate.asset.clone())
                 .collect::<BTreeSet<_>>();
-            let committed_source_gross =
-                target_contexts
-                    .iter()
-                    .try_fold(Decimal::ZERO, |total, (asset, context)| {
-                        let committed_target = if ranked_assets.contains(asset.as_str()) {
-                            allocation_baseline_target(
-                                context.current_source_target,
-                                context.raw_desired_source_target,
-                            )
-                        } else {
-                            self.mfce.effective_target(
-                                asset,
-                                context.current_source_target,
-                                context.raw_desired_source_target,
-                            )
-                        };
-                        total
-                            .checked_add(committed_target.abs())
-                            .ok_or(LiveShadowError::Arithmetic)
-                    })?;
+            let mut committed_source_gross = Decimal::ZERO;
+            let mut existing_tail_reservations = Decimal::ZERO;
+            for (asset, context) in &target_contexts {
+                let replaces_outstanding = allocation_replacement_assets.contains(asset);
+                let committed_target = if replaces_outstanding {
+                    allocation_baseline_target(
+                        context.current_source_target,
+                        context.raw_desired_source_target,
+                    )
+                } else {
+                    self.mfce.effective_target(
+                        asset,
+                        context.current_source_target,
+                        context.raw_desired_source_target,
+                    )
+                };
+                let projected_notional = self.projected_existing_notional(
+                    asset,
+                    committed_target,
+                    replaces_outstanding,
+                )?;
+                let projected_magnitude = projected_notional.abs().max(committed_target.abs());
+                committed_source_gross = committed_source_gross
+                    .checked_add(projected_magnitude)
+                    .ok_or(LiveShadowError::Arithmetic)?;
+                existing_tail_reservations = existing_tail_reservations
+                    .checked_add(
+                        self.mfce
+                            .reserved_tail_loss_usd(asset, projected_notional)
+                            .map_err(mfce_error)?,
+                    )
+                    .ok_or(LiveShadowError::Arithmetic)?;
+            }
             let available_increment_notional = source_capacity
                 .checked_sub(committed_source_gross)
+                .unwrap_or(Decimal::ZERO)
+                .max(Decimal::ZERO);
+            let remaining_tail_budget = total_tail_budget
+                .checked_sub(existing_tail_reservations)
                 .unwrap_or(Decimal::ZERO)
                 .max(Decimal::ZERO);
             let decisions = allocate_cross_sectional(
@@ -3252,7 +3307,8 @@ impl LiveShadowEngine {
                 .ok_or(LiveShadowError::Arithmetic)?,
             filled_positions,
             filled_position_state_complete: true,
-            acknowledged_open_orders: vec![],
+            acknowledged_open_orders: self
+                .pending_open_orders_excluding(&allocation_replacement_assets),
             open_order_state_complete: true,
             unconstrained_targets: BTreeMap::new(),
             market_rules,
@@ -3406,6 +3462,42 @@ impl LiveShadowEngine {
             .into_iter()
             .map(|action| (action.asset.clone(), action))
             .collect::<BTreeMap<_, _>>();
+        for asset in &allocation_replacement_assets {
+            let rules = execution_rules
+                .get(asset)
+                .ok_or_else(|| LiveShadowError::InvalidMarket(asset.clone()))?;
+            let tolerance = rules
+                .mark_price
+                .checked_mul(rules.size_step)
+                .ok_or(LiveShadowError::Arithmetic)?;
+            let should_retain = self.pending.get(asset).is_some_and(|previous| {
+                executable_by_asset.get(asset).is_some_and(|replacement| {
+                    pending_action_is_immaterial_replacement(
+                        &previous.action,
+                        replacement,
+                        tolerance,
+                    )
+                })
+            });
+            if should_retain {
+                continue;
+            }
+            if let Some(previous) = self.pending.remove(asset) {
+                self.action_lifecycle_events.push(ActionLifecycleEvent {
+                    asset: asset.clone(),
+                    decision_id: previous.action.decision_id.to_string(),
+                    planned_cloid: previous.action.planned_cloid.to_string(),
+                    root_planned_cloid: previous.root_planned_cloid,
+                    parent_planned_cloid: previous.parent_planned_cloid,
+                    retry_generation: previous.action.retry_generation,
+                    observed_at_mono: now,
+                    requested_notional: previous.action.rounded_notional,
+                    filled_quantity: None,
+                    unfilled_quantity: None,
+                    outcome: ActionAttemptOutcome::SupersededByNewTarget,
+                });
+            }
+        }
         let waiting_assets = self.pending_book.keys().cloned().collect::<Vec<_>>();
         for asset in waiting_assets {
             let fresh_book = self
@@ -5452,6 +5544,62 @@ mod tests {
     use serde::ser::SerializeMap;
     use serde::Deserialize;
     use std::path::Path;
+
+    #[test]
+    fn projected_usage_counts_outstanding_increment_before_fill_without_double_counting() {
+        assert_eq!(
+            projected_exposure_notional(
+                Decimal::from(10),
+                Some(Decimal::from(5)),
+                Some(Decimal::from(15)),
+                false,
+            )
+            .unwrap(),
+            Decimal::from(15)
+        );
+        assert_eq!(
+            projected_exposure_notional(Decimal::from(15), None, Some(Decimal::from(15)), false,)
+                .unwrap(),
+            Decimal::from(15)
+        );
+        assert_eq!(
+            projected_exposure_notional(
+                Decimal::from(15),
+                Some(Decimal::from(-7)),
+                Some(Decimal::from(8)),
+                false,
+            )
+            .unwrap(),
+            Decimal::from(15),
+            "a reduction reserves no additional gross risk"
+        );
+    }
+
+    #[test]
+    fn projected_usage_handles_reversal_and_atomic_target_replacement() {
+        assert_eq!(
+            projected_exposure_notional(
+                Decimal::from(10),
+                Some(Decimal::from(-15)),
+                Some(Decimal::from(-5)),
+                false,
+            )
+            .unwrap(),
+            Decimal::from(10),
+            "a long-ten to short-five crossing has no endpoint above ten"
+        );
+        assert_eq!(
+            projected_exposure_notional(
+                Decimal::from(10),
+                Some(Decimal::from(20)),
+                Some(Decimal::from(30)),
+                true,
+            )
+            .unwrap(),
+            Decimal::from(10),
+            "reevaluation replaces the old outstanding target instead of accumulating it"
+        );
+    }
 
     #[test]
     fn stream_continuity_replaces_wallet_age_and_gaps_fail_closed() {
