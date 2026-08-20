@@ -16,11 +16,7 @@ COPY --chmod=0444 railway-frozen/copytrade.json /app/config/copytrade.json
 COPY --chmod=0444 railway-frozen/very-profitable-layer.json /app/config/very-profitable-layer.json
 COPY --chmod=0444 railway-frozen/read-api-policy.json /app/policy/read-api-policy.json
 COPY --chmod=0444 railway-frozen/public-mainnet-transport.json /app/policy/public-mainnet-transport.json
-COPY --chmod=0444 railway-frozen/release-manifest.json /app/frozen/release-manifest.json
-COPY --chmod=0444 railway-frozen/release-manifest.sha256 /app/frozen/release-manifest.sha256
-COPY --chmod=0444 railway-frozen/frozen-identity.json /app/frozen/frozen-identity.json
-COPY --chmod=0444 railway-frozen/isolation-report.txt /app/frozen/isolation-report.txt
-COPY --chmod=0444 THIRD_PARTY_NOTICES.md /app/frozen/THIRD_PARTY_NOTICES.md
+COPY --chmod=0444 THIRD_PARTY_NOTICES.md /app/THIRD_PARTY_NOTICES.md
 
 # Fail the image build if the frozen observer cannot load on the exact runtime
 # base (for example, because a Linux C++ runtime dependency leaked in).

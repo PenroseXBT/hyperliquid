@@ -462,23 +462,36 @@ async fn run_qualification_impl<const CONTINUOUS: bool>(
             &transport_policy,
         )?
     };
-    let manifest = load_release_manifest(&options.release_manifest_path)?;
-    verify_isolation_report(&options.isolation_report_path)?;
-    let production_manifest = manifest.qualification_stage == "PRODUCTION_RELEASE";
-    let stage_matches =
-        manifest_stage_matches(options.production.is_some(), &manifest.qualification_stage);
-    let binary_matches = if production_manifest {
-        manifest.observer_binary_sha256.as_deref() == Some(&sha256_file(std::env::current_exe()?)?)
+    // Build assurance is deliberately not runtime authority for the continuous
+    // unsigned daemon. CI verifies isolation, source identity, and release
+    // reproducibility before deployment; production startup validates only the
+    // runtime configuration, durable state, and hard trading invariants.
+    let manifest = if CONTINUOUS {
+        None
     } else {
-        manifest.binary_sha256 == sha256_file(std::env::current_exe()?)?
+        let manifest = load_release_manifest(&options.release_manifest_path)?;
+        verify_isolation_report(&options.isolation_report_path)?;
+        let production_manifest = manifest.qualification_stage == "PRODUCTION_RELEASE";
+        let stage_matches =
+            manifest_stage_matches(options.production.is_some(), &manifest.qualification_stage);
+        let binary_matches = if production_manifest {
+            manifest.observer_binary_sha256.as_deref()
+                == Some(&sha256_file(std::env::current_exe()?)?)
+        } else {
+            manifest.binary_sha256 == sha256_file(std::env::current_exe()?)?
+        };
+        if !stage_matches
+            || manifest.configuration_sha256 != derive_config_hash(&config)?.to_hex()
+            || manifest.risk_policy_sha256 != derive_risk_policy_hash(&config.global_risk)?.to_hex()
+            || !binary_matches
+        {
+            return Err("release manifest mismatch".into());
+        }
+        Some(manifest)
     };
-    if !stage_matches
-        || manifest.configuration_sha256 != derive_config_hash(&config)?.to_hex()
-        || manifest.risk_policy_sha256 != derive_risk_policy_hash(&config.global_risk)?.to_hex()
-        || !binary_matches
-    {
-        return Err("release manifest mismatch".into());
-    }
+    let binary_sha256 = sha256_file(std::env::current_exe()?)?;
+    let configuration_sha256 = derive_config_hash(&config)?.to_hex();
+    let risk_policy_sha256 = derive_risk_policy_hash(&config.global_risk)?.to_hex();
     let wall_ms: u64 = SystemTime::now()
         .duration_since(UNIX_EPOCH)?
         .as_millis()
@@ -489,7 +502,7 @@ async fn run_qualification_impl<const CONTINUOUS: bool>(
         "{}-{}-{}",
         wall_ms,
         std::process::id(),
-        &manifest.binary_sha256[..12]
+        &binary_sha256[..12]
     );
     let output = if CONTINUOUS {
         options.output.clone()
@@ -520,12 +533,21 @@ async fn run_qualification_impl<const CONTINUOUS: bool>(
             }
         },
         run_id,
-        binary_sha256: manifest.binary_sha256.clone(),
-        source_tree_sha256: manifest.source_tree_sha256.clone(),
-        git_commit: manifest.git_commit.clone(),
-        git_tree_state: manifest.git_tree_state.clone(),
-        configuration_sha256: manifest.configuration_sha256.clone(),
-        risk_policy_sha256: manifest.risk_policy_sha256.clone(),
+        binary_sha256,
+        source_tree_sha256: manifest
+            .as_ref()
+            .map(|manifest| manifest.source_tree_sha256.clone())
+            .unwrap_or_else(|| "build-time-only".into()),
+        git_commit: manifest
+            .as_ref()
+            .map(|manifest| manifest.git_commit.clone())
+            .unwrap_or_else(|| "build-time-only".into()),
+        git_tree_state: manifest
+            .as_ref()
+            .map(|manifest| manifest.git_tree_state.clone())
+            .unwrap_or_else(|| "build-time-only".into()),
+        configuration_sha256,
+        risk_policy_sha256,
         read_policy_sha256: sha256_json(&read_policy_value)?,
         transport_policy_sha256: sha256_json(&transport_policy_value)?,
         start_wall_clock_utc_ms: wall_ms,
@@ -625,7 +647,7 @@ async fn run_qualification_impl<const CONTINUOUS: bool>(
     )?;
     let mut engine = LiveShadowEngine::new(
         config.clone(),
-        manifest.binary_sha256.as_bytes(),
+        header.binary_sha256.as_bytes(),
         header.run_id.clone(),
         active_freshness,
         inactive_freshness,
@@ -642,10 +664,13 @@ async fn run_qualification_impl<const CONTINUOUS: bool>(
     let mut cohort_record_cursor = 0usize;
     let mut technical_record_cursor = 0usize;
     let state_identity = UnsignedShadowStateIdentity {
-        source_tree_sha256: manifest.source_tree_sha256.clone(),
-        observer_binary_sha256: sha256_file(std::env::current_exe()?)?,
-        configuration_sha256: manifest.configuration_sha256.clone(),
-        risk_policy_sha256: manifest.risk_policy_sha256.clone(),
+        // Retain the schema-v8 identity shape while removing build artifacts
+        // from restore authority. Runtime compatibility is bound to the
+        // validated configuration/risk contract and persistence schema.
+        source_tree_sha256: "build-time-only".into(),
+        observer_binary_sha256: "build-time-only".into(),
+        configuration_sha256: header.configuration_sha256.clone(),
+        risk_policy_sha256: header.risk_policy_sha256.clone(),
     };
     let mut state_root = options
         .state_root

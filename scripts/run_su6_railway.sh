@@ -7,10 +7,6 @@ readonly CONFIG="/app/config/copytrade.json"
 readonly VERY_PROFITABLE_LAYER="/app/config/very-profitable-layer.json"
 readonly READ_POLICY="/app/policy/read-api-policy.json"
 readonly TRANSPORT_POLICY="/app/policy/public-mainnet-transport.json"
-readonly MANIFEST="/app/frozen/release-manifest.json"
-readonly MANIFEST_DIGEST="/app/frozen/release-manifest.sha256"
-readonly EMBEDDED_IDENTITY="/app/frozen/frozen-identity.json"
-readonly ISOLATION_REPORT="/app/frozen/isolation-report.txt"
 
 readonly VOLUME_ROOT="${RAILWAY_VOLUME_MOUNT_PATH:?RAILWAY_VOLUME_MOUNT_PATH is required}"
 readonly DATA_ROOT_NAME="${SU6_DATA_ROOT_NAME:?SU6_DATA_ROOT_NAME is required}"
@@ -22,7 +18,6 @@ readonly DATA_ROOT="${VOLUME_ROOT}/${DATA_ROOT_NAME}"
 readonly STATE_ROOT="${DATA_ROOT}/state"
 readonly RUNTIME_ROOT="${DATA_ROOT}/runtime"
 readonly FAILURE_ROOT="${DATA_ROOT}/failure"
-readonly VOLUME_IDENTITY="${DATA_ROOT}/frozen-identity.json"
 readonly FATAL_STOP_MARKER="${STATE_ROOT}/fatal-stop.json"
 readonly PROCESS_STDERR="${FAILURE_ROOT}/process.stderr"
 
@@ -44,27 +39,6 @@ trap stop_observer INT TERM
 
 mkdir -p "$STATE_ROOT" "$RUNTIME_ROOT" "$FAILURE_ROOT"
 
-(
-    cd "$(dirname "$MANIFEST")"
-    sha256sum -c "$(basename "$MANIFEST_DIGEST")"
-) >/dev/null || {
-    log "fatal=frozen_manifest_checksum_mismatch"
-    exit 1
-}
-
-if [[ -e "$VOLUME_IDENTITY" ]]; then
-    cmp -s "$EMBEDDED_IDENTITY" "$VOLUME_IDENTITY" || {
-        log "fatal=state_root_identity_mismatch"
-        exit 1
-    }
-else
-    temporary="${VOLUME_IDENTITY}.tmp.$$"
-    cp "$EMBEDDED_IDENTITY" "$temporary"
-    sync -f "$temporary"
-    mv "$temporary" "$VOLUME_IDENTITY"
-    sync -f "$DATA_ROOT"
-fi
-
 if [[ -e "$FATAL_STOP_MARKER" ]]; then
     log "fatal_stop_present=true state=quiescent marker=${FATAL_STOP_MARKER}"
     while true; do sleep 3600; done
@@ -79,8 +53,6 @@ set +e
     --very-profitable-layer "$VERY_PROFITABLE_LAYER" \
     --request-policy "$READ_POLICY" \
     --transport-policy "$TRANSPORT_POLICY" \
-    --release-manifest "$MANIFEST" \
-    --isolation-report "$ISOLATION_REPORT" \
     --output "$RUNTIME_ROOT" \
     --state-root "$STATE_ROOT" \
     2>"$PROCESS_STDERR" &
