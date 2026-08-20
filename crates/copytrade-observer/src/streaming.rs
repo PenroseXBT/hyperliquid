@@ -979,6 +979,22 @@ mod tests {
     }
 
     #[test]
+    fn streamed_fill_retains_raw_position_from_zero_equity_empty_baseline() {
+        let candidate = wallet('a');
+        let mut book = StreamingSourceBook::new([candidate.clone()]).unwrap();
+        let mut empty = baseline(candidate, 100);
+        empty.account_value = Decimal::ZERO;
+        book.install_baseline(empty).unwrap();
+
+        let changed = book.apply_trade(trade(101, 1)).unwrap().pop().unwrap();
+        assert_eq!(changed.account_value, Decimal::ZERO);
+        assert_eq!(
+            changed.positions["xyz:XYZ100"].signed_notional,
+            Decimal::from(20)
+        );
+    }
+
+    #[test]
     fn parses_public_trade_users_and_hip3_coin() {
         let message = json!({
             "channel":"trades",

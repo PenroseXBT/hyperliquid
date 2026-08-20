@@ -1656,6 +1656,25 @@ pub struct ProductionIntentIdentity {
     pub expires_after_ms: u64,
 }
 
+fn normalized_source_exposures(state: &SourceStateResponse) -> Option<BTreeMap<String, Decimal>> {
+    if state.positions.is_empty() {
+        return Some(BTreeMap::new());
+    }
+    if state.account_value <= Decimal::ZERO {
+        return None;
+    }
+    state
+        .positions
+        .iter()
+        .map(|(asset, position)| {
+            position
+                .signed_notional
+                .checked_div(state.account_value)
+                .map(|exposure| (asset.clone(), exposure))
+        })
+        .collect()
+}
+
 impl LiveShadowEngine {
     pub fn new(
         config: CopyTradeConfig,
@@ -1883,17 +1902,13 @@ impl LiveShadowEngine {
                 let payload = serde_json::to_vec(&state)
                     .map_err(|error| LiveShadowError::Core(error.to_string()))?;
                 let payload_hash = hash_payload_bytes(&payload);
-                let exposures = state
-                    .positions
-                    .iter()
-                    .map(|(asset, position)| {
-                        let exposure = position
-                            .signed_notional
-                            .checked_div(state.account_value)
-                            .ok_or(LiveShadowError::Arithmetic)?;
-                        Ok((asset.clone(), exposure))
-                    })
-                    .collect::<Result<BTreeMap<_, _>, LiveShadowError>>()?;
+                // Individual public source records are external information,
+                // not engine integrity. A zero-equity empty baseline is valid,
+                // but a later streamed fill cannot be normalized until the
+                // ordinary authoritative reconciliation refreshes its equity.
+                // Retain the raw snapshot while omitting its unusable economic
+                // contribution; never let one wallet stop the daemon.
+                let exposures = normalized_source_exposures(&state).unwrap_or_default();
                 let authorized_assets =
                     if let Some(previous) = self.source_exposure_book.get(&candidate_id) {
                         previous
@@ -2637,6 +2652,15 @@ impl LiveShadowEngine {
                     "exposure state sequence mismatch for {id}"
                 )));
             }
+            let Some(normalized_exposures) = normalized_source_exposures(&snapshot.payload) else {
+                eligibility.excluded.insert(id, ExclusionReason::Stale);
+                continue;
+            };
+            if normalized_exposures != exposure_state.exposures {
+                return Err(LiveShadowError::Core(format!(
+                    "normalized exposure state mismatch for {id}"
+                )));
+            }
             eligibility.active_ids.insert(id.clone());
             members.push(SnapshotSetMember {
                 candidate_id: id.clone(),
@@ -2666,13 +2690,13 @@ impl LiveShadowEngine {
                 // never through both source sets.
                 continue;
             }
-            for (asset, absolute_exposure) in &exposure_state.exposures {
+            for (asset, absolute_exposure) in &normalized_exposures {
                 if self.source_stream_mode && !self.source_market_coverage.contains(asset) {
                     continue;
                 }
-                let exposure = absolute_exposure
-                    .to_f64()
-                    .ok_or(LiveShadowError::Arithmetic)?;
+                let Some(exposure) = absolute_exposure.to_f64() else {
+                    continue;
+                };
                 let input = ConsensusInput {
                     candidate_id: id.clone(),
                     allocation_weight: candidate.allocation_weight,
@@ -5463,6 +5487,184 @@ mod tests {
         assert!(engine.source_is_fresh(&candidate, 10_000_000));
         engine.set_source_stream_healthy_for_test(false);
         assert!(!engine.source_is_fresh(&candidate, 2));
+    }
+
+    #[test]
+    fn unusable_wallet_normalization_is_omitted_without_stopping_valid_sources() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let mut config = CopyTradeConfig::from_path(root.join("config/copytrade.json")).unwrap();
+        config.candidates.truncate(2);
+        config.technical.enabled = false;
+        for candidate in &mut config.candidates {
+            candidate.allocation_weight = 1.0;
+            candidate.confidence_modifier = Some(1.0);
+        }
+        let valid = config.candidates[0].address.to_ascii_lowercase();
+        let unusable = config.candidates[1].address.to_ascii_lowercase();
+        let mut engine =
+            LiveShadowEngine::new(config, b"source-normalization", "run", 40_000, 80_000).unwrap();
+        engine.enable_source_stream_mode();
+        engine.set_source_tier(&valid, SourceTier::Inactive);
+        engine.set_source_tier(&unusable, SourceTier::Inactive);
+
+        let source = |candidate: String, account_value: Decimal, notional: Decimal, at| {
+            SourceStateResponse {
+                candidate_id: candidate,
+                account_value,
+                source_time_ms: at,
+                positions: (!notional.is_zero())
+                    .then(|| {
+                        BTreeMap::from([(
+                            "BTC".into(),
+                            SourceAssetPosition {
+                                asset: "BTC".into(),
+                                signed_size: Decimal::ONE,
+                                signed_notional: notional,
+                                entry_price: Some(Decimal::from(100)),
+                                unrealized_pnl: Some(Decimal::ZERO),
+                            },
+                        )])
+                    })
+                    .unwrap_or_default(),
+                closed_candles: Vec::new(),
+            }
+        };
+
+        engine
+            .ingest(
+                accepted(
+                    PublicPayload::SourceState(source(
+                        valid.clone(),
+                        Decimal::from(1_000),
+                        Decimal::from(100),
+                        1_000,
+                    )),
+                    ReadRequestKind::ExpandedSourceState,
+                    1_000,
+                ),
+                1_000,
+            )
+            .unwrap();
+        engine
+            .ingest(
+                accepted(
+                    PublicPayload::SourceState(source(
+                        unusable.clone(),
+                        Decimal::ZERO,
+                        Decimal::ZERO,
+                        1_000,
+                    )),
+                    ReadRequestKind::ExpandedSourceState,
+                    1_000,
+                ),
+                1_000,
+            )
+            .unwrap();
+        // A streamed opening fill retains its raw position while the wallet's
+        // unchanged zero-equity baseline makes its normalized contribution
+        // temporarily unusable.
+        engine
+            .ingest(
+                accepted(
+                    PublicPayload::SourceState(source(
+                        unusable.clone(),
+                        Decimal::ZERO,
+                        Decimal::from(900),
+                        1_001,
+                    )),
+                    ReadRequestKind::ExpandedSourceState,
+                    1_001,
+                ),
+                1_001,
+            )
+            .unwrap();
+        engine
+            .ingest(
+                accepted(
+                    PublicPayload::MarketSnapshot(MarketSnapshotResponse {
+                        mids: BTreeMap::from([("BTC".into(), Decimal::from(100))]),
+                    }),
+                    ReadRequestKind::MarketMids,
+                    1_002,
+                ),
+                1_002,
+            )
+            .unwrap();
+        engine
+            .ingest(
+                accepted(
+                    PublicPayload::MarketMetadata(MarketMetadataResponse {
+                        universe: vec![MarketMetadataAsset {
+                            name: "BTC".into(),
+                            size_decimals: 3,
+                        }],
+                        contexts: BTreeMap::new(),
+                        live_taker_fee_bps: Some(Decimal::from(5)),
+                    }),
+                    ReadRequestKind::ExchangeMetadata,
+                    1_002,
+                ),
+                1_002,
+            )
+            .unwrap();
+        engine
+            .complete_source_stream_reconciliation(BTreeSet::from(["BTC".into()]), 1_003)
+            .unwrap();
+
+        assert_eq!(
+            engine.mfce.previous_source_exposure("BTC"),
+            Decimal::new(1, 1)
+        );
+        assert_eq!(engine.mfce_report().observed_transitions, 1);
+        assert_eq!(engine.mfce_report().decision_counts.reject, 0);
+
+        // A later authoritative positive-equity state rejoins naturally with
+        // no explicit uncertainty state or schema transition.
+        engine
+            .ingest(
+                accepted(
+                    PublicPayload::SourceState(source(
+                        unusable,
+                        Decimal::from(1_000),
+                        Decimal::from(200),
+                        1_004,
+                    )),
+                    ReadRequestKind::ExpandedSourceState,
+                    1_004,
+                ),
+                1_004,
+            )
+            .unwrap();
+        assert_eq!(
+            engine.mfce.previous_source_exposure("BTC"),
+            Decimal::new(3, 1)
+        );
+        assert_eq!(engine.mfce_report().observed_transitions, 2);
+    }
+
+    #[test]
+    fn zero_equity_source_is_valid_only_while_it_has_no_position() {
+        let empty = SourceStateResponse {
+            candidate_id: "0x0000000000000000000000000000000000000001".into(),
+            account_value: Decimal::ZERO,
+            source_time_ms: 1,
+            positions: BTreeMap::new(),
+            closed_candles: Vec::new(),
+        };
+        assert_eq!(normalized_source_exposures(&empty), Some(BTreeMap::new()));
+
+        let mut nonempty = empty;
+        nonempty.positions.insert(
+            "BTC".into(),
+            SourceAssetPosition {
+                asset: "BTC".into(),
+                signed_size: Decimal::ONE,
+                signed_notional: Decimal::from(100),
+                entry_price: Some(Decimal::from(100)),
+                unrealized_pnl: Some(Decimal::ZERO),
+            },
+        );
+        assert_eq!(normalized_source_exposures(&nonempty), None);
     }
 
     #[test]
