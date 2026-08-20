@@ -2050,8 +2050,9 @@ impl LiveShadowEngine {
     }
 
     pub fn urgent_book_assets(&self) -> BTreeSet<String> {
-        self.pending_book
+        self.pending
             .keys()
+            .chain(self.pending_book.keys())
             .chain(self.continuations.keys())
             .cloned()
             .collect()

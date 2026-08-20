@@ -24,7 +24,7 @@ use tokio_tungstenite::tungstenite::Message;
 const APPROVED_WS_URL: &str = "wss://api.hyperliquid.xyz/ws";
 const MAX_TRACKED_WALLETS: usize = 512;
 const MAX_MARKETS: usize = 850;
-const MAX_HOT_BOOKS: usize = 128;
+pub(crate) const MAX_HOT_BOOKS: usize = 128;
 const MAX_BUFFERED_TRADES: usize = 32_768;
 const MAX_DEDUP_TRADES: usize = 65_536;
 
@@ -218,9 +218,7 @@ impl StreamingHandle {
     }
 
     pub async fn replace_hot_books(&self, assets: BTreeSet<String>) -> Result<(), StreamingError> {
-        if assets.len() > MAX_HOT_BOOKS || assets.iter().any(|asset| !valid_market(asset)) {
-            return Err(StreamingError::Capacity);
-        }
+        let assets = sanitize_hot_books(assets);
         self.commands
             .send(StreamingCommand::ReplaceHotBooks(assets))
             .await
@@ -874,12 +872,20 @@ fn validate_markets(markets: &BTreeSet<String>) -> Result<(), StreamingError> {
     Ok(())
 }
 
-fn valid_market(market: &str) -> bool {
+pub(crate) fn valid_market(market: &str) -> bool {
     !market.is_empty()
         && market.len() <= 64
         && market
             .bytes()
             .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b':' | b'-' | b'_' | b'.'))
+}
+
+fn sanitize_hot_books(assets: BTreeSet<String>) -> BTreeSet<String> {
+    assets
+        .into_iter()
+        .filter(|asset| valid_market(asset))
+        .take(MAX_HOT_BOOKS)
+        .collect()
 }
 
 fn valid_address(address: &str) -> bool {
@@ -914,6 +920,19 @@ fn u64_field(value: &Value, field: &str) -> Result<u64, StreamingError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn hot_book_command_input_is_bounded_and_malformed_markets_are_omitted() {
+        let mut requested = (0..=MAX_HOT_BOOKS)
+            .map(|index| format!("M{index:03}"))
+            .collect::<BTreeSet<_>>();
+        requested.insert("bad market".into());
+
+        let sanitized = sanitize_hot_books(requested);
+
+        assert_eq!(sanitized.len(), MAX_HOT_BOOKS);
+        assert!(!sanitized.contains("bad market"));
+    }
 
     fn wallet(byte: char) -> String {
         format!("0x{}", byte.to_string().repeat(40))

@@ -22,7 +22,8 @@ use crate::replay::verify_replay_event_chain;
 use crate::replay::ReplayPayload;
 use crate::state_root::{StateRootStartup, UnsignedStateRoot};
 use crate::streaming::{
-    parse_asset_contexts, MarketDirectory, StreamingEvent, StreamingHandle, StreamingSourceBook,
+    parse_asset_contexts, valid_market, MarketDirectory, StreamingEvent, StreamingHandle,
+    StreamingSourceBook, MAX_HOT_BOOKS,
 };
 use crate::ObserverCoreState;
 use copytrade_core::decision::{derive_config_hash, derive_risk_policy_hash};
@@ -46,6 +47,45 @@ use tokio::time::{sleep, Duration};
 
 pub const MINIMUM_QUALIFICATION_SECONDS: u64 = 86_400;
 const MAX_ACTIVE_SOURCE_CANDIDATES: usize = 100;
+
+fn select_hot_books(
+    urgent: &BTreeSet<String>,
+    required: &BTreeSet<String>,
+    last_required: &BTreeMap<String, Timestamp>,
+    subscribed: &BTreeSet<String>,
+) -> BTreeSet<String> {
+    let mut selected = BTreeSet::new();
+    let mut add_tier = |mut assets: Vec<String>| {
+        assets.sort_by_key(|asset| (!subscribed.contains(asset), asset.clone()));
+        for asset in assets {
+            if selected.len() == MAX_HOT_BOOKS {
+                break;
+            }
+            if valid_market(&asset) {
+                selected.insert(asset);
+            }
+        }
+    };
+
+    add_tier(urgent.iter().cloned().collect());
+    add_tier(required.difference(urgent).cloned().collect::<Vec<_>>());
+
+    let mut grace = last_required
+        .iter()
+        .filter(|(asset, _)| !required.contains(*asset))
+        .map(|(asset, timestamp)| (asset.clone(), *timestamp))
+        .collect::<Vec<_>>();
+    grace.sort_by(|(left_asset, left_time), (right_asset, right_time)| {
+        right_time
+            .cmp(left_time)
+            .then_with(|| {
+                (!subscribed.contains(left_asset)).cmp(&!subscribed.contains(right_asset))
+            })
+            .then_with(|| left_asset.cmp(right_asset))
+    });
+    add_tier(grace.into_iter().map(|(asset, _)| asset).collect());
+    selected
+}
 
 /// Research-only polling capacity used by the legacy qualification commands.
 /// The production daemon uses stream continuity plus bounded REST baseline and
@@ -997,21 +1037,23 @@ async fn run_qualification_impl<const CONTINUOUS: bool>(
             book_enqueue_due = next_cadence_deadline(book_enqueue_due, now, 2_000)?;
         }
         if let Some(stream) = streaming.as_ref() {
-            let required = engine
-                .assets_requiring_books(now)
-                .into_iter()
-                .chain(engine.urgent_book_assets())
-                .collect::<BTreeSet<_>>();
-            for asset in required {
-                hot_book_last_required.insert(asset, now);
+            let urgent = engine.urgent_book_assets();
+            let required = engine.assets_requiring_books(now);
+            for asset in required.iter().chain(&urgent) {
+                if !valid_market(asset) {
+                    continue;
+                }
+                hot_book_last_required.insert(asset.clone(), now);
             }
             hot_book_last_required.retain(|_, last_required| {
                 now.saturating_sub(*last_required) <= transport_policy.streaming.hot_book_grace_ms
             });
-            let next_hot_books = hot_book_last_required
-                .keys()
-                .cloned()
-                .collect::<BTreeSet<_>>();
+            let next_hot_books = select_hot_books(
+                &urgent,
+                &required,
+                &hot_book_last_required,
+                &subscribed_hot_books,
+            );
             if next_hot_books != subscribed_hot_books {
                 stream
                     .replace_hot_books(next_hot_books.clone())
@@ -3187,6 +3229,60 @@ fn evaluate_transport_gate(
 mod tests {
     use super::*;
     use copytrade_core::scheduler::ManualClock;
+
+    fn markets(prefix: &str, count: usize) -> BTreeSet<String> {
+        (0..count)
+            .map(|index| format!("{prefix}{index:03}"))
+            .collect()
+    }
+
+    #[test]
+    fn hot_book_selection_bounds_capacity_and_omits_malformed_markets() {
+        let mut required = markets("M", MAX_HOT_BOOKS + 1);
+        required.insert("bad market".into());
+        let history = required.iter().cloned().map(|asset| (asset, 10)).collect();
+
+        let selected = select_hot_books(&BTreeSet::new(), &required, &history, &BTreeSet::new());
+
+        assert_eq!(selected.len(), MAX_HOT_BOOKS);
+        assert!(!selected.contains("bad market"));
+        assert!(!selected.contains("M128"));
+    }
+
+    #[test]
+    fn urgent_book_displaces_lower_priority_demand_at_capacity() {
+        let required = markets("M", MAX_HOT_BOOKS);
+        let subscribed = required.clone();
+        let history = required.iter().cloned().map(|asset| (asset, 10)).collect();
+        let urgent = BTreeSet::from(["URGENT".to_string()]);
+
+        let selected = select_hot_books(&urgent, &required, &history, &subscribed);
+
+        assert_eq!(selected.len(), MAX_HOT_BOOKS);
+        assert!(selected.contains("URGENT"));
+        assert_eq!(selected.intersection(&required).count(), MAX_HOT_BOOKS - 1);
+    }
+
+    #[test]
+    fn pending_book_receives_slot_after_demand_and_grace_expire() {
+        let required = markets("M", MAX_HOT_BOOKS + 1);
+        let mut history = required
+            .iter()
+            .cloned()
+            .map(|asset| (asset, 10))
+            .collect::<BTreeMap<_, _>>();
+        let first = select_hot_books(&BTreeSet::new(), &required, &history, &BTreeSet::new());
+        assert!(!first.contains("M128"));
+
+        let mut reduced = required;
+        reduced.remove("M000");
+        history.remove("M000");
+        let second = select_hot_books(&BTreeSet::new(), &reduced, &history, &first);
+
+        assert_eq!(second.len(), MAX_HOT_BOOKS);
+        assert!(!second.contains("M000"));
+        assert!(second.contains("M128"));
+    }
 
     fn source_policies() -> (ReadOnlySchedulerConfig, PublicTransportPolicy) {
         let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
