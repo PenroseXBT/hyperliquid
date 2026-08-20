@@ -194,6 +194,11 @@ pub struct MfceAssetState {
     pub reserved_tail_loss_bps: Decimal,
     pub active: Option<MfceActiveTransition>,
     pub admission: MfceAdmissionState,
+    /// Last source transition included in the cumulative decision funnel.
+    /// Repricing and book refreshes may reevaluate one transition many times,
+    /// but they remain one economic opportunity.
+    #[serde(default)]
+    pub last_counted_transition_id: Option<u64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -230,6 +235,15 @@ pub struct MfceTrainingAttempt {
     pub incumbent_epoch: Option<u64>,
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct MfceDecisionCounts {
+    pub explore: u64,
+    pub exploit: u64,
+    pub reject: u64,
+    pub allocated: u64,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct MfcePersistentState {
@@ -243,6 +257,8 @@ pub struct MfcePersistentState {
     pub incumbent: Option<MfceModelState>,
     #[serde(default)]
     pub pending_training: Option<MfceTrainingAttempt>,
+    #[serde(default)]
+    pub decision_counts: MfceDecisionCounts,
 }
 
 impl Default for MfcePersistentState {
@@ -257,6 +273,7 @@ impl Default for MfcePersistentState {
             samples: VecDeque::new(),
             incumbent: None,
             pending_training: None,
+            decision_counts: MfceDecisionCounts::default(),
         }
     }
 }
@@ -355,12 +372,14 @@ pub struct MfcePolicyOutput {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct MfceReport {
+    pub observed_transitions: u64,
     pub completed_samples: usize,
     pub active_transitions: usize,
     pub awaiting_live_books: usize,
     pub incumbent_epoch: Option<u64>,
     pub trained_through_sample_id: Option<u64>,
     pub labels_since_retrain_attempt: u64,
+    pub decision_counts: MfceDecisionCounts,
     pub policy_outputs: Vec<MfcePolicyOutput>,
 }
 
@@ -423,12 +442,23 @@ impl MfcePersistentState {
     }
 
     pub fn validate(&self) -> Result<(), MfceError> {
+        let counted_decisions = self
+            .decision_counts
+            .explore
+            .checked_add(self.decision_counts.exploit)
+            .and_then(|count| count.checked_add(self.decision_counts.reject));
+        let admitted_decisions = self
+            .decision_counts
+            .explore
+            .checked_add(self.decision_counts.exploit);
         if self.schema_version != MFCE_STATE_SCHEMA_VERSION
             || self.assets.len() > MFCE_MAX_ASSETS
             || self.samples.len() > MFCE_MAX_SAMPLES
             || self.next_transition_id == 0
             || self.next_sample_id == 0
             || self.last_retrain_attempt_sample_id >= self.next_sample_id
+            || counted_decisions.is_none_or(|count| count >= self.next_transition_id)
+            || admitted_decisions.is_none_or(|count| self.decision_counts.allocated > count)
         {
             return Err(MfceError::InvalidState(
                 "MFCE state bounds are invalid".into(),
@@ -456,6 +486,9 @@ impl MfcePersistentState {
             validate_asset(asset)?;
             if state.last_observed_source_epoch > self.source_epoch
                 || state.reserved_tail_loss_bps < Decimal::ZERO
+                || state
+                    .last_counted_transition_id
+                    .is_some_and(|transition_id| transition_id >= self.next_transition_id)
                 || (state.last_raw_source_exposure.is_zero()
                     && !state.approved_target_notional.is_zero())
                 || (!state.approved_target_notional.is_zero()
@@ -590,6 +623,7 @@ impl MfcePersistentState {
 
     pub fn report(&self) -> MfceReport {
         MfceReport {
+            observed_transitions: self.next_transition_id.saturating_sub(1),
             completed_samples: self.samples.len(),
             active_transitions: self
                 .assets
@@ -612,6 +646,7 @@ impl MfcePersistentState {
                 .next_sample_id
                 .saturating_sub(1)
                 .saturating_sub(self.last_retrain_attempt_sample_id),
+            decision_counts: self.decision_counts,
             policy_outputs: Vec::new(),
         }
     }
@@ -1012,6 +1047,7 @@ impl MfceEngine {
             .q50_gross_bps
             .checked_sub(decision.net_q50_bps)
             .ok_or(MfceError::Arithmetic)?;
+        let mut decision_counts = self.state.decision_counts;
         let state = self
             .state
             .assets
@@ -1026,6 +1062,35 @@ impl MfceEngine {
             return Err(MfceError::InvalidState(
                 "stale MFCE admission result".into(),
             ));
+        }
+        let is_new_decision = state.last_counted_transition_id != Some(transition_id);
+        if is_new_decision {
+            match decision.policy_state {
+                MfcePolicyState::Explore => {
+                    decision_counts.explore = decision_counts
+                        .explore
+                        .checked_add(1)
+                        .ok_or(MfceError::Arithmetic)?;
+                }
+                MfcePolicyState::Exploit => {
+                    decision_counts.exploit = decision_counts
+                        .exploit
+                        .checked_add(1)
+                        .ok_or(MfceError::Arithmetic)?;
+                }
+                MfcePolicyState::Reject => {
+                    decision_counts.reject = decision_counts
+                        .reject
+                        .checked_add(1)
+                        .ok_or(MfceError::Arithmetic)?;
+                }
+            }
+            if decision.admitted && !decision.allocation_fraction.is_zero() {
+                decision_counts.allocated = decision_counts
+                    .allocated
+                    .checked_add(1)
+                    .ok_or(MfceError::Arithmetic)?;
+            }
         }
         if let Some(active) = state.active.as_mut() {
             if active.transition_id == transition_id {
@@ -1090,6 +1155,10 @@ impl MfceEngine {
                 modeled_tail_loss_usd: decision.modeled_tail_loss_usd,
             },
         );
+        if is_new_decision {
+            state.last_counted_transition_id = Some(transition_id);
+        }
+        self.state.decision_counts = decision_counts;
         Ok(())
     }
 
@@ -1100,6 +1169,7 @@ impl MfceEngine {
         reason: MfceRejectionReason,
     ) -> Result<(), MfceError> {
         let model_epoch = self.state.incumbent.as_ref().map_or(0, |model| model.epoch);
+        let mut decision_counts = self.state.decision_counts;
         let state = self
             .state
             .assets
@@ -1113,6 +1183,13 @@ impl MfceEngine {
         ) {
             return Err(MfceError::InvalidState("stale MFCE rejection".into()));
         }
+        if state.last_counted_transition_id != Some(transition_id) {
+            decision_counts.reject = decision_counts
+                .reject
+                .checked_add(1)
+                .ok_or(MfceError::Arithmetic)?;
+            state.last_counted_transition_id = Some(transition_id);
+        }
         if let Some(active) = state.active.as_mut() {
             if active.transition_id == transition_id {
                 active.admitted = false;
@@ -1125,6 +1202,7 @@ impl MfceEngine {
             q10_gross_bps: None,
             q50_gross_bps: None,
         };
+        self.state.decision_counts = decision_counts;
         Ok(())
     }
 
@@ -2894,6 +2972,47 @@ mod tests {
             engine.effective_target("BTC", Decimal::from(50), Decimal::from(100)),
             Decimal::from(50)
         );
+        assert_eq!(engine.report().observed_transitions, 1);
+        assert_eq!(engine.report().decision_counts.exploit, 1);
+        assert_eq!(engine.report().decision_counts.allocated, 1);
+
+        // Repricing and a fresh book may reevaluate the same transition, but
+        // the rolling funnel must continue to count one unique opportunity.
+        let recheck = engine
+            .observe_raw_source(
+                "BTC",
+                true,
+                Decimal::new(5, 1),
+                Decimal::from(50),
+                Decimal::ZERO,
+                Decimal::from(101),
+                2_000,
+                initial,
+            )
+            .unwrap();
+        assert_eq!(recheck.transition_id, Some(transition_id));
+        engine
+            .record_allocation(
+                "BTC",
+                transition_id,
+                &MfceAllocationDecision {
+                    policy_state: MfcePolicyState::Exploit,
+                    admitted: true,
+                    reason: None,
+                    allocation_fraction: Decimal::ONE,
+                    opportunity_score: Decimal::ONE,
+                    net_q50_bps: Decimal::from(20),
+                    conservative_edge_bps: Decimal::from(20),
+                    net_q10_bps: Decimal::from(10),
+                    required_median_bps: Decimal::ZERO,
+                    modeled_tail_loss_usd: Decimal::ZERO,
+                },
+                &prediction,
+                Decimal::ZERO,
+            )
+            .unwrap();
+        assert_eq!(engine.report().decision_counts.exploit, 1);
+        assert_eq!(engine.report().decision_counts.allocated, 1);
     }
 
     #[test]

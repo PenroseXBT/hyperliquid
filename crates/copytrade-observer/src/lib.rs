@@ -15,6 +15,7 @@ pub mod railway_aggregate;
 // production. The signer owns the sole authoritative fill/funding ledger.
 pub mod replay;
 pub mod state_root;
+pub mod streaming;
 
 use cohort_layer::{PreparedVeryProfitableLayer, VeryProfitableLayerArtifact};
 use copytrade_core::CopyTradeConfig;

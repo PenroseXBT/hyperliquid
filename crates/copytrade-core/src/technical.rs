@@ -225,7 +225,11 @@ pub struct TechnicalTarget {
 #[serde(deny_unknown_fields)]
 pub struct TechnicalStrategyConfig {
     pub enabled: bool,
+    /// Legacy research-only sleeve metadata. The production MFCE allocator
+    /// does not read either fraction.
     pub source_budget_fraction: f64,
+    /// Legacy research-only sleeve metadata. Technical state is context only
+    /// in the production daemon.
     pub technical_budget_fraction: f64,
     pub universe_size: usize,
     pub enter_threshold: f64,

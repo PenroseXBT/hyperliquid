@@ -121,13 +121,6 @@ impl CopyTradeConfig {
         })?;
         if let Some(identity) = &self.very_profitable_layer {
             identity.validate()?;
-            if (self.technical.source_budget_fraction - 0.35).abs() > 1e-12
-                || (self.technical.technical_budget_fraction - 0.65).abs() > 1e-12
-            {
-                return Err(ConfigError::new(
-                    "very_profitable SU6R1 requires the frozen 35% source / 65% technical split",
-                ));
-            }
         }
         self.validate_numeric_fields()?;
         if self.candidates.is_empty() || self.candidates.iter().all(|candidate| !candidate.enabled)

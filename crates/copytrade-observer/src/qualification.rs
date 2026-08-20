@@ -1,3 +1,5 @@
+#[cfg(feature = "research-cli")]
+use crate::cohort_layer::VeryProfitableLayerArtifact;
 use crate::ipc_client::{
     IntentDispatchState, ProductionDispatchHandle, ProductionIntentDispatcher,
 };
@@ -5,14 +7,23 @@ use crate::live_shadow::{
     EconomicAttribution, LiveShadowEngine, ProductionIntentIdentity, UnresolvedRootStatus,
     UnsignedShadowStateIdentity,
 };
-use crate::profitability::{summarize_profitability, ProfitabilitySummary};
+#[cfg(feature = "research-cli")]
+use crate::profitability::summarize_profitability;
+#[cfg(feature = "research-cli")]
+use crate::profitability::ProfitabilitySummary;
 use crate::public_mainnet::{HyperliquidPublicTransport, PublicTransportPolicy};
 use crate::qualification_evidence::{
-    load_release_manifest, sha256_file, verify_checkpoint_chain, CheckpointPayload, EvidenceBundle,
-    LatencyEvidence, RunHeader, TerminalSummary,
+    load_release_manifest, sha256_file, CheckpointPayload, LatencyEvidence, RunHeader,
 };
-use crate::replay::{verify_replay_event_chain, ReplayPayload};
+#[cfg(feature = "research-cli")]
+use crate::qualification_evidence::{verify_checkpoint_chain, EvidenceBundle, TerminalSummary};
+#[cfg(feature = "research-cli")]
+use crate::replay::verify_replay_event_chain;
+use crate::replay::ReplayPayload;
 use crate::state_root::{StateRootStartup, UnsignedStateRoot};
+use crate::streaming::{
+    parse_asset_contexts, MarketDirectory, StreamingEvent, StreamingHandle, StreamingSourceBook,
+};
 use crate::ObserverCoreState;
 use copytrade_core::decision::{derive_config_hash, derive_risk_policy_hash};
 use copytrade_core::scheduler::{
@@ -36,10 +47,9 @@ use tokio::time::{sleep, Duration};
 pub const MINIMUM_QUALIFICATION_SECONDS: u64 = 86_400;
 const MAX_ACTIVE_SOURCE_CANDIDATES: usize = 100;
 
-/// Nominal source polling capacity after the effective candidate universe has
-/// been assembled (including cohort-only scheduler additions). Both tier
-/// cadences remain fixed by the transport policy so the configured 75-second
-/// freshness deadline continues to include its queue and transport allowance.
+/// Research-only polling capacity used by the legacy qualification commands.
+/// The production daemon uses stream continuity plus bounded REST baseline and
+/// reconciliation work; it does not use polling age as source freshness.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 struct SourceDispatchPlan {
     effective_candidate_count: usize,
@@ -74,10 +84,12 @@ pub struct QualificationOptions {
 }
 
 struct RuntimeEvidence {
+    #[cfg(feature = "research-cli")]
     bundle: Option<EvidenceBundle>,
 }
 
 impl RuntimeEvidence {
+    #[cfg(feature = "research-cli")]
     fn qualification(bundle: EvidenceBundle) -> Self {
         Self {
             bundle: Some(bundle),
@@ -85,7 +97,21 @@ impl RuntimeEvidence {
     }
 
     fn continuous() -> Self {
-        Self { bundle: None }
+        Self {
+            #[cfg(feature = "research-cli")]
+            bundle: None,
+        }
+    }
+
+    fn enabled(&self) -> bool {
+        #[cfg(feature = "research-cli")]
+        {
+            self.bundle.is_some()
+        }
+        #[cfg(not(feature = "research-cli"))]
+        {
+            false
+        }
     }
 
     fn append_replay_event(
@@ -93,23 +119,32 @@ impl RuntimeEvidence {
         observed_at_mono: Timestamp,
         payload: ReplayPayload,
     ) -> Result<(), Box<dyn Error>> {
+        #[cfg(feature = "research-cli")]
         if let Some(bundle) = &mut self.bundle {
             bundle.append_replay_event(observed_at_mono, payload)?;
         }
+        #[cfg(not(feature = "research-cli"))]
+        let _ = (observed_at_mono, payload);
         Ok(())
     }
 
     fn append_log(&mut self, stderr: bool, line: &str) -> Result<(), Box<dyn Error>> {
+        #[cfg(feature = "research-cli")]
         if let Some(bundle) = &mut self.bundle {
             bundle.append_log(stderr, line)?;
         }
+        #[cfg(not(feature = "research-cli"))]
+        let _ = (stderr, line);
         Ok(())
     }
 
     fn append_checkpoint(&mut self, payload: CheckpointPayload) -> Result<(), Box<dyn Error>> {
+        #[cfg(feature = "research-cli")]
         if let Some(bundle) = &mut self.bundle {
             bundle.append_checkpoint(payload)?;
         }
+        #[cfg(not(feature = "research-cli"))]
+        let _ = payload;
         Ok(())
     }
 
@@ -118,12 +153,16 @@ impl RuntimeEvidence {
         name: &str,
         value: &T,
     ) -> Result<(), Box<dyn Error>> {
+        #[cfg(feature = "research-cli")]
         if let Some(bundle) = &self.bundle {
             bundle.write_summary(name, value)?;
         }
+        #[cfg(not(feature = "research-cli"))]
+        let _ = (name, value);
         Ok(())
     }
 
+    #[cfg(feature = "research-cli")]
     fn write_terminal(&self, summary: &TerminalSummary) -> Result<(), Box<dyn Error>> {
         if let Some(bundle) = &self.bundle {
             bundle.write_terminal(summary)?;
@@ -132,6 +171,7 @@ impl RuntimeEvidence {
     }
 
     fn flush_replay_events(&mut self) -> Result<(), Box<dyn Error>> {
+        #[cfg(feature = "research-cli")]
         if let Some(bundle) = &mut self.bundle {
             bundle.flush_replay_events()?;
         }
@@ -155,11 +195,11 @@ fn append_new_cohort_records(
     cursor: &mut usize,
     observed_at_mono: Timestamp,
 ) -> Result<(), Box<dyn Error>> {
-    let records = engine.cohort_indicator_records();
-    if evidence.bundle.is_none() {
-        *cursor = records.len();
+    if !evidence.enabled() {
+        *cursor = engine.cohort_indicator_records().len();
         return Ok(());
     }
+    let records = engine.cohort_indicator_records();
     for indicator in records.get(*cursor..).unwrap_or_default() {
         evidence.append_replay_event(
             observed_at_mono,
@@ -177,11 +217,11 @@ fn append_new_technical_records(
     engine: &LiveShadowEngine,
     cursor: &mut usize,
 ) -> Result<(), Box<dyn Error>> {
-    let records = engine.technical_decision_records();
-    if evidence.bundle.is_none() {
-        *cursor = records.len();
+    if !evidence.enabled() {
+        *cursor = engine.technical_decision_records().len();
         return Ok(());
     }
+    let records = engine.technical_decision_records();
     for decision in records.get(*cursor..).unwrap_or_default() {
         evidence.append_replay_event(
             decision.observed_at_mono,
@@ -239,7 +279,9 @@ struct RollingEconomicStatus {
     funding: Decimal,
     net_pnl: Decimal,
     net_pnl_per_turnover: Decimal,
-    settled_return_on_configured_equity: Decimal,
+    starting_settled_equity: Decimal,
+    settled_equity_return: Decimal,
+    profit_factor_state: &'static str,
     profit_factor: Option<Decimal>,
     maximum_drawdown: Decimal,
     annualized_sharpe_5m: f64,
@@ -259,9 +301,6 @@ struct ContinuousStatus<'a> {
     fatal_stop: bool,
     snapshot_generation: Option<u64>,
     candidate_count: usize,
-    fresh_candidate_count: usize,
-    expired_candidate_count: u64,
-    never_refreshed_candidate_count: u64,
     projection_violations: u64,
     persistence_failures: u64,
     unresolved_roots: usize,
@@ -270,38 +309,84 @@ struct ContinuousStatus<'a> {
     closed_episodes_lifetime: u64,
     scheduler_pending: usize,
     scheduler_in_flight: usize,
+    rest_weight_consumed_process: u64,
+    rest_reserved_weight_consumed_process: u64,
     rate_limited_responses: u64,
+    streaming: Option<StreamingRuntimeStatus>,
+    unique_source_transitions: u64,
+    modeled_executions_retained: usize,
     mfce_completed_transition_labels: usize,
     mfce_active_transitions: usize,
     mfce_awaiting_live_books: usize,
+    mfce_book_ready_transitions: usize,
     mfce_model_epoch: Option<u64>,
     mfce_policy_exploit: u64,
     mfce_policy_explore: u64,
     mfce_policy_reject: u64,
     source_risk_increases_allocated: u64,
     source_risk_increases_rejected_by_mfce: u64,
+    marked_equity: Decimal,
+    settled_equity: Decimal,
+    open_marked_equity_contribution: Decimal,
     mfce: crate::mfce::MfceReport,
     economics: Vec<RollingEconomicStatus>,
 }
 
+#[derive(Debug, Clone, Copy, Serialize)]
+struct StreamingRuntimeStatus {
+    source_healthy: bool,
+    hydrated_source_count: usize,
+    discovered_markets: usize,
+    subscribed_trade_markets: usize,
+    coverage_ready_markets: usize,
+    coverage_stale_markets: usize,
+    coverage_reconciliation_wallets_pending: usize,
+    coverage_reconciliations: u64,
+    subscribed_hot_books: usize,
+    connections: u64,
+    gaps: u64,
+    public_trades_seen: u64,
+    tracked_trade_updates: u64,
+    book_updates: u64,
+    invalid_messages: u64,
+}
+
+pub async fn run_continuous_daemon(
+    mut options: QualificationOptions,
+) -> Result<PathBuf, Box<dyn Error>> {
+    options.continuous = true;
+    run_qualification_impl::<true>(options).await
+}
+
+#[cfg(feature = "research-cli")]
 pub async fn run_qualification(options: QualificationOptions) -> Result<PathBuf, Box<dyn Error>> {
-    if options.continuous
+    if options.continuous {
+        run_qualification_impl::<true>(options).await
+    } else {
+        run_qualification_impl::<false>(options).await
+    }
+}
+
+async fn run_qualification_impl<const CONTINUOUS: bool>(
+    options: QualificationOptions,
+) -> Result<PathBuf, Box<dyn Error>> {
+    if CONTINUOUS
         && (options.transport_gate || options.profitability_gate || options.micro_density_gate)
     {
         return Err("continuous runtime cannot enable qualification gates".into());
     }
-    if options.continuous && options.state_root.is_none() && options.production.is_none() {
+    if CONTINUOUS && options.state_root.is_none() && options.production.is_none() {
         return Err("continuous runtime requires --state-root".into());
     }
     if options.production.is_some() && options.state_root.is_some() {
         return Err("unsigned state restoration is forbidden in production mode".into());
     }
-    if options.state_root.is_some() && !options.profitability_gate && !options.continuous {
+    if options.state_root.is_some() && !options.profitability_gate && !CONTINUOUS {
         return Err(
             "--state-root is supported only by unsigned profitability or continuous runs".into(),
         );
     }
-    if options.continuous {
+    if CONTINUOUS {
         // No elapsed-time or profitability lifecycle controls the daemon.
     } else if options.production.is_some() {
         if options.duration_seconds < 60 {
@@ -328,34 +413,55 @@ pub async fn run_qualification(options: QualificationOptions) -> Result<PathBuf,
     )?;
     let config = observer_state.config().clone();
     let very_profitable_layer = observer_state.very_profitable_layer().cloned();
-    let expanded_source_candidates = very_profitable_layer
-        .as_ref()
-        .map(|layer| layer.qualified_members.clone())
-        .unwrap_or_default();
     let scheduler_config = ReadOnlySchedulerConfig::from_path(&options.request_policy_path)?;
     let transport_policy: PublicTransportPolicy =
         serde_json::from_slice(&std::fs::read(&options.transport_policy_path)?)?;
     transport_policy
         .validate()
         .map_err(|error| format!("invalid transport policy: {error:?}"))?;
+    let streaming_enabled = transport_policy.streaming.enabled;
+    if CONTINUOUS && !streaming_enabled {
+        return Err("continuous production requires the HD1 streaming data plane".into());
+    }
+    let expanded_source_candidates = if streaming_enabled {
+        config
+            .candidates
+            .iter()
+            .map(|candidate| candidate.address.to_ascii_lowercase())
+            .collect()
+    } else {
+        very_profitable_layer
+            .as_ref()
+            .map(|layer| layer.qualified_members.clone())
+            .unwrap_or_default()
+    };
     let active_freshness = transport_policy
         .source_deadline_ms(SourceTier::Active)
         .ok_or("active freshness overflow")?;
     let inactive_freshness = transport_policy
         .source_deadline_ms(SourceTier::Inactive)
         .ok_or("inactive freshness overflow")?;
-    if config.global_risk.source_snapshot_max_age_ms != inactive_freshness
-        || scheduler_config.freshness.configured_max_age_ms != inactive_freshness
+    if !streaming_enabled
+        && (config.global_risk.source_snapshot_max_age_ms != inactive_freshness
+            || scheduler_config.freshness.configured_max_age_ms != inactive_freshness)
     {
         return Err("configured freshness must equal the maximum derived tier deadline".into());
     }
-    let source_dispatch_plan = derive_source_dispatch_plan_with_expansion(
-        config.candidates.len(),
-        expanded_source_candidates.len(),
-        transport_policy.perp_dexes.len(),
-        &scheduler_config,
-        &transport_policy,
-    )?;
+    let source_dispatch_plan = if streaming_enabled {
+        streaming_source_dispatch_plan(
+            config.candidates.len(),
+            &scheduler_config,
+            &transport_policy,
+        )?
+    } else {
+        derive_source_dispatch_plan_with_expansion(
+            config.candidates.len(),
+            expanded_source_candidates.len(),
+            transport_policy.perp_dexes.len(),
+            &scheduler_config,
+            &transport_policy,
+        )?
+    };
     let manifest = load_release_manifest(&options.release_manifest_path)?;
     verify_isolation_report(&options.isolation_report_path)?;
     let production_manifest = manifest.qualification_stage == "PRODUCTION_RELEASE";
@@ -385,7 +491,7 @@ pub async fn run_qualification(options: QualificationOptions) -> Result<PathBuf,
         std::process::id(),
         &manifest.binary_sha256[..12]
     );
-    let output = if options.continuous {
+    let output = if CONTINUOUS {
         options.output.clone()
     } else {
         options.output.join(&run_id)
@@ -393,14 +499,25 @@ pub async fn run_qualification(options: QualificationOptions) -> Result<PathBuf,
     let read_policy_value = serde_json::to_value(&scheduler_config)?;
     let transport_policy_value = serde_json::to_value(&transport_policy)?;
     let header = RunHeader {
-        stage: if options.micro_density_gate {
-            "SU5R-MICRO-DENSITY".into()
-        } else if options.transport_gate {
-            "HL1K-TRANSPORT-GATE".into()
-        } else if options.profitability_gate {
-            "HL1-PROFITABILITY-4H".into()
-        } else {
-            "HL1K".into()
+        stage: {
+            #[cfg(not(feature = "research-cli"))]
+            {
+                "SU6-CONTINUOUS".into()
+            }
+            #[cfg(feature = "research-cli")]
+            {
+                if CONTINUOUS {
+                    "SU6-CONTINUOUS".into()
+                } else if options.micro_density_gate {
+                    "SU5R-MICRO-DENSITY".into()
+                } else if options.transport_gate {
+                    "HL1K-TRANSPORT-GATE".into()
+                } else if options.profitability_gate {
+                    "HL1-PROFITABILITY-4H".into()
+                } else {
+                    "HL1K".into()
+                }
+            }
         },
         run_id,
         binary_sha256: manifest.binary_sha256.clone(),
@@ -413,7 +530,7 @@ pub async fn run_qualification(options: QualificationOptions) -> Result<PathBuf,
         transport_policy_sha256: sha256_json(&transport_policy_value)?,
         start_wall_clock_utc_ms: wall_ms,
         start_monotonic_ms: start,
-        expected_minimum_duration_seconds: if options.continuous {
+        expected_minimum_duration_seconds: if CONTINUOUS {
             0
         } else {
             options.duration_seconds
@@ -426,20 +543,26 @@ pub async fn run_qualification(options: QualificationOptions) -> Result<PathBuf,
         submission_capable: false,
         api_wallet_present: false,
     };
+    #[cfg(feature = "research-cli")]
     let qualification_config = serde_json::json!({"copytrade":config,"read_policy":read_policy_value,"transport_policy":transport_policy_value});
-    let mut evidence = if options.continuous {
+    let mut evidence = if CONTINUOUS {
         std::fs::create_dir_all(&output)?;
         RuntimeEvidence::continuous()
     } else {
-        RuntimeEvidence::qualification(EvidenceBundle::create(
-            &output,
-            &options.release_manifest_path,
-            &qualification_config,
-            &header,
-            &options.isolation_report_path,
-        )?)
+        #[cfg(feature = "research-cli")]
+        {
+            RuntimeEvidence::qualification(EvidenceBundle::create(
+                &output,
+                &options.release_manifest_path,
+                &qualification_config,
+                &header,
+                &options.isolation_report_path,
+            )?)
+        }
+        #[cfg(not(feature = "research-cli"))]
+        unreachable!("qualification evidence is excluded from the production build")
     };
-    if !options.continuous {
+    if !CONTINUOUS {
         if let Some(layer_path) = &options.very_profitable_layer_path {
             std::fs::copy(layer_path, output.join("very-profitable-layer.json"))?;
         }
@@ -462,7 +585,7 @@ pub async fn run_qualification(options: QualificationOptions) -> Result<PathBuf,
             transport_policy_sha256: header.transport_policy_sha256.clone(),
         },
     )?;
-    if !options.continuous {
+    if !CONTINUOUS {
         std::fs::copy(
             std::env::current_exe()?,
             output.join("observer-release-binary"),
@@ -508,6 +631,9 @@ pub async fn run_qualification(options: QualificationOptions) -> Result<PathBuf,
         inactive_freshness,
     )
     .map_err(|error| error.to_string())?;
+    if streaming_enabled {
+        engine.enable_source_stream_mode();
+    }
     if let Some(layer) = very_profitable_layer {
         engine
             .install_very_profitable_layer(layer)
@@ -561,6 +687,56 @@ pub async fn run_qualification(options: QualificationOptions) -> Result<PathBuf,
         engine.synchronize_production_state(&state);
         state.save_atomic(&production.state_path)?;
     }
+    let mut streaming = streaming_enabled
+        .then(|| {
+            StreamingHandle::start(
+                transport_policy.streaming.clone(),
+                config
+                    .candidates
+                    .iter()
+                    .map(|candidate| candidate.address.to_ascii_lowercase()),
+            )
+        })
+        .transpose()
+        .map_err(|error| format!("streaming transport: {error:?}"))?;
+    let mut streaming_sources = streaming_enabled
+        .then(|| {
+            StreamingSourceBook::new(
+                config
+                    .candidates
+                    .iter()
+                    .map(|candidate| candidate.address.to_ascii_lowercase()),
+            )
+        })
+        .transpose()
+        .map_err(|error| format!("streaming source book: {error:?}"))?;
+    let mut market_directory: Option<MarketDirectory> = None;
+    let mut stream_live_taker_fee_bps = None;
+    let mut stream_connected = false;
+    let mut reconciliation_epoch_active = streaming_enabled;
+    let mut reconciliation_started_at = start.saturating_sub(1);
+    let mut reconciliation_remaining = if streaming_enabled {
+        config
+            .candidates
+            .iter()
+            .map(|candidate| candidate.address.to_ascii_lowercase())
+            .collect::<BTreeSet<_>>()
+    } else {
+        BTreeSet::new()
+    };
+    let mut next_reconciliation_due = start
+        .checked_add(transport_policy.streaming.reconciliation_interval_ms)
+        .ok_or("streaming reconciliation deadline overflow")?;
+    let mut hot_book_last_required = BTreeMap::<String, Timestamp>::new();
+    let mut subscribed_hot_books = BTreeSet::<String>::new();
+    let mut subscribed_trade_markets = BTreeSet::<String>::new();
+    let mut coverage_ready_markets = BTreeSet::<String>::new();
+    let mut coverage_pending_markets = BTreeSet::<String>::new();
+    let mut coverage_reconciliation_remaining = BTreeSet::<String>::new();
+    let mut coverage_gap_started_at = None::<Timestamp>;
+    let mut coverage_reconciliations = 0_u64;
+    let mut trade_market_rotation_cursor = 0_usize;
+    let mut trade_market_rotation_due = start;
     let mut candidate_tiers = config
         .candidates
         .iter()
@@ -600,7 +776,7 @@ pub async fn run_qualification(options: QualificationOptions) -> Result<PathBuf,
     let mut checkpoint_due = 0;
     let mut counters = Counters::default();
     let mut tasks = JoinSet::new();
-    let deadline = (!options.continuous)
+    let deadline = (!CONTINUOUS)
         .then(|| {
             start
                 .checked_add(
@@ -613,14 +789,14 @@ pub async fn run_qualification(options: QualificationOptions) -> Result<PathBuf,
         })
         .transpose()?;
     let mut interrupted = false;
-    if options.profitability_gate || options.continuous {
+    if options.profitability_gate || CONTINUOUS {
         engine.record_equity_boundary(start)?;
         evidence.append_replay_event(start, ReplayPayload::EquityBoundary)?;
         persist_unsigned_state(&mut engine, &mut state_root)?;
     }
     while deadline.is_none_or(|deadline| clock.now_ms() < deadline) {
         let now = clock.now_ms();
-        if now >= tier_rebalance_due {
+        if !streaming_enabled && now >= tier_rebalance_due {
             let ordered_candidates = config
                 .candidates
                 .iter()
@@ -670,15 +846,27 @@ pub async fn run_qualification(options: QualificationOptions) -> Result<PathBuf,
             candidate_tiers = next_tiers;
             tier_rebalance_due = next_cadence_deadline(tier_rebalance_due, now, 60_000)?;
         }
+        if streaming_enabled
+            && now >= next_reconciliation_due
+            && !reconciliation_epoch_active
+            && coverage_reconciliation_remaining.is_empty()
+        {
+            source_due = phase_staggered_source_due(&config, now, source_dispatch_plan)?;
+            next_reconciliation_due = next_cadence_deadline(
+                next_reconciliation_due,
+                now,
+                transport_policy.streaming.reconciliation_interval_ms,
+            )?;
+        }
         for candidate in &config.candidates {
             let id = candidate.address.to_ascii_lowercase();
-            if source_due[&id] <= now {
+            if source_due[&id] <= now && (!streaming_enabled || market_directory.is_some()) {
                 let tier = candidate_tiers[&id];
                 let interval = match tier {
                     SourceTier::Active => source_dispatch_plan.active_cadence_ms,
                     SourceTier::Inactive => source_dispatch_plan.inactive_cadence_ms,
                 };
-                let source_kind = if expanded_source_candidates.contains(&id) {
+                let source_kind = if streaming_enabled || expanded_source_candidates.contains(&id) {
                     ReadRequestKind::ExpandedSourceState
                 } else {
                     ReadRequestKind::SourceState
@@ -690,18 +878,31 @@ pub async fn run_qualification(options: QualificationOptions) -> Result<PathBuf,
                     source_kind,
                     // Source cadence is the qualification invariant. Public order-book
                     // enrichment may use only the normal-budget capacity left after it.
-                    RequestPriority::High,
+                    if reconciliation_epoch_active || !coverage_reconciliation_remaining.is_empty()
+                    {
+                        RequestPriority::Critical
+                    } else {
+                        RequestPriority::High
+                    },
                     Some(tier),
                     now,
-                    config.global_risk.source_snapshot_max_age_ms,
+                    if streaming_enabled {
+                        transport_policy.streaming.reconciliation_spread_ms
+                    } else {
+                        config.global_risk.source_snapshot_max_age_ms
+                    },
                     &mut counters,
                 )?;
                 scheduled.insert(id.clone());
-                let previous_due = source_due[&id];
-                source_due.insert(id, next_cadence_deadline(previous_due, now, interval)?);
+                if streaming_enabled {
+                    source_due.insert(id, u64::MAX);
+                } else {
+                    let previous_due = source_due[&id];
+                    source_due.insert(id, next_cadence_deadline(previous_due, now, interval)?);
+                }
             }
         }
-        if market_due <= now {
+        if !streaming_enabled && market_due <= now {
             enqueue(
                 &scheduler,
                 &scheduler_config,
@@ -730,9 +931,13 @@ pub async fn run_qualification(options: QualificationOptions) -> Result<PathBuf,
             // Funding context is admission-critical and the accepted response
             // is valid for 120 seconds. Refresh at half-life so a normal
             // delayed poll cannot leave MFCE pending for most of the hour.
-            metadata_due = now + 60_000;
+            metadata_due = if streaming_enabled {
+                now + 6 * 60 * 60_000
+            } else {
+                now + 60_000
+            };
         }
-        if now >= book_enqueue_due {
+        if !streaming_enabled && now >= book_enqueue_due {
             let urgent_assets = engine.urgent_book_assets().into_iter().collect::<Vec<_>>();
             let assets = if urgent_assets.is_empty() {
                 engine
@@ -765,6 +970,81 @@ pub async fn run_qualification(options: QualificationOptions) -> Result<PathBuf,
             // and the combined metadata + live-fee refresh (22), enrichment
             // stays within the 90-weight non-source allowance.
             book_enqueue_due = next_cadence_deadline(book_enqueue_due, now, 2_000)?;
+        }
+        if let Some(stream) = streaming.as_ref() {
+            let required = engine
+                .assets_requiring_books(now)
+                .into_iter()
+                .chain(engine.urgent_book_assets())
+                .collect::<BTreeSet<_>>();
+            for asset in required {
+                hot_book_last_required.insert(asset, now);
+            }
+            hot_book_last_required.retain(|_, last_required| {
+                now.saturating_sub(*last_required) <= transport_policy.streaming.hot_book_grace_ms
+            });
+            let next_hot_books = hot_book_last_required
+                .keys()
+                .cloned()
+                .collect::<BTreeSet<_>>();
+            if next_hot_books != subscribed_hot_books {
+                stream
+                    .replace_hot_books(next_hot_books.clone())
+                    .await
+                    .map_err(|error| format!("hot book subscriptions: {error:?}"))?;
+                subscribed_hot_books = next_hot_books;
+            }
+            if now >= trade_market_rotation_due
+                && !reconciliation_epoch_active
+                && coverage_reconciliation_remaining.is_empty()
+            {
+                if let Some(directory) = market_directory.as_ref() {
+                    let mut priority = streaming_sources
+                        .as_ref()
+                        .map_or_else(BTreeSet::new, StreamingSourceBook::active_assets);
+                    priority.extend(subscribed_hot_books.iter().cloned());
+                    let (next_markets, next_cursor) = directory
+                        .rotated_markets(&priority, trade_market_rotation_cursor)
+                        .map_err(|error| format!("trade subscription rotation: {error:?}"))?;
+                    if next_markets != subscribed_trade_markets {
+                        coverage_ready_markets = coverage_ready_markets
+                            .intersection(&next_markets)
+                            .cloned()
+                            .collect();
+                        coverage_pending_markets = next_markets
+                            .difference(&coverage_ready_markets)
+                            .cloned()
+                            .collect();
+                        engine
+                            .replace_source_market_coverage(coverage_ready_markets.clone(), now)
+                            .map_err(|error| error.to_string())?;
+                        stream
+                            .replace_markets(next_markets.clone())
+                            .await
+                            .map_err(|error| format!("trade subscriptions: {error:?}"))?;
+                        subscribed_trade_markets = next_markets;
+                        if !coverage_pending_markets.is_empty() {
+                            coverage_gap_started_at = Some(now);
+                            coverage_reconciliation_remaining = config
+                                .candidates
+                                .iter()
+                                .map(|candidate| candidate.address.to_ascii_lowercase())
+                                .collect();
+                            source_due = phase_staggered_source_due(
+                                &config,
+                                now.checked_add(1)
+                                    .ok_or("coverage reconciliation start overflow")?,
+                                source_dispatch_plan,
+                            )?;
+                            coverage_reconciliations = coverage_reconciliations.saturating_add(1);
+                        }
+                    }
+                    trade_market_rotation_cursor = next_cursor;
+                }
+                trade_market_rotation_due = now
+                    .checked_add(60_000)
+                    .ok_or("trade subscription rotation overflow")?;
+            }
         }
         while tasks.len() < scheduler_config.api.max_concurrency {
             let Some(dispatch) = scheduler.begin_next() else {
@@ -821,12 +1101,82 @@ pub async fn run_qualification(options: QualificationOptions) -> Result<PathBuf,
                     ExecutionOutcome::PermanentFailure => counters.permanent_failures += 1,
                 }
                 if outcome == ExecutionOutcome::CompletedFresh {
-                    if let Some(response) = transport.take_accepted(&completed_request) {
+                    if let Some(mut response) = transport.take_accepted(&completed_request) {
+                        let mut completes_stream_reconciliation = false;
+                        let mut completes_coverage_reconciliation = false;
+                        if streaming_enabled {
+                            match &mut response.payload {
+                                crate::public_mainnet::PublicPayload::SourceState(state) => {
+                                    let installed = streaming_sources
+                                        .as_mut()
+                                        .ok_or("streaming source book unavailable")?
+                                        .install_baseline(state.clone())
+                                        .map_err(|error| format!("source baseline: {error:?}"))?;
+                                    *state = installed;
+                                    if response.requested_at_mono > reconciliation_started_at {
+                                        reconciliation_remaining.remove(&state.candidate_id);
+                                    }
+                                    if coverage_gap_started_at.is_some_and(|gap_started_at| {
+                                        response.requested_at_mono > gap_started_at
+                                    }) {
+                                        coverage_reconciliation_remaining
+                                            .remove(&state.candidate_id);
+                                    }
+                                    if reconciliation_epoch_active
+                                        && stream_connected
+                                        && reconciliation_remaining.is_empty()
+                                    {
+                                        reconciliation_epoch_active = false;
+                                        completes_stream_reconciliation = true;
+                                    }
+                                    if stream_connected
+                                        && !coverage_pending_markets.is_empty()
+                                        && coverage_reconciliation_remaining.is_empty()
+                                    {
+                                        completes_coverage_reconciliation = true;
+                                    }
+                                }
+                                crate::public_mainnet::PublicPayload::MarketMetadata(metadata) => {
+                                    let directory = MarketDirectory::from_metadata(metadata)
+                                        .map_err(|error| format!("stream market directory: {error:?}"))?;
+                                    let mut priority = streaming_sources
+                                        .as_ref()
+                                        .map_or_else(BTreeSet::new, StreamingSourceBook::active_assets);
+                                    priority.extend(subscribed_hot_books.iter().cloned());
+                                    let (markets, next_cursor) = directory
+                                        .rotated_markets(&priority, trade_market_rotation_cursor)
+                                        .map_err(|error| format!("trade subscription selection: {error:?}"))?;
+                                    if subscribed_trade_markets.is_empty() {
+                                        streaming
+                                            .as_ref()
+                                            .ok_or("streaming handle unavailable")?
+                                            .replace_markets(markets.clone())
+                                            .await
+                                            .map_err(|error| {
+                                                format!("trade subscriptions: {error:?}")
+                                            })?;
+                                        subscribed_trade_markets = markets;
+                                        coverage_ready_markets.clear();
+                                        coverage_pending_markets.clear();
+                                        coverage_reconciliation_remaining.clear();
+                                        coverage_gap_started_at = None;
+                                        trade_market_rotation_cursor = next_cursor;
+                                        trade_market_rotation_due = clock
+                                            .now_ms()
+                                            .checked_add(60_000)
+                                            .ok_or("trade subscription rotation overflow")?;
+                                    }
+                                    stream_live_taker_fee_bps = metadata.live_taker_fee_bps;
+                                    market_directory = Some(directory);
+                                }
+                                _ => {}
+                            }
+                        }
                         if let Some(tier) = response.source_tier {
                             *counters.accepted_count_by_tier.entry(tier).or_default() += 1;
                         }
                         let accepted_at = clock.now_ms();
-                        if !options.continuous {
+                        if !CONTINUOUS {
                             evidence.append_replay_event(
                                 accepted_at,
                                 ReplayPayload::AcceptedResponse {
@@ -836,6 +1186,34 @@ pub async fn run_qualification(options: QualificationOptions) -> Result<PathBuf,
                         }
                         let executions_before = engine.metrics().shadow_executions;
                         engine.ingest(response, accepted_at).map_err(|e| e.to_string())?;
+                        if completes_stream_reconciliation {
+                            engine
+                                .complete_source_stream_reconciliation(
+                                    subscribed_trade_markets.clone(),
+                                    accepted_at,
+                                )
+                                .map_err(|e| e.to_string())?;
+                            coverage_ready_markets = subscribed_trade_markets.clone();
+                        }
+                        if completes_coverage_reconciliation {
+                            coverage_ready_markets
+                                .append(&mut coverage_pending_markets);
+                            coverage_gap_started_at = None;
+                            engine
+                                .complete_source_market_reconciliation(
+                                    coverage_ready_markets.clone(),
+                                    accepted_at,
+                                )
+                                .map_err(|e| e.to_string())?;
+                            next_reconciliation_due = accepted_at
+                                .checked_add(
+                                    transport_policy.streaming.reconciliation_interval_ms,
+                                )
+                                .ok_or("streaming reconciliation deadline overflow")?;
+                            trade_market_rotation_due = accepted_at
+                                .checked_add(60_000)
+                                .ok_or("trade subscription rotation overflow")?;
+                        }
                         dispatch_production_intents(
                             &mut engine,
                             options.production.as_ref(),
@@ -852,7 +1230,7 @@ pub async fn run_qualification(options: QualificationOptions) -> Result<PathBuf,
                             &engine,
                             &mut technical_record_cursor,
                         )?;
-                        if !options.continuous
+                        if !CONTINUOUS
                             || engine.metrics().shadow_executions != executions_before
                         {
                             persist_unsigned_state(&mut engine, &mut state_root)?;
@@ -861,6 +1239,163 @@ pub async fn run_qualification(options: QualificationOptions) -> Result<PathBuf,
                 } else {
                     let _ = transport.take_accepted(&completed_request);
                 }
+            }
+            stream_event = async {
+                match streaming.as_mut() {
+                    Some(stream) => stream.recv().await,
+                    None => std::future::pending().await,
+                }
+            }, if streaming_enabled => {
+                let event = stream_event.ok_or("public streaming task stopped")?;
+                let observed_at = clock.now_ms();
+                match event {
+                    StreamingEvent::Connected { .. } => {
+                        stream_connected = true;
+                        if reconciliation_epoch_active
+                            && reconciliation_remaining.is_empty()
+                            && streaming_sources
+                                .as_ref()
+                                .is_some_and(StreamingSourceBook::all_hydrated)
+                        {
+                            reconciliation_epoch_active = false;
+                            engine
+                                .complete_source_stream_reconciliation(
+                                    subscribed_trade_markets.clone(),
+                                    observed_at,
+                                )
+                                .map_err(|e| e.to_string())?;
+                            coverage_ready_markets = subscribed_trade_markets.clone();
+                            dispatch_production_intents(
+                                &mut engine,
+                                options.production.as_ref(),
+                            )
+                            .await?;
+                        }
+                    }
+                    StreamingEvent::Gap { .. } => {
+                        stream_connected = false;
+                        reconciliation_epoch_active = true;
+                        reconciliation_started_at = observed_at;
+                        engine.mark_source_stream_gap();
+                        coverage_ready_markets.clear();
+                        coverage_pending_markets.clear();
+                        coverage_reconciliation_remaining.clear();
+                        coverage_gap_started_at = None;
+                        reconciliation_remaining = config
+                            .candidates
+                            .iter()
+                            .map(|candidate| candidate.address.to_ascii_lowercase())
+                            .collect();
+                        source_due = phase_staggered_source_due(
+                            &config,
+                            observed_at
+                                .checked_add(1)
+                                .ok_or("stream-gap reconciliation start overflow")?,
+                            source_dispatch_plan,
+                        )?;
+                    }
+                    StreamingEvent::Trades(trades) => {
+                        let executions_before = engine.metrics().shadow_executions;
+                        for trade in trades {
+                            let states = streaming_sources
+                                .as_mut()
+                                .ok_or("streaming source book unavailable")?
+                                .apply_trade(trade)
+                                .map_err(|error| format!("stream trade: {error:?}"))?;
+                            for state in states {
+                                let subject = state.candidate_id.clone();
+                                let tier = candidate_tiers
+                                    .get(&subject)
+                                    .copied()
+                                    .unwrap_or(SourceTier::Inactive);
+                                let response = accepted_stream_response(
+                                    crate::public_mainnet::PublicPayload::SourceState(state),
+                                    subject,
+                                    ReadRequestKind::ExpandedSourceState,
+                                    Some(tier),
+                                    observed_at,
+                                    config.global_risk.source_snapshot_max_age_ms,
+                                )?;
+                                engine.ingest(response, observed_at).map_err(|e| e.to_string())?;
+                            }
+                        }
+                        dispatch_production_intents(&mut engine, options.production.as_ref()).await?;
+                        if engine.metrics().shadow_executions != executions_before {
+                            persist_unsigned_state(&mut engine, &mut state_root)?;
+                        }
+                    }
+                    StreamingEvent::AssetContexts(data) => {
+                        if let Some(directory) = market_directory.as_ref() {
+                            let Ok((mids, metadata)) = parse_asset_contexts(
+                                &data,
+                                directory,
+                                stream_live_taker_fee_bps,
+                            ) else {
+                                // Replaceable market context is allowed to go
+                                // explicitly missing. Its existing validity
+                                // expires naturally; malformed context cannot
+                                // terminate an otherwise continuous source
+                                // and reconciliation daemon.
+                                if let Some(stream) = streaming.as_ref() {
+                                    stream.note_invalid_payload();
+                                }
+                                continue;
+                            };
+                            engine.ingest(
+                                accepted_stream_response(
+                                    crate::public_mainnet::PublicPayload::MarketSnapshot(mids),
+                                    "market".into(),
+                                    ReadRequestKind::MarketMids,
+                                    None,
+                                    observed_at,
+                                    transport_policy.market_validity_ms,
+                                )?,
+                                observed_at,
+                            )?;
+                            engine.ingest(
+                                accepted_stream_response(
+                                    crate::public_mainnet::PublicPayload::MarketMetadata(metadata),
+                                    "market".into(),
+                                    ReadRequestKind::ExchangeMetadata,
+                                    None,
+                                    observed_at,
+                                    transport_policy.market_validity_ms,
+                                )?,
+                                observed_at,
+                            )?;
+                        }
+                    }
+                    StreamingEvent::OrderBook(book) => {
+                        let asset = book.asset.clone();
+                        let executions_before = engine.metrics().shadow_executions;
+                        engine.ingest(
+                            accepted_stream_response(
+                                crate::public_mainnet::PublicPayload::OrderBook(book),
+                                asset,
+                                ReadRequestKind::OrderBook,
+                                None,
+                                observed_at,
+                                transport_policy.market_validity_ms,
+                            )?,
+                            observed_at,
+                        )?;
+                        dispatch_production_intents(&mut engine, options.production.as_ref()).await?;
+                        if engine.metrics().shadow_executions != executions_before {
+                            persist_unsigned_state(&mut engine, &mut state_root)?;
+                        }
+                    }
+                }
+                append_new_cohort_records(
+                    &mut evidence,
+                    &engine,
+                    &mut cohort_record_cursor,
+                    observed_at,
+                )?;
+                append_new_technical_records(
+                    &mut evidence,
+                    &engine,
+                    &mut technical_record_cursor,
+                )?;
             }
             _ = tokio::signal::ctrl_c() => {
                 interrupted = true;
@@ -882,7 +1417,7 @@ pub async fn run_qualification(options: QualificationOptions) -> Result<PathBuf,
             persist_unsigned_state(&mut engine, &mut state_root)?;
             decision_due = now + 20_000;
         }
-        if (options.profitability_gate || options.micro_density_gate || options.continuous)
+        if (options.profitability_gate || options.micro_density_gate || CONTINUOUS)
             && now >= profitability_bucket_due
         {
             engine.record_equity_boundary(profitability_bucket_due)?;
@@ -897,42 +1432,44 @@ pub async fn run_qualification(options: QualificationOptions) -> Result<PathBuf,
             let h = scheduler.health();
             let t = transport.metrics();
             let m = engine.metrics();
-            let (fresh_by_tier, expired_by_age, never_refreshed) =
-                coverage_evidence(&config, &candidate_tiers, &engine, now);
-            evidence.append_checkpoint(CheckpointPayload {
-                sequence: 0,
-                monotonic_elapsed_ms: now - start,
-                accepted_source_snapshots: m.accepted_source_snapshots,
-                stale_source_snapshots: m.stale_source_snapshots,
-                rejected_source_snapshots: m.rejected_source_snapshots,
-                active_source_count: engine.active_source_count(now),
-                total_weight_consumed: counters.total_weight,
-                reserved_weight_consumed: counters.reserved_weight,
-                pending_queue: h.pending,
-                successor_queue: h.successors,
-                in_flight: h.in_flight,
-                rate_limited_responses: t.rate_limited.load(Ordering::SeqCst),
-                retry_count: counters.retries,
-                decision_count: m.decisions,
-                projection_violations: m.projection_violations,
-                shadow_execution_count: m.shadow_executions,
-                open_episode_count: engine.ledger().portfolio_open_count() as u64,
-                closed_episode_count: engine.ledger().portfolio_closed_count(),
-                persistence_healthy: m.persistence_failures == 0,
-                response_rejected_as_stale: counters.response_rejected_as_stale,
-                accepted_snapshot_expired_by_age: expired_by_age.clone(),
-                candidate_never_refreshed: never_refreshed.clone(),
-                request_expired_in_queue: h.expired_in_queue_by_tier.clone(),
-                request_superseded_pending: h.superseded_pending_by_tier.clone(),
-                request_superseded_in_flight: h.superseded_in_flight_by_tier.clone(),
-                dispatch_count_by_tier: h.dispatch_count_by_tier.clone(),
-                accepted_count_by_tier: counters.accepted_count_by_tier.clone(),
-                queue_wait_ms_by_tier: counters.queue_wait_ms_by_tier.clone(),
-                transport_latency_ms_by_kind: counters.transport_latency_ms_by_kind.clone(),
-                fresh_candidates_by_tier: fresh_by_tier.clone(),
-                oldest_pending_age_by_tier: h.oldest_pending_age_ms_by_tier.clone(),
-            })?;
-            if options.continuous {
+            if !CONTINUOUS {
+                let (fresh_by_tier, expired_by_age, never_refreshed) =
+                    coverage_evidence(&config, &candidate_tiers, &engine, now);
+                evidence.append_checkpoint(CheckpointPayload {
+                    sequence: 0,
+                    monotonic_elapsed_ms: now - start,
+                    accepted_source_snapshots: m.accepted_source_snapshots,
+                    stale_source_snapshots: m.stale_source_snapshots,
+                    rejected_source_snapshots: m.rejected_source_snapshots,
+                    active_source_count: engine.active_source_count(now),
+                    total_weight_consumed: counters.total_weight,
+                    reserved_weight_consumed: counters.reserved_weight,
+                    pending_queue: h.pending,
+                    successor_queue: h.successors,
+                    in_flight: h.in_flight,
+                    rate_limited_responses: t.rate_limited.load(Ordering::SeqCst),
+                    retry_count: counters.retries,
+                    decision_count: m.decisions,
+                    projection_violations: m.projection_violations,
+                    shadow_execution_count: m.shadow_executions,
+                    open_episode_count: engine.ledger().portfolio_open_count() as u64,
+                    closed_episode_count: engine.ledger().portfolio_closed_count(),
+                    persistence_healthy: m.persistence_failures == 0,
+                    response_rejected_as_stale: counters.response_rejected_as_stale,
+                    accepted_snapshot_expired_by_age: expired_by_age,
+                    candidate_never_refreshed: never_refreshed,
+                    request_expired_in_queue: h.expired_in_queue_by_tier.clone(),
+                    request_superseded_pending: h.superseded_pending_by_tier.clone(),
+                    request_superseded_in_flight: h.superseded_in_flight_by_tier.clone(),
+                    dispatch_count_by_tier: h.dispatch_count_by_tier.clone(),
+                    accepted_count_by_tier: counters.accepted_count_by_tier.clone(),
+                    queue_wait_ms_by_tier: counters.queue_wait_ms_by_tier.clone(),
+                    transport_latency_ms_by_kind: counters.transport_latency_ms_by_kind.clone(),
+                    fresh_candidates_by_tier: fresh_by_tier,
+                    oldest_pending_age_by_tier: h.oldest_pending_age_ms_by_tier.clone(),
+                })?;
+            }
+            if CONTINUOUS {
                 engine.compact_runtime_history(now.saturating_sub(30 * 24 * 60 * 60 * 1_000))?;
                 cohort_record_cursor = engine.cohort_indicator_records().len();
                 technical_record_cursor = engine.technical_decision_records().len();
@@ -947,9 +1484,17 @@ pub async fn run_qualification(options: QualificationOptions) -> Result<PathBuf,
                     &counters,
                     &h,
                     t.rate_limited.load(Ordering::SeqCst),
-                    &fresh_by_tier,
-                    expired_by_age.values().copied().sum(),
-                    never_refreshed.values().copied().sum(),
+                    streaming_runtime_status(
+                        streaming.as_ref(),
+                        streaming_sources.as_ref(),
+                        &engine,
+                        market_directory.as_ref(),
+                        &subscribed_trade_markets,
+                        &coverage_ready_markets,
+                        coverage_reconciliation_remaining.len(),
+                        coverage_reconciliations,
+                        &subscribed_hot_books,
+                    ),
                 ) {
                     println!("rolling_status_update_failed=true nonfatal=true error={error}");
                 }
@@ -1005,6 +1550,9 @@ pub async fn run_qualification(options: QualificationOptions) -> Result<PathBuf,
             checkpoint_due = now + 60_000;
         }
     }
+    if let Some(stream) = streaming.as_ref() {
+        stream.shutdown().await;
+    }
     while let Some(result) = tasks.join_next().await {
         let (dispatch, result, started_at, kind) = result?;
         let completed_request = dispatch.request().clone();
@@ -1018,9 +1566,20 @@ pub async fn run_qualification(options: QualificationOptions) -> Result<PathBuf,
         let outcome = scheduler.finish(dispatch, result);
         append_freshness_decision(&mut evidence, &completed_request, outcome, clock.now_ms())?;
         if outcome == ExecutionOutcome::CompletedFresh {
-            if let Some(response) = transport.take_accepted(&completed_request) {
+            if let Some(mut response) = transport.take_accepted(&completed_request) {
+                if streaming_enabled {
+                    if let crate::public_mainnet::PublicPayload::SourceState(state) =
+                        &mut response.payload
+                    {
+                        *state = streaming_sources
+                            .as_mut()
+                            .ok_or("streaming source book unavailable")?
+                            .install_baseline(state.clone())
+                            .map_err(|error| format!("source baseline: {error:?}"))?;
+                    }
+                }
                 let accepted_at = clock.now_ms();
-                if !options.continuous {
+                if !CONTINUOUS {
                     evidence.append_replay_event(
                         accepted_at,
                         ReplayPayload::AcceptedResponse {
@@ -1040,7 +1599,7 @@ pub async fn run_qualification(options: QualificationOptions) -> Result<PathBuf,
                     accepted_at,
                 )?;
                 append_new_technical_records(&mut evidence, &engine, &mut technical_record_cursor)?;
-                if !options.continuous || engine.metrics().shadow_executions != executions_before {
+                if !CONTINUOUS || engine.metrics().shadow_executions != executions_before {
                     persist_unsigned_state(&mut engine, &mut state_root)?;
                 }
             }
@@ -1063,12 +1622,10 @@ pub async fn run_qualification(options: QualificationOptions) -> Result<PathBuf,
     }
     persist_production_mfce_state(&engine, options.production.as_ref()).await?;
     evidence.flush_replay_events()?;
-    if options.continuous {
+    if CONTINUOUS {
         persist_unsigned_state(&mut engine, &mut state_root)?;
         let now = clock.now_ms();
         let health = scheduler.health();
-        let (fresh_by_tier, expired_by_age, never_refreshed) =
-            coverage_evidence(&config, &candidate_tiers, &engine, now);
         if let Err(error) = write_continuous_status(
             &output,
             &header.run_id,
@@ -1079,9 +1636,17 @@ pub async fn run_qualification(options: QualificationOptions) -> Result<PathBuf,
             &counters,
             &health,
             transport.metrics().rate_limited.load(Ordering::SeqCst),
-            &fresh_by_tier,
-            expired_by_age.values().copied().sum(),
-            never_refreshed.values().copied().sum(),
+            streaming_runtime_status(
+                streaming.as_ref(),
+                streaming_sources.as_ref(),
+                &engine,
+                market_directory.as_ref(),
+                &subscribed_trade_markets,
+                &coverage_ready_markets,
+                coverage_reconciliation_remaining.len(),
+                coverage_reconciliations,
+                &subscribed_hot_books,
+            ),
         ) {
             println!("rolling_status_update_failed=true nonfatal=true error={error}");
         }
@@ -1091,147 +1656,138 @@ pub async fn run_qualification(options: QualificationOptions) -> Result<PathBuf,
         );
         return Ok(output);
     }
-    engine
-        .persist(output.join("shadow-ledger.json"))
-        .map_err(|e| e.to_string())?;
-    engine
-        .persist_target_state(output.join("virtual-target-ledger.json"))
-        .map_err(|e| e.to_string())?;
-    persist_unsigned_state(&mut engine, &mut state_root)?;
-    let elapsed = (clock.now_ms() - start) / 1000;
-    let chain = verify_checkpoint_chain(output.join("periodic-checkpoints.jsonl"))?;
-    if std::fs::read_to_string(output.join("event-chain-head.txt"))?.trim() != chain {
-        return Err("checkpoint chain mismatch".into());
-    }
-    let t = transport.metrics();
-    let m = engine.metrics();
-    let summary = TerminalSummary {
-        stage: if options.micro_density_gate {
-            "SU5R-MICRO-DENSITY".into()
-        } else if options.transport_gate {
-            "HL1K-TRANSPORT-GATE".into()
-        } else if options.profitability_gate {
-            "HL1-PROFITABILITY-4H".into()
-        } else {
-            "HL1K".into()
-        },
-        passed: false,
-        failure_reason: Some(if interrupted {
-            "operator_stopped_diagnostic_run".into()
-        } else {
-            "awaiting_external_finalization".into()
-        }),
-        secondary_reason: None,
-        unsigned: true,
-        planned_only: true,
-        submission_capable: false,
-        api_wallet_present: false,
-        candidate_count: config.candidates.len(),
-        monotonic_elapsed_seconds: elapsed,
-        process_restarts: 0,
-        risk_invariant_violations: m.projection_violations,
-        mutation_requests: t.mutation_requests.load(Ordering::SeqCst),
-        key_file_opens: t.key_file_opens.load(Ordering::SeqCst),
-        closed_shadow_episodes: engine.ledger().portfolio_closed().len() as u64,
-        closed_source_episodes: engine.ledger().total_source_closed() as u64,
-        event_chain_verified: true,
-        all_candidates_scheduled: scheduled.len() == config.candidates.len(),
-        unreconciled_shadow_intents: m.unreconciled_shadow_intents,
-        isolation_pre_run_passed: true,
-        isolation_post_run_passed: false,
-        evidence_verified: false,
-        profitability_gate_passed: false,
-        operational_gate_passed: false,
-        accounting_gate_passed: false,
-        profitability_signal_positive: false,
-        sharpe_target_proven: false,
-    };
-    evidence.write_summary("scheduler-summary.json", &counters)?;
-    evidence.write_summary("freshness-summary.json", m)?;
-    evidence.write_summary("shadow-accounting-summary.json",&serde_json::json!({"executions":m.shadow_executions,"unreconciled":m.unreconciled_shadow_intents}))?;
-    evidence.write_summary("shadow-actions.json", engine.executions())?;
-    evidence.write_summary(
-        "decision-plan-summary.json",
-        &engine.compact_decision_plan_summary(),
-    )?;
-    evidence.write_summary(
-        "cohort-indicator-records.json",
-        &engine.compact_cohort_decision_records(),
-    )?;
-    evidence.write_summary(
-        "cohort-decision-summary.json",
-        &engine.compact_cohort_decision_summary(),
-    )?;
-    evidence.write_summary(
-        "technical-decision-records.json",
-        engine.technical_decision_records(),
-    )?;
-    evidence.write_summary(
-        "book-evaluation-events.json",
-        engine.book_evaluation_events(),
-    )?;
-    evidence.write_summary(
-        "action-lifecycle-events.json",
-        engine.action_lifecycle_events(),
-    )?;
-    let executable_density = engine.executable_density_summary()?;
-    evidence.write_summary("executable-density-summary.json", &executable_density)?;
-    evidence.write_summary("five-minute-return-buckets.json", engine.equity_buckets())?;
-    evidence.write_summary(
-        "portfolio-episodes.json",
-        engine.ledger().portfolio_closed(),
-    )?;
-    evidence.write_summary("source-episodes.json", &engine.ledger().all_source_closed())?;
-    evidence.write_summary(
-        "candidate-ingestion-audit.json",
-        &transport.candidate_audit_snapshot(),
-    )?;
-    evidence.write_summary(
+    #[cfg(feature = "research-cli")]
+    {
+        engine
+            .persist(output.join("shadow-ledger.json"))
+            .map_err(|e| e.to_string())?;
+        engine
+            .persist_target_state(output.join("virtual-target-ledger.json"))
+            .map_err(|e| e.to_string())?;
+        persist_unsigned_state(&mut engine, &mut state_root)?;
+        let elapsed = (clock.now_ms() - start) / 1000;
+        let chain = verify_checkpoint_chain(output.join("periodic-checkpoints.jsonl"))?;
+        if std::fs::read_to_string(output.join("event-chain-head.txt"))?.trim() != chain {
+            return Err("checkpoint chain mismatch".into());
+        }
+        let t = transport.metrics();
+        let m = engine.metrics();
+        let summary = TerminalSummary {
+            stage: if options.micro_density_gate {
+                "SU5R-MICRO-DENSITY".into()
+            } else if options.transport_gate {
+                "HL1K-TRANSPORT-GATE".into()
+            } else if options.profitability_gate {
+                "HL1-PROFITABILITY-4H".into()
+            } else {
+                "HL1K".into()
+            },
+            passed: false,
+            failure_reason: Some(if interrupted {
+                "operator_stopped_diagnostic_run".into()
+            } else {
+                "awaiting_external_finalization".into()
+            }),
+            secondary_reason: None,
+            unsigned: true,
+            planned_only: true,
+            submission_capable: false,
+            api_wallet_present: false,
+            candidate_count: config.candidates.len(),
+            monotonic_elapsed_seconds: elapsed,
+            process_restarts: 0,
+            risk_invariant_violations: m.projection_violations,
+            mutation_requests: t.mutation_requests.load(Ordering::SeqCst),
+            key_file_opens: t.key_file_opens.load(Ordering::SeqCst),
+            closed_shadow_episodes: engine.ledger().portfolio_closed().len() as u64,
+            closed_source_episodes: engine.ledger().total_source_closed() as u64,
+            event_chain_verified: true,
+            all_candidates_scheduled: scheduled.len() == config.candidates.len(),
+            unreconciled_shadow_intents: m.unreconciled_shadow_intents,
+            isolation_pre_run_passed: true,
+            isolation_post_run_passed: false,
+            evidence_verified: false,
+            profitability_gate_passed: false,
+            operational_gate_passed: false,
+            accounting_gate_passed: false,
+            profitability_signal_positive: false,
+            sharpe_target_proven: false,
+        };
+        evidence.write_summary("scheduler-summary.json", &counters)?;
+        evidence.write_summary("freshness-summary.json", m)?;
+        evidence.write_summary("shadow-accounting-summary.json",&serde_json::json!({"executions":m.shadow_executions,"unreconciled":m.unreconciled_shadow_intents}))?;
+        evidence.write_summary("shadow-actions.json", engine.executions())?;
+        evidence.write_summary(
+            "decision-plan-summary.json",
+            &engine.compact_decision_plan_summary(),
+        )?;
+        evidence.write_summary(
+            "cohort-indicator-records.json",
+            &engine.compact_cohort_decision_records(),
+        )?;
+        evidence.write_summary(
+            "cohort-decision-summary.json",
+            &engine.compact_cohort_decision_summary(),
+        )?;
+        evidence.write_summary(
+            "technical-decision-records.json",
+            engine.technical_decision_records(),
+        )?;
+        evidence.write_summary(
+            "book-evaluation-events.json",
+            engine.book_evaluation_events(),
+        )?;
+        evidence.write_summary(
+            "action-lifecycle-events.json",
+            engine.action_lifecycle_events(),
+        )?;
+        let executable_density = engine.executable_density_summary()?;
+        evidence.write_summary("executable-density-summary.json", &executable_density)?;
+        evidence.write_summary("five-minute-return-buckets.json", engine.equity_buckets())?;
+        evidence.write_summary(
+            "portfolio-episodes.json",
+            engine.ledger().portfolio_closed(),
+        )?;
+        evidence.write_summary("source-episodes.json", &engine.ledger().all_source_closed())?;
+        evidence.write_summary(
+            "candidate-ingestion-audit.json",
+            &transport.candidate_audit_snapshot(),
+        )?;
+        evidence.write_summary(
         "episode-summary.json",
         &serde_json::json!({"closed_portfolio_episodes":engine.ledger().portfolio_closed().len(),"closed_source_episodes":engine.ledger().total_source_closed()}),
     )?;
-    evidence.write_terminal(&summary)?;
-    if options.transport_gate {
-        let gate = evaluate_transport_gate(
-            &output,
-            &config,
-            source_dispatch_plan,
-            &candidate_tiers,
-            &engine,
-            &scheduler.health(),
-            &counters,
-            transport.metrics().rate_limited.load(Ordering::SeqCst),
-        )?;
-        evidence.write_summary("transport-gate-summary.json", &gate)?;
-        if !gate.passed {
-            return Err("short transport qualification failed; diagnostic bundle preserved".into());
-        }
-    } else if options.profitability_gate || options.micro_density_gate {
-        let starting_equity =
-            Decimal::from_f64(config.starting_equity_usd).ok_or("invalid starting equity")?;
-        let profitability = summarize_profitability(
-            starting_equity,
-            engine.executions(),
-            engine.equity_buckets(),
-            engine.ledger(),
-        )
-        .map_err(|error| format!("profitability summary: {error}"))?;
-        evidence.write_summary("profitability-summary.json", &profitability)?;
-        let gate = evaluate_profitability_gate(
-            &profitability,
-            &executable_density,
-            elapsed,
-            scheduled.len() == config.candidates.len(),
-            engine.active_source_count(clock.now_ms()) == config.candidates.len(),
-            m.projection_violations,
-            t.mutation_requests.load(Ordering::SeqCst),
-            t.key_file_opens.load(Ordering::SeqCst),
-            counters.reserved_weight,
-            transport.metrics().rate_limited.load(Ordering::SeqCst),
-        );
-        evidence.write_summary("profitability-gate-summary.json", &gate)?;
-        if options.micro_density_gate {
-            let micro_gate = evaluate_micro_density_gate(
+        evidence.write_terminal(&summary)?;
+        if options.transport_gate {
+            let gate = evaluate_transport_gate(
+                &output,
+                &config,
+                source_dispatch_plan,
+                &candidate_tiers,
+                &engine,
+                &scheduler.health(),
+                &counters,
+                transport.metrics().rate_limited.load(Ordering::SeqCst),
+            )?;
+            evidence.write_summary("transport-gate-summary.json", &gate)?;
+            if !gate.passed {
+                return Err(
+                    "short transport qualification failed; diagnostic bundle preserved".into(),
+                );
+            }
+        } else if options.profitability_gate || options.micro_density_gate {
+            let starting_equity =
+                Decimal::from_f64(config.starting_equity_usd).ok_or("invalid starting equity")?;
+            let profitability = summarize_profitability(
+                starting_equity,
+                engine.executions(),
+                engine.equity_buckets(),
+                engine.ledger(),
+            )
+            .map_err(|error| format!("profitability summary: {error}"))?;
+            evidence.write_summary("profitability-summary.json", &profitability)?;
+            let gate = evaluate_profitability_gate(
+                &profitability,
                 &executable_density,
                 elapsed,
                 scheduled.len() == config.candidates.len(),
@@ -1242,27 +1798,48 @@ pub async fn run_qualification(options: QualificationOptions) -> Result<PathBuf,
                 counters.reserved_weight,
                 transport.metrics().rate_limited.load(Ordering::SeqCst),
             );
-            evidence.write_summary("micro-density-gate-summary.json", &micro_gate)?;
-            if !micro_gate.passed {
-                return Err("short micro-density gate failed; diagnostic bundle preserved".into());
-            }
-        } else if !gate.passed {
-            if interrupted {
+            evidence.write_summary("profitability-gate-summary.json", &gate)?;
+            if options.micro_density_gate {
+                let micro_gate = evaluate_micro_density_gate(
+                    &executable_density,
+                    elapsed,
+                    scheduled.len() == config.candidates.len(),
+                    engine.active_source_count(clock.now_ms()) == config.candidates.len(),
+                    m.projection_violations,
+                    t.mutation_requests.load(Ordering::SeqCst),
+                    t.key_file_opens.load(Ordering::SeqCst),
+                    counters.reserved_weight,
+                    transport.metrics().rate_limited.load(Ordering::SeqCst),
+                );
+                evidence.write_summary("micro-density-gate-summary.json", &micro_gate)?;
+                if !micro_gate.passed {
+                    return Err(
+                        "short micro-density gate failed; diagnostic bundle preserved".into(),
+                    );
+                }
+            } else if !gate.passed {
+                if interrupted {
+                    return Err(
+                        "four-hour profitability window interrupted; partial evidence retained"
+                            .into(),
+                    );
+                }
                 return Err(
-                    "four-hour profitability window interrupted; partial evidence retained".into(),
+                    "four-hour profitability measurement gate failed; bundle retained".into(),
                 );
             }
-            return Err("four-hour profitability measurement gate failed; bundle retained".into());
         }
+        if interrupted {
+            return Err("HL1K interrupted; qualification clock reset".into());
+        }
+        println!(
+            "hl1k_observation_complete=true provisional=true output={}",
+            output.display()
+        );
+        Ok(output)
     }
-    if interrupted {
-        return Err("HL1K interrupted; qualification clock reset".into());
-    }
-    println!(
-        "hl1k_observation_complete=true provisional=true output={}",
-        output.display()
-    );
-    Ok(output)
+    #[cfg(not(feature = "research-cli"))]
+    unreachable!("the continuous daemon returns from its shutdown path")
 }
 
 fn write_continuous_status(
@@ -1272,16 +1849,15 @@ fn write_continuous_status(
     now: Timestamp,
     config: &CopyTradeConfig,
     engine: &LiveShadowEngine,
-    _counters: &Counters,
+    counters: &Counters,
     scheduler: &SchedulerHealth,
     rate_limited_responses: u64,
-    fresh_by_tier: &BTreeMap<SourceTier, u64>,
-    expired_candidate_count: u64,
-    never_refreshed_candidate_count: u64,
+    streaming: Option<StreamingRuntimeStatus>,
 ) -> Result<(), Box<dyn Error>> {
     let mfce = engine.mfce_report();
     let unresolved_roots = engine.unresolved_actionable_root_count();
     let economics = [
+        ("lifetime", 0),
         ("since_process_start", start),
         ("last_24h", now.saturating_sub(24 * 60 * 60 * 1_000)),
         ("last_7d", now.saturating_sub(7 * 24 * 60 * 60 * 1_000)),
@@ -1290,22 +1866,8 @@ fn write_continuous_status(
     .into_iter()
     .map(|(horizon, cutoff)| runtime_economic_status(horizon, cutoff, config, engine))
     .collect::<Result<Vec<_>, _>>()?;
-    let mfce_policy_exploit = mfce
-        .policy_outputs
-        .iter()
-        .filter(|output| output.policy_state == crate::mfce::MfcePolicyState::Exploit)
-        .count() as u64;
-    let mfce_policy_explore = mfce
-        .policy_outputs
-        .iter()
-        .filter(|output| output.policy_state == crate::mfce::MfcePolicyState::Explore)
-        .count() as u64;
-    let mfce_policy_reject = mfce
-        .policy_outputs
-        .iter()
-        .filter(|output| output.policy_state == crate::mfce::MfcePolicyState::Reject)
-        .count() as u64;
     let metrics = engine.metrics();
+    let deployment_equity = engine.deployment_equity()?;
     let status = ContinuousStatus {
         mode: "continuous_unsigned_planned_only",
         run_id,
@@ -1314,13 +1876,11 @@ fn write_continuous_status(
         elapsed_seconds: now.saturating_sub(start) / 1_000,
         healthy: metrics.projection_violations == 0
             && metrics.persistence_failures == 0
-            && unresolved_roots == 0,
+            && unresolved_roots == 0
+            && engine.source_stream_healthy(),
         fatal_stop: false,
         snapshot_generation: engine.snapshot_generation(),
         candidate_count: config.candidates.len(),
-        fresh_candidate_count: fresh_by_tier.values().copied().sum::<u64>() as usize,
-        expired_candidate_count,
-        never_refreshed_candidate_count,
         projection_violations: metrics.projection_violations,
         persistence_failures: metrics.persistence_failures,
         unresolved_roots,
@@ -1329,20 +1889,27 @@ fn write_continuous_status(
         closed_episodes_lifetime: engine.ledger().portfolio_closed_count(),
         scheduler_pending: scheduler.pending,
         scheduler_in_flight: scheduler.in_flight,
+        rest_weight_consumed_process: counters.total_weight,
+        rest_reserved_weight_consumed_process: counters.reserved_weight,
         rate_limited_responses,
+        streaming,
+        unique_source_transitions: mfce.observed_transitions,
+        modeled_executions_retained: engine.executions().len(),
         mfce_completed_transition_labels: mfce.completed_samples,
         mfce_active_transitions: mfce.active_transitions,
         mfce_awaiting_live_books: mfce.awaiting_live_books,
+        mfce_book_ready_transitions: mfce
+            .active_transitions
+            .saturating_sub(mfce.awaiting_live_books),
         mfce_model_epoch: mfce.incumbent_epoch,
-        mfce_policy_exploit,
-        mfce_policy_explore,
-        mfce_policy_reject,
-        source_risk_increases_allocated: mfce
-            .policy_outputs
-            .iter()
-            .filter(|output| output.admitted)
-            .count() as u64,
-        source_risk_increases_rejected_by_mfce: mfce_policy_reject,
+        mfce_policy_exploit: mfce.decision_counts.exploit,
+        mfce_policy_explore: mfce.decision_counts.explore,
+        mfce_policy_reject: mfce.decision_counts.reject,
+        source_risk_increases_allocated: mfce.decision_counts.allocated,
+        source_risk_increases_rejected_by_mfce: mfce.decision_counts.reject,
+        marked_equity: deployment_equity.current_equity,
+        settled_equity: deployment_equity.settled_equity,
+        open_marked_equity_contribution: deployment_equity.unrealized_net_pnl,
         mfce,
         economics,
     };
@@ -1366,6 +1933,38 @@ fn write_continuous_status(
     std::fs::write(&journal_temporary, journal_bytes)?;
     std::fs::rename(journal_temporary, journal_path)?;
     Ok(())
+}
+
+fn streaming_runtime_status(
+    stream: Option<&StreamingHandle>,
+    sources: Option<&StreamingSourceBook>,
+    engine: &LiveShadowEngine,
+    directory: Option<&MarketDirectory>,
+    subscribed_trade_markets: &BTreeSet<String>,
+    coverage_ready_markets: &BTreeSet<String>,
+    coverage_reconciliation_wallets_pending: usize,
+    coverage_reconciliations: u64,
+    subscribed_hot_books: &BTreeSet<String>,
+) -> Option<StreamingRuntimeStatus> {
+    let metrics = stream?.metrics();
+    let discovered_markets = directory.map_or(0, |directory| directory.markets().len());
+    Some(StreamingRuntimeStatus {
+        source_healthy: engine.source_stream_healthy(),
+        hydrated_source_count: sources.map_or(0, StreamingSourceBook::hydrated_count),
+        discovered_markets,
+        subscribed_trade_markets: subscribed_trade_markets.len(),
+        coverage_ready_markets: coverage_ready_markets.len(),
+        coverage_stale_markets: discovered_markets.saturating_sub(coverage_ready_markets.len()),
+        coverage_reconciliation_wallets_pending,
+        coverage_reconciliations,
+        subscribed_hot_books: subscribed_hot_books.len(),
+        connections: metrics.connections.load(Ordering::SeqCst),
+        gaps: metrics.gaps.load(Ordering::SeqCst),
+        public_trades_seen: metrics.trades.load(Ordering::SeqCst),
+        tracked_trade_updates: metrics.tracked_trade_updates.load(Ordering::SeqCst),
+        book_updates: metrics.book_updates.load(Ordering::SeqCst),
+        invalid_messages: metrics.invalid_messages.load(Ordering::SeqCst),
+    })
 }
 
 fn runtime_economic_status(
@@ -1396,7 +1995,7 @@ fn runtime_economic_status(
                 .ok_or_else(|| "rolling economic sum overflow".into())
         })
     };
-    let include_archived = horizon == "since_process_start";
+    let include_archived = horizon == "lifetime";
     let mut turnover = sum_decimal(executions.iter().map(|item| item.filled_notional).collect())?;
     let mut gross_pnl = sum_decimal(episodes.iter().map(|item| item.realized_pnl).collect())?;
     let mut fees = sum_decimal(episodes.iter().map(|item| item.fees).collect())?;
@@ -1417,8 +2016,30 @@ fn runtime_economic_status(
             .map(|item| item.net_pnl.abs())
             .collect(),
     )?;
-    let starting_equity = Decimal::from_f64(config.starting_equity_usd)
+    let configured_starting_equity = Decimal::from_f64(config.starting_equity_usd)
         .ok_or("invalid configured starting equity")?;
+    let archived_net_pnl = engine
+        .ledger()
+        .portfolio_archived_totals()
+        .values()
+        .try_fold(Decimal::ZERO, |sum, totals| sum.checked_add(totals.net_pnl))
+        .ok_or("archived settled pnl overflow")?;
+    let starting_settled_equity = if include_archived {
+        configured_starting_equity
+    } else {
+        engine
+            .ledger()
+            .portfolio_closed()
+            .iter()
+            .filter(|episode| episode.closed_at < cutoff)
+            .try_fold(
+                configured_starting_equity
+                    .checked_add(archived_net_pnl)
+                    .ok_or("starting settled equity overflow")?,
+                |equity, episode| equity.checked_add(episode.net_pnl),
+            )
+            .ok_or("starting settled equity overflow")?
+    };
     let mut net_pnl_by_asset = BTreeMap::new();
     for episode in &episodes {
         let value = net_pnl_by_asset.entry(episode.asset.clone()).or_default();
@@ -1500,7 +2121,7 @@ fn runtime_economic_status(
     };
     let mut peak = buckets
         .first()
-        .map_or(starting_equity, |bucket| bucket.starting_equity);
+        .map_or(starting_settled_equity, |bucket| bucket.starting_equity);
     let mut maximum_drawdown = Decimal::ZERO;
     for bucket in buckets {
         peak = peak.max(bucket.ending_equity);
@@ -1532,12 +2153,22 @@ fn runtime_economic_status(
                 .checked_div(turnover)
                 .ok_or("rolling efficiency overflow")?
         },
-        settled_return_on_configured_equity: if starting_equity.is_zero() {
+        starting_settled_equity,
+        settled_equity_return: if starting_settled_equity.is_zero() {
             Decimal::ZERO
         } else {
             net_pnl
-                .checked_div(starting_equity)
+                .checked_div(starting_settled_equity)
                 .ok_or("rolling return overflow")?
+        },
+        profit_factor_state: if episodes.len().saturating_add(archived_closures) == 0 {
+            "unavailable_no_closures"
+        } else if losses.is_zero() && gains > Decimal::ZERO {
+            "infinite_no_losses"
+        } else if losses.is_zero() {
+            "unavailable_no_wins_or_losses"
+        } else {
+            "finite"
         },
         profit_factor: (!losses.is_zero())
             .then(|| gains.checked_div(losses).ok_or("rolling PF overflow"))
@@ -1630,6 +2261,44 @@ fn derive_source_dispatch_plan(
     transport: &PublicTransportPolicy,
 ) -> Result<SourceDispatchPlan, Box<dyn Error>> {
     derive_source_dispatch_plan_with_expansion(candidate_count, 0, 0, scheduler, transport)
+}
+
+fn streaming_source_dispatch_plan(
+    candidate_count: usize,
+    scheduler: &ReadOnlySchedulerConfig,
+    transport: &PublicTransportPolicy,
+) -> Result<SourceDispatchPlan, Box<dyn Error>> {
+    if candidate_count == 0 || !transport.streaming.enabled {
+        return Err("streaming source universe must be nonempty and enabled".into());
+    }
+    let expanded_weight = scheduler
+        .api
+        .endpoint_weights
+        .get(&ReadRequestKind::ExpandedSourceState)
+        .copied()
+        .ok_or("expanded source-state endpoint weight missing")?;
+    // One default DEX plus at most twenty discovered builder DEXes, each at
+    // the official clearinghouseState weight of two.
+    if expanded_weight < 42 {
+        return Err("streaming reconciliation must reserve 42 REST weight per wallet".into());
+    }
+    let source_call_capacity_per_window =
+        u64::from(scheduler.api.source_polling_weight_per_window / expanded_weight);
+    if source_call_capacity_per_window == 0 {
+        return Err("streaming reconciliation has no REST budget".into());
+    }
+    let cadence = transport.streaming.reconciliation_spread_ms;
+    Ok(SourceDispatchPlan {
+        effective_candidate_count: candidate_count,
+        active_candidate_count: 0,
+        inactive_candidate_count: candidate_count,
+        active_cadence_ms: cadence,
+        inactive_cadence_ms: cadence,
+        source_call_capacity_per_window,
+        active_dispatches_per_window: 0,
+        inactive_dispatches_per_window: source_call_capacity_per_window,
+        combined_dispatches_per_window: source_call_capacity_per_window,
+    })
 }
 
 fn derive_source_dispatch_plan_with_expansion(
@@ -1868,6 +2537,7 @@ fn next_cadence_deadline(
         .ok_or_else(|| "cadence deadline overflow".into())
 }
 
+#[cfg(any(feature = "research-cli", test))]
 fn required_dispatch_count(
     candidate_count: usize,
     elapsed_ms: u64,
@@ -1883,6 +2553,7 @@ fn required_dispatch_count(
     Ok(count.try_into()?)
 }
 
+#[cfg(feature = "research-cli")]
 pub fn finalize_qualification(
     bundle: &Path,
     post_report: &Path,
@@ -2075,6 +2746,27 @@ fn enqueue<C: Clock>(
     }
 }
 
+fn accepted_stream_response(
+    payload: crate::public_mainnet::PublicPayload,
+    subject: String,
+    request_kind: ReadRequestKind,
+    source_tier: Option<SourceTier>,
+    now: Timestamp,
+    validity_ms: u64,
+) -> Result<crate::public_mainnet::AcceptedPublicResponse, Box<dyn Error>> {
+    Ok(crate::public_mainnet::AcceptedPublicResponse {
+        request_kind,
+        source_tier,
+        subject,
+        requested_at_mono: now,
+        received_at_mono: now,
+        valid_until_mono: now
+            .checked_add(validity_ms)
+            .ok_or("stream validity overflow")?,
+        payload,
+    })
+}
+
 fn append_freshness_decision(
     evidence: &mut RuntimeEvidence,
     request: &ScheduledReadRequest,
@@ -2157,6 +2849,7 @@ pub fn parse_duration_seconds(value: &str) -> Result<u64, Box<dyn Error>> {
         .ok_or_else(|| "duration overflow".into())
 }
 
+#[cfg(feature = "research-cli")]
 #[derive(Debug, Serialize)]
 struct TransportGateSummary {
     passed: bool,
@@ -2183,6 +2876,7 @@ struct TransportGateSummary {
     oldest_pending_age_ms: u64,
 }
 
+#[cfg(feature = "research-cli")]
 #[derive(Debug, Serialize)]
 struct ProfitabilityGateSummary {
     passed: bool,
@@ -2210,6 +2904,7 @@ struct ProfitabilityGateSummary {
     terminal_equity_matches_final_bucket: bool,
 }
 
+#[cfg(feature = "research-cli")]
 #[derive(Debug, Serialize)]
 struct MicroDensityGateSummary {
     passed: bool,
@@ -2234,6 +2929,7 @@ struct MicroDensityGateSummary {
 }
 
 #[allow(clippy::too_many_arguments)]
+#[cfg(feature = "research-cli")]
 fn evaluate_micro_density_gate(
     density: &crate::live_shadow::ExecutableDensitySummary,
     elapsed_seconds: u64,
@@ -2284,6 +2980,7 @@ fn evaluate_micro_density_gate(
 }
 
 #[allow(clippy::too_many_arguments)]
+#[cfg(feature = "research-cli")]
 fn evaluate_profitability_gate(
     profitability: &ProfitabilitySummary,
     density: &crate::live_shadow::ExecutableDensitySummary,
@@ -2340,6 +3037,7 @@ fn evaluate_profitability_gate(
     }
 }
 
+#[cfg(feature = "research-cli")]
 fn evaluate_transport_gate(
     bundle: &Path,
     config: &CopyTradeConfig,
@@ -2469,13 +3167,19 @@ mod tests {
         let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
         let mut scheduler =
             ReadOnlySchedulerConfig::from_path(root.join("config/read-api-policy.json")).unwrap();
+        scheduler.api.total_weight_per_window = 1_200;
         scheduler.api.reserved_weight_per_window = 360;
         scheduler.api.source_polling_weight_per_window = 750;
+        scheduler
+            .api
+            .endpoint_weights
+            .insert(ReadRequestKind::ExpandedSourceState, 4);
         let mut transport: PublicTransportPolicy = serde_json::from_slice(
             &std::fs::read(root.join("config/public-mainnet-transport.json")).unwrap(),
         )
         .unwrap();
         transport.perp_dexes.clear();
+        transport.streaming.enabled = false;
         (scheduler, transport)
     }
 
@@ -2643,13 +3347,10 @@ mod tests {
 
     #[test]
     fn expanded_xyz_sources_are_fully_weighted_and_remain_at_safe_cadence() {
-        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
-        let scheduler =
-            ReadOnlySchedulerConfig::from_path(root.join("config/read-api-policy.json")).unwrap();
-        let transport: PublicTransportPolicy = serde_json::from_slice(
-            &std::fs::read(root.join("config/public-mainnet-transport.json")).unwrap(),
-        )
-        .unwrap();
+        let (mut scheduler, mut transport) = source_policies();
+        scheduler.api.reserved_weight_per_window = 120;
+        scheduler.api.source_polling_weight_per_window = 920;
+        transport.perp_dexes = vec!["xyz".into()];
         let plan = derive_source_dispatch_plan_with_expansion(
             375,
             80,
@@ -2696,6 +3397,35 @@ mod tests {
             &transport,
         )
         .is_err());
+    }
+
+    #[test]
+    fn streaming_reconciliation_is_weighted_below_the_public_rest_ceiling() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let scheduler =
+            ReadOnlySchedulerConfig::from_path(root.join("config/read-api-policy.json")).unwrap();
+        let transport: PublicTransportPolicy = serde_json::from_slice(
+            &std::fs::read(root.join("config/public-mainnet-transport.json")).unwrap(),
+        )
+        .unwrap();
+        let plan = streaming_source_dispatch_plan(375, &scheduler, &transport).unwrap();
+        assert_eq!(scheduler.api.total_weight_per_window, 900);
+        assert_eq!(
+            scheduler.api.endpoint_weights[&ReadRequestKind::ExchangeMetadata],
+            60
+        );
+        assert_eq!(
+            scheduler.api.endpoint_weights[&ReadRequestKind::ExpandedSourceState],
+            42
+        );
+        assert_eq!(plan.source_call_capacity_per_window, 16);
+        assert_eq!(plan.active_candidate_count, 0);
+        assert_eq!(plan.inactive_candidate_count, 375);
+        let minimum_sweep_ms = 375_u64
+            .div_ceil(plan.source_call_capacity_per_window)
+            .checked_mul(scheduler.api.window_ms)
+            .unwrap();
+        assert!(minimum_sweep_ms <= transport.streaming.reconciliation_spread_ms);
     }
 
     #[test]
@@ -2775,4 +3505,3 @@ mod tests {
         assert!(phase_deadline(0, 20_000, 0, 0).is_err());
     }
 }
-use crate::cohort_layer::VeryProfitableLayerArtifact;

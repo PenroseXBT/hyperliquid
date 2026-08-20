@@ -1,5 +1,10 @@
 # Hyperliquid
 
+The continuous observer's public ingestion plane is documented in
+`HD1_STREAMING_DATA_PLANE.md`. It uses public all-perp trade and market-context
+streams with demand-driven L2 books; REST is limited to bounded bootstrap,
+reconciliation, slow metadata, and follower/account safety reads.
+
 A deterministic, risk-bounded Hyperliquid copy-trading engine. Accepted wallet and cohort exposure transitions are the only candidate generator. One embedded MFCE engine conditions q10/q50 gross-transition-return estimates on source conviction, volatility, liquidity, transition state, and read-only multi-timeframe technical context.
 
 Execution friction is computed separately from the current order book, the follower's live `userFees` taker rate, and live funding. MFCE classifies risk increases as `exploit`, `explore`, or `reject`, then ranks the complete current transition set by after-cost edge per unit of conditional downside. Before an incumbent exists, structurally valid source transitions default to small conviction-prior Explore allocations so learning cannot deadlock. Exploit opportunities compete for the main source sleeve, while all simultaneous Explore opportunities share one bounded global sleeve. Only model-backed negative expectancy beyond its uncertainty band earns an economic Reject; q10 and uncertainty otherwise shrink sizing, with genuine tail-budget exhaustion still failing closed. Reductions and exits retain the existing reduce-only, target-ledger, accounting, projection, and signing paths.

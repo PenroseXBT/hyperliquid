@@ -122,6 +122,28 @@ fn mutation_capable_arguments_are_not_registered() {
 }
 
 #[test]
+#[cfg(not(feature = "research-cli"))]
+fn production_binary_excludes_research_commands() {
+    for command in [
+        "observe",
+        "plan",
+        "shadow",
+        "qualify-mainnet",
+        "qualify-transport",
+        "qualify-profitability",
+        "qualify-micro-density",
+        "finalize-qualification",
+        "aggregate-qualification",
+        "replay-density",
+        "audit-candidates",
+    ] {
+        let output = observer().arg(command).output().unwrap();
+        assert!(!output.status.success(), "{command} unexpectedly succeeded");
+    }
+}
+
+#[test]
+#[cfg(feature = "research-cli")]
 fn read_only_observation_schedules_all_candidates_without_transport() {
     let policy = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../config/read-api-policy.json");
     let output = observer()
@@ -140,6 +162,7 @@ fn read_only_observation_schedules_all_candidates_without_transport() {
 }
 
 #[test]
+#[cfg(feature = "research-cli")]
 fn invalid_read_policy_fails_closed() {
     let invalid = temporary_path("invalid-read-policy");
     fs::write(&invalid, b"{}").unwrap();
@@ -158,6 +181,7 @@ fn invalid_read_policy_fails_closed() {
 }
 
 #[test]
+#[cfg(feature = "research-cli")]
 fn fixture_plan_is_inert_and_reproducible() {
     let fixture =
         Path::new(env!("CARGO_MANIFEST_DIR")).join("../../fixtures/accepted-snapshots.json");
@@ -184,6 +208,7 @@ fn fixture_plan_is_inert_and_reproducible() {
 }
 
 #[test]
+#[cfg(feature = "research-cli")]
 fn fixture_shadow_is_deterministic_and_unsigned() {
     let fixture =
         Path::new(env!("CARGO_MANIFEST_DIR")).join("../../fixtures/accepted-snapshots.json");

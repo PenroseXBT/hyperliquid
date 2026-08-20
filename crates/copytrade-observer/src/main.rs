@@ -1,22 +1,28 @@
 use copytrade_core::ipc::{IpcPolicy, ProcessRole, ProductionHandshake, IPC_STATE_SCHEMA_VERSION};
+#[cfg(feature = "research-cli")]
 use copytrade_core::planning_fixture::{construct_plan_from_fixture, execute_fixture_shadow};
 use copytrade_core::release::{canonical_manifest_json, create_release_manifest};
 use copytrade_core::release::{sha256_file, ReleaseManifest};
-use copytrade_core::scheduler::ReadOnlyDataSource;
+#[cfg(feature = "research-cli")]
 use copytrade_core::scheduler::{
-    BudgetClass, Clock, MonotonicClock, ReadOnlySchedulerConfig, ReadRequestKind, RequestKey,
-    RequestPriority, RequestScheduler, RequestSubject, ScheduleOutcome, ScheduledReadRequest,
+    BudgetClass, Clock, MonotonicClock, ReadOnlyDataSource, ReadOnlySchedulerConfig,
+    ReadRequestKind, RequestKey, RequestPriority, RequestScheduler, RequestSubject,
+    ScheduleOutcome, ScheduledReadRequest,
 };
 use copytrade_observer::ipc_client::{
     DurableHandoffQueue, ObserverSignerClient, ProductionIntentDispatcher,
 };
 use copytrade_observer::live_shadow::ProductionIntentIdentity;
+#[cfg(feature = "research-cli")]
 use copytrade_observer::public_mainnet::{HyperliquidPublicTransport, PublicTransportPolicy};
+#[cfg(feature = "research-cli")]
+use copytrade_observer::qualification::{finalize_qualification, run_qualification};
 use copytrade_observer::qualification::{
-    finalize_qualification, parse_duration_seconds, run_qualification, ProductionObserverRuntime,
-    QualificationOptions,
+    parse_duration_seconds, run_continuous_daemon, ProductionObserverRuntime, QualificationOptions,
 };
+#[cfg(feature = "research-cli")]
 use copytrade_observer::railway_aggregate::aggregate_railway_window;
+#[cfg(feature = "research-cli")]
 use copytrade_observer::replay::replay_density_rungs_with_layer;
 use copytrade_observer::state_root::unsigned_persistence_schema_sha256;
 use copytrade_observer::{ObserverCoreState, FORBIDDEN_DEPENDENCY_PACKAGES};
@@ -24,6 +30,7 @@ use std::env;
 use std::error::Error;
 use std::path::PathBuf;
 use std::process;
+#[cfg(feature = "research-cli")]
 use std::sync::Arc;
 
 #[derive(Debug, PartialEq, Eq)]
@@ -64,17 +71,28 @@ enum Operation {
     PrintBuildManifest,
     CheckDependencyPolicy,
     PrintPersistenceSchemaHash,
+    #[cfg(feature = "research-cli")]
     Observe,
+    #[cfg(feature = "research-cli")]
     Plan,
+    #[cfg(feature = "research-cli")]
     Shadow,
     ReleaseManifest,
+    #[cfg(feature = "research-cli")]
     QualifyMainnet,
+    #[cfg(feature = "research-cli")]
     QualifyTransport,
+    #[cfg(feature = "research-cli")]
     QualifyProfitability,
+    #[cfg(feature = "research-cli")]
     QualifyMicroDensity,
+    #[cfg(feature = "research-cli")]
     FinalizeQualification,
+    #[cfg(feature = "research-cli")]
     AggregateQualification,
+    #[cfg(feature = "research-cli")]
     ReplayDensity,
+    #[cfg(feature = "research-cli")]
     AuditCandidates,
     Continuous,
     Production,
@@ -116,8 +134,11 @@ async fn run() -> Result<(), Box<dyn Error>> {
         Operation::PrintPersistenceSchemaHash => {
             println!("{}", unsigned_persistence_schema_sha256())
         }
+        #[cfg(feature = "research-cli")]
         Operation::Observe => run_read_only_observation(&state, &arguments.request_policy)?,
+        #[cfg(feature = "research-cli")]
         Operation::Plan => run_inert_plan(&state, &arguments.fixture)?,
+        #[cfg(feature = "research-cli")]
         Operation::Shadow => run_deterministic_shadow(&state, &arguments.fixture)?,
         Operation::ReleaseManifest => run_release_manifest(
             &state,
@@ -127,6 +148,7 @@ async fn run() -> Result<(), Box<dyn Error>> {
             arguments.source_tree_sha256.as_deref(),
             arguments.release_binary.as_deref(),
         )?,
+        #[cfg(feature = "research-cli")]
         Operation::QualifyMainnet => {
             run_qualification(QualificationOptions {
                 config_path: arguments.config,
@@ -146,6 +168,7 @@ async fn run() -> Result<(), Box<dyn Error>> {
             })
             .await?;
         }
+        #[cfg(feature = "research-cli")]
         Operation::QualifyTransport => {
             run_qualification(QualificationOptions {
                 config_path: arguments.config,
@@ -165,6 +188,7 @@ async fn run() -> Result<(), Box<dyn Error>> {
             })
             .await?;
         }
+        #[cfg(feature = "research-cli")]
         Operation::QualifyProfitability => {
             run_qualification(QualificationOptions {
                 config_path: arguments.config,
@@ -184,6 +208,7 @@ async fn run() -> Result<(), Box<dyn Error>> {
             })
             .await?;
         }
+        #[cfg(feature = "research-cli")]
         Operation::QualifyMicroDensity => {
             run_qualification(QualificationOptions {
                 config_path: arguments.config,
@@ -203,6 +228,7 @@ async fn run() -> Result<(), Box<dyn Error>> {
             })
             .await?;
         }
+        #[cfg(feature = "research-cli")]
         Operation::FinalizeQualification => {
             let summary = finalize_qualification(
                 &arguments.bundle.ok_or("--bundle is required")?,
@@ -213,6 +239,7 @@ async fn run() -> Result<(), Box<dyn Error>> {
                 summary.passed, summary.monotonic_elapsed_seconds
             );
         }
+        #[cfg(feature = "research-cli")]
         Operation::AggregateQualification => {
             let summary = aggregate_railway_window(
                 &arguments.bundle.ok_or("--bundle is required")?,
@@ -230,6 +257,7 @@ async fn run() -> Result<(), Box<dyn Error>> {
             )?;
             println!("{}", serde_json::to_string_pretty(&summary)?);
         }
+        #[cfg(feature = "research-cli")]
         Operation::ReplayDensity => {
             let report = replay_density_rungs_with_layer(
                 &arguments.config,
@@ -248,11 +276,12 @@ async fn run() -> Result<(), Box<dyn Error>> {
                 arguments.output.display()
             );
         }
+        #[cfg(feature = "research-cli")]
         Operation::AuditCandidates => {
             run_candidate_audit(&state, &arguments.transport_policy, &arguments.output).await?
         }
         Operation::Continuous => {
-            run_qualification(QualificationOptions {
+            run_continuous_daemon(QualificationOptions {
                 config_path: arguments.config,
                 very_profitable_layer_path: arguments.very_profitable_layer,
                 request_policy_path: arguments.request_policy,
@@ -444,25 +473,36 @@ fn parse_arguments(arguments: impl Iterator<Item = String>) -> Result<Arguments,
                         .parse()?,
                 )
             }
+            #[cfg(feature = "research-cli")]
             "observe" => set_operation(&mut operation, Operation::Observe)?,
+            #[cfg(feature = "research-cli")]
             "plan" => set_operation(&mut operation, Operation::Plan)?,
+            #[cfg(feature = "research-cli")]
             "shadow" => set_operation(&mut operation, Operation::Shadow)?,
             "release-manifest" => set_operation(&mut operation, Operation::ReleaseManifest)?,
+            #[cfg(feature = "research-cli")]
             "qualify-mainnet" => set_operation(&mut operation, Operation::QualifyMainnet)?,
+            #[cfg(feature = "research-cli")]
             "qualify-transport" => set_operation(&mut operation, Operation::QualifyTransport)?,
+            #[cfg(feature = "research-cli")]
             "qualify-profitability" => {
                 set_operation(&mut operation, Operation::QualifyProfitability)?
             }
+            #[cfg(feature = "research-cli")]
             "qualify-micro-density" => {
                 set_operation(&mut operation, Operation::QualifyMicroDensity)?
             }
+            #[cfg(feature = "research-cli")]
             "finalize-qualification" => {
                 set_operation(&mut operation, Operation::FinalizeQualification)?
             }
+            #[cfg(feature = "research-cli")]
             "aggregate-qualification" => {
                 set_operation(&mut operation, Operation::AggregateQualification)?
             }
+            #[cfg(feature = "research-cli")]
             "replay-density" => set_operation(&mut operation, Operation::ReplayDensity)?,
+            #[cfg(feature = "research-cli")]
             "audit-candidates" => set_operation(&mut operation, Operation::AuditCandidates)?,
             "continuous" => set_operation(&mut operation, Operation::Continuous)?,
             "production" => set_operation(&mut operation, Operation::Production)?,
@@ -544,6 +584,7 @@ fn run_release_manifest(
     Ok(())
 }
 
+#[cfg(feature = "research-cli")]
 fn run_inert_plan(state: &ObserverCoreState, fixture_path: &PathBuf) -> Result<(), Box<dyn Error>> {
     let plan = construct_plan_from_fixture(state.config(), fixture_path)?;
     println!(
@@ -568,6 +609,7 @@ fn run_inert_plan(state: &ObserverCoreState, fixture_path: &PathBuf) -> Result<(
     Ok(())
 }
 
+#[cfg(feature = "research-cli")]
 fn run_deterministic_shadow(
     state: &ObserverCoreState,
     fixture_path: &PathBuf,
@@ -680,7 +722,7 @@ async fn run_production_observer(arguments: &Arguments) -> Result<(), Box<dyn Er
     let hash = |value: Option<&String>, name: &str| -> Result<[u8; 32], Box<dyn Error>> {
         parse_hash32(value.ok_or_else(|| format!("manifest {name} hash missing"))?)
     };
-    run_qualification(QualificationOptions {
+    run_continuous_daemon(QualificationOptions {
         config_path: arguments.config.clone(),
         very_profitable_layer_path: arguments.very_profitable_layer.clone(),
         request_policy_path: arguments.request_policy.clone(),
@@ -740,6 +782,7 @@ fn set_operation(current: &mut Operation, requested: Operation) -> Result<(), Bo
     Ok(())
 }
 
+#[cfg(feature = "research-cli")]
 fn run_read_only_observation(
     state: &ObserverCoreState,
     policy_path: &PathBuf,
@@ -796,6 +839,7 @@ fn run_read_only_observation(
     Ok(())
 }
 
+#[cfg(feature = "research-cli")]
 async fn run_candidate_audit(
     state: &ObserverCoreState,
     transport_policy_path: &PathBuf,
@@ -960,6 +1004,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "research-cli")]
     fn observer_accepts_only_modeled_read_only_observation() {
         let parsed = parse_arguments(
             [
@@ -975,6 +1020,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "research-cli")]
     fn profitability_parser_accepts_persistent_state_root() {
         let parsed = parse_arguments(
             [
@@ -1014,6 +1060,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "research-cli")]
     fn observer_accepts_inert_fixture_planning() {
         let parsed = parse_arguments(
             [
@@ -1029,12 +1076,14 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "research-cli")]
     fn observer_accepts_deterministic_shadow_fixture() {
         let parsed = parse_arguments(["shadow".to_string()].into_iter()).unwrap();
         assert_eq!(parsed.operation, Operation::Shadow);
     }
 
     #[test]
+    #[cfg(feature = "research-cli")]
     fn observer_accepts_only_recorded_public_density_replay() {
         let parsed = parse_arguments(
             [

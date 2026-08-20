@@ -7,5 +7,15 @@
   "queue_delay_allowance_ms": 5000,
   "transport_p99_allowance_ms": 10000,
   "market_validity_ms": 40000,
-  "perp_dexes": ["xyz"]
+  "perp_dexes": [],
+  "streaming": {
+    "enabled": true,
+    "idle_timeout_ms": 15000,
+    "reconnect_initial_backoff_ms": 1000,
+    "reconnect_maximum_backoff_ms": 30000,
+    "reconciliation_interval_ms": 3600000,
+    "reconciliation_spread_ms": 1800000,
+    "hot_book_grace_ms": 30000,
+    "maximum_message_bytes": 4194304
+  }
 }

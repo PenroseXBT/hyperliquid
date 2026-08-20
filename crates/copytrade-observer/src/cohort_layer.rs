@@ -27,9 +27,6 @@ use crate::public_mainnet::SourceStateResponse;
 pub const COHORT_LAYER_SCHEMA_VERSION: u32 = 3;
 pub const HYPERLIQUID_INFO_AUTHORITY: &str = "https://api.hyperliquid.xyz/info";
 const COHORT_CANDIDATE_LABEL_PREFIX: &str = "hyperdash-very-profitable";
-const SU6R1_SOURCE_BUDGET_FRACTION: f64 = 0.35;
-const SU6R1_TECHNICAL_BUDGET_FRACTION: f64 = 0.65;
-const ALLOCATION_EPSILON: f64 = 1e-12;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CohortLayerError {
@@ -116,7 +113,6 @@ impl PreparedVeryProfitableLayer {
         config: &CopyTradeConfig,
     ) -> Result<Self, CohortLayerError> {
         validate_artifact_header(artifact)?;
-        validate_hybrid_allocation(config)?;
         let artifact_sha256 = artifact.canonical_sha256()?;
         let existing = config
             .candidates
@@ -202,7 +198,6 @@ impl PreparedVeryProfitableLayer {
         &self,
         config: &mut CopyTradeConfig,
     ) -> Result<usize, CohortLayerError> {
-        validate_hybrid_allocation(config)?;
         let identity = layer_identity(&self.resolution, &self.artifact_sha256);
         validate_bound_identity(config, &identity)?;
         let scheduled_cohort = config
@@ -328,19 +323,6 @@ fn validate_bound_identity(
     {
         return Err(CohortLayerError::InvalidMergedConfiguration(
             "configuration is already bound to a different very_profitable artifact".into(),
-        ));
-    }
-    Ok(())
-}
-
-fn validate_hybrid_allocation(config: &CopyTradeConfig) -> Result<(), CohortLayerError> {
-    if (config.technical.source_budget_fraction - SU6R1_SOURCE_BUDGET_FRACTION).abs()
-        > ALLOCATION_EPSILON
-        || (config.technical.technical_budget_fraction - SU6R1_TECHNICAL_BUDGET_FRACTION).abs()
-            > ALLOCATION_EPSILON
-    {
-        return Err(CohortLayerError::InvalidMergedConfiguration(
-            "very_profitable SU6R1 requires the frozen 35% source / 65% technical split".into(),
         ));
     }
     Ok(())
@@ -605,17 +587,14 @@ mod tests {
     }
 
     #[test]
-    fn cohort_layer_requires_the_frozen_thirty_five_sixty_five_identity() {
+    fn historical_sleeve_fields_do_not_control_cohort_preparation() {
         let mut config = config();
         let existing = config.candidates[0].address.clone();
         let artifact = artifact(existing, address(0xa004));
         config.technical.source_budget_fraction = 0.40;
         config.technical.technical_budget_fraction = 0.60;
 
-        assert!(matches!(
-            PreparedVeryProfitableLayer::prepare(&artifact, &config),
-            Err(CohortLayerError::InvalidMergedConfiguration(_))
-        ));
+        assert!(PreparedVeryProfitableLayer::prepare(&artifact, &config).is_ok());
         assert!(config.very_profitable_layer.is_none());
         assert_eq!(config.candidates.len(), 169);
     }

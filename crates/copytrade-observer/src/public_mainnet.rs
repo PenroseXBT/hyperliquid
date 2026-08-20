@@ -2,12 +2,14 @@ use crate::ingestion::{
     CandidateAuditSnapshot, CandidateAuditState, DecodeStage, IngestionFailure,
     IngestionFailureClassification,
 };
+use crate::streaming::StreamingPolicy;
 use copytrade_core::decision::hash_payload_bytes;
 use copytrade_core::scheduler::{
     Clock, ReadFailure, ReadOnlyDataSource, ReadRequestKind, ReadResponse, RequestSubject,
     ScheduledReadRequest,
 };
 use copytrade_core::technical::{CandleInterval, ClosedCandle};
+use futures_util::{stream, StreamExt};
 use reqwest::{redirect::Policy, Client, StatusCode, Url};
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
@@ -40,6 +42,10 @@ pub struct PublicTransportPolicy {
     /// is always queried and must not be listed here.
     #[serde(default)]
     pub perp_dexes: Vec<String>,
+    /// Event-driven public data plane. When enabled, REST source reads are
+    /// bootstrap/reconciliation only and market/book freshness comes from WS.
+    #[serde(default)]
+    pub streaming: StreamingPolicy,
 }
 
 impl PublicTransportPolicy {
@@ -67,6 +73,9 @@ impl PublicTransportPolicy {
         {
             return Err(PublicReadError::InvalidPolicy);
         }
+        self.streaming
+            .validate()
+            .map_err(|_| PublicReadError::InvalidPolicy)?;
         Ok(())
     }
 
@@ -239,6 +248,8 @@ pub struct HyperliquidPublicTransport<C: Clock> {
     technical_fetch: Arc<Mutex<TechnicalCandleFetchState>>,
     fee_user: Arc<Mutex<Option<String>>>,
     expanded_source_candidates: Arc<Mutex<BTreeSet<String>>>,
+    discovered_perp_dexes: Arc<Mutex<BTreeSet<String>>>,
+    discovered_perp_dex_order: Arc<Mutex<Vec<String>>>,
 }
 
 const TECHNICAL_UNIVERSE_LIMIT: usize = 25;
@@ -310,6 +321,8 @@ impl<C: Clock> HyperliquidPublicTransport<C> {
             technical_fetch: Arc::new(Mutex::new(TechnicalCandleFetchState::default())),
             fee_user: Arc::new(Mutex::new(None)),
             expanded_source_candidates: Arc::new(Mutex::new(BTreeSet::new())),
+            discovered_perp_dexes: Arc::new(Mutex::new(BTreeSet::new())),
+            discovered_perp_dex_order: Arc::new(Mutex::new(Vec::new())),
         })
     }
 
@@ -361,6 +374,13 @@ impl<C: Clock> HyperliquidPublicTransport<C> {
 
     pub fn metrics(&self) -> Arc<PublicTransportMetrics> {
         Arc::clone(&self.metrics)
+    }
+
+    pub fn discovered_perp_dexes(&self) -> BTreeSet<String> {
+        self.discovered_perp_dexes
+            .lock()
+            .expect("discovered perp DEX mutex poisoned")
+            .clone()
     }
 
     pub fn candidate_audit_snapshot(&self) -> CandidateAuditSnapshot {
@@ -562,7 +582,12 @@ impl<C: Clock> HyperliquidPublicTransport<C> {
         &self,
         request: &ScheduledReadRequest,
     ) -> Result<AcceptedPublicResponse, ReadFailure> {
-        let (subject, body) = modeled_body(request)?;
+        let (subject, body) =
+            if self.policy.streaming.enabled && request.kind == ReadRequestKind::ExchangeMetadata {
+                ("market".to_string(), json!({"type":"allPerpMetas"}))
+            } else {
+                modeled_body(request)?
+            };
         let expanded_source = self
             .expanded_source_candidates
             .lock()
@@ -570,6 +595,17 @@ impl<C: Clock> HyperliquidPublicTransport<C> {
             .contains(&subject);
         if request.kind == ReadRequestKind::ExpandedSourceState && !expanded_source {
             return Err(ReadFailure::InvalidResponse);
+        }
+        if self.policy.streaming.enabled && request.kind == ReadRequestKind::ExchangeMetadata {
+            let dex_bytes = self
+                .fetch_auxiliary_info(&json!({"type":"perpDexs"}))
+                .await?;
+            let dex_order =
+                parse_perp_dex_order(&dex_bytes).map_err(|_| ReadFailure::InvalidResponse)?;
+            *self
+                .discovered_perp_dex_order
+                .lock()
+                .expect("discovered perp DEX order mutex poisoned") = dex_order;
         }
         if request.kind.is_source_state() {
             validate_candidate_address(&subject).map_err(|failure| {
@@ -713,19 +749,39 @@ impl<C: Clock> HyperliquidPublicTransport<C> {
                     .lock()
                     .expect("market asset mutex poisoned")
                     .clone();
-                for dex in &self.policy.perp_dexes {
-                    let auxiliary = self
-                        .fetch_auxiliary_info(
-                            &json!({"type":"clearinghouseState","user":subject,"dex":dex}),
-                        )
-                        .await?;
-                    let additional =
-                        parse_source_state_with_metadata(&subject, &auxiliary, &assets)
-                            .map_err(|_| ReadFailure::InvalidResponse)?;
+                let dexes = if self.policy.streaming.enabled {
+                    self.discovered_perp_dexes()
+                } else {
+                    self.policy.perp_dexes.iter().cloned().collect()
+                };
+                let fetches = stream::iter(dexes.into_iter().map(|dex| {
+                    let subject = subject.clone();
+                    let assets = assets.clone();
+                    async move {
+                        let auxiliary = self
+                            .fetch_auxiliary_info(
+                                &json!({"type":"clearinghouseState","user":subject,"dex":dex}),
+                            )
+                            .await?;
+                        let additional =
+                            parse_source_state_with_metadata(&subject, &auxiliary, &assets)
+                                .map_err(|_| ReadFailure::InvalidResponse)?;
+                        Ok::<_, ReadFailure>((dex, additional))
+                    }
+                }))
+                .buffer_unordered(4)
+                .collect::<Vec<_>>()
+                .await;
+                let mut additional = fetches.into_iter().collect::<Result<Vec<_>, _>>()?;
+                additional.sort_by(|left, right| left.0.cmp(&right.0));
+                for (_, additional) in additional {
                     merge_source_states(state, additional)?;
                 }
             }
             PublicPayload::MarketSnapshot(snapshot) => {
+                if self.policy.streaming.enabled {
+                    return Err(ReadFailure::Permanent);
+                }
                 for dex in &self.policy.perp_dexes {
                     let auxiliary = self
                         .fetch_auxiliary_info(&json!({"type":"allMids","dex":dex}))
@@ -736,13 +792,15 @@ impl<C: Clock> HyperliquidPublicTransport<C> {
                 }
             }
             PublicPayload::MarketMetadata(metadata) => {
-                for dex in &self.policy.perp_dexes {
-                    let auxiliary = self
-                        .fetch_auxiliary_info(&json!({"type":"metaAndAssetCtxs","dex":dex}))
-                        .await?;
-                    let (additional, _) = parse_metadata_with_technical_universe(&auxiliary)
-                        .map_err(|_| ReadFailure::InvalidResponse)?;
-                    merge_market_metadata(metadata, additional)?;
+                if !self.policy.streaming.enabled {
+                    for dex in &self.policy.perp_dexes {
+                        let auxiliary = self
+                            .fetch_auxiliary_info(&json!({"type":"metaAndAssetCtxs","dex":dex}))
+                            .await?;
+                        let (additional, _) = parse_metadata_with_technical_universe(&auxiliary)
+                            .map_err(|_| ReadFailure::InvalidResponse)?;
+                        merge_market_metadata(metadata, additional)?;
+                    }
                 }
                 *self
                     .market_assets
@@ -765,27 +823,31 @@ impl<C: Clock> HyperliquidPublicTransport<C> {
                 metadata.live_taker_fee_bps = Some(self.fetch_live_taker_fee_bps(&fee_user).await?);
             }
         }
-        if let PublicPayload::SourceState(state) = &payload {
-            let maximum_age = self
-                .policy
-                .source_deadline_ms(request.source_tier.ok_or(ReadFailure::InvalidResponse)?)
-                .ok_or(ReadFailure::InvalidResponse)?;
-            let age = wall_clock_ms().saturating_sub(state.source_time_ms);
-            if age > maximum_age {
-                let failure = IngestionFailure::new(
-                    IngestionFailureClassification::StaleFutureTimestamp,
-                    DecodeStage::MetadataResolved,
-                    format!("source state age {age}ms exceeds {maximum_age}ms"),
-                );
-                self.record_candidate_failure(request, &subject, failure);
-                return Err(ReadFailure::InvalidResponse);
+        if !self.policy.streaming.enabled {
+            if let PublicPayload::SourceState(state) = &payload {
+                let maximum_age = self
+                    .policy
+                    .source_deadline_ms(request.source_tier.ok_or(ReadFailure::InvalidResponse)?)
+                    .ok_or(ReadFailure::InvalidResponse)?;
+                let age = wall_clock_ms().saturating_sub(state.source_time_ms);
+                if age > maximum_age {
+                    let failure = IngestionFailure::new(
+                        IngestionFailureClassification::StaleFutureTimestamp,
+                        DecodeStage::MetadataResolved,
+                        format!("source state age {age}ms exceeds {maximum_age}ms"),
+                    );
+                    self.record_candidate_failure(request, &subject, failure);
+                    return Err(ReadFailure::InvalidResponse);
+                }
             }
         }
-        if let PublicPayload::SourceState(state) = &mut payload {
-            let candidate_id = state.candidate_id.clone();
-            state.closed_candles = self
-                .fetch_due_source_candles(&candidate_id, &state.positions, wall_clock_ms())
-                .await;
+        if !self.policy.streaming.enabled {
+            if let PublicPayload::SourceState(state) = &mut payload {
+                let candidate_id = state.candidate_id.clone();
+                state.closed_candles = self
+                    .fetch_due_source_candles(&candidate_id, &state.positions, wall_clock_ms())
+                    .await;
+            }
         }
         let received_at_mono = self.clock.now_ms();
         let validity = match request.kind {
@@ -838,8 +900,28 @@ impl<C: Clock> HyperliquidPublicTransport<C> {
                 .map(PublicPayload::MarketSnapshot)
                 .map_err(generic_decode_failure),
             ReadRequestKind::ExchangeMetadata => {
-                let (metadata, technical_assets) = parse_metadata_with_technical_universe(bytes)
-                    .map_err(generic_decode_failure)?;
+                let (metadata, technical_assets, dexes) = if self.policy.streaming.enabled {
+                    let dex_order = self
+                        .discovered_perp_dex_order
+                        .lock()
+                        .expect("discovered perp DEX order mutex poisoned")
+                        .clone();
+                    let (metadata, dexes) =
+                        parse_all_perp_metas(bytes, &dex_order).map_err(generic_decode_failure)?;
+                    let technical = ranked_technical_assets(&metadata.universe, &BTreeMap::new());
+                    (metadata, technical, dexes)
+                } else {
+                    let (metadata, technical_assets) =
+                        parse_metadata_with_technical_universe(bytes)
+                            .map_err(generic_decode_failure)?;
+                    (metadata, technical_assets, BTreeSet::new())
+                };
+                if self.policy.streaming.enabled {
+                    *self
+                        .discovered_perp_dexes
+                        .lock()
+                        .expect("discovered perp DEX mutex poisoned") = dexes;
+                }
                 *self
                     .market_assets
                     .lock()
@@ -1387,6 +1469,170 @@ fn parse_metadata_with_technical_universe(
     ))
 }
 
+/// Parses the `allPerpMetas` response without assuming a fixed builder-DEX
+/// list. Hyperliquid has returned both pair-shaped and object-shaped aggregate
+/// encodings over time, so the decoder accepts only bounded containers that
+/// contain an explicit `universe` and an unambiguous DEX name.
+fn parse_all_perp_metas(
+    bytes: &[u8],
+    dex_order: &[String],
+) -> Result<(MarketMetadataResponse, BTreeSet<String>), PublicReadError> {
+    let value: Value =
+        serde_json::from_slice(bytes).map_err(|_| PublicReadError::InvalidPayload)?;
+    let mut groups = Vec::<(String, &Value)>::new();
+    if let Some(rows) = value.as_array().filter(|rows| {
+        !rows.is_empty()
+            && rows
+                .iter()
+                .all(|row| row.get("universe").and_then(Value::as_array).is_some())
+    }) {
+        if rows.len() != dex_order.len() {
+            return Err(PublicReadError::InvalidPayload);
+        }
+        groups.extend(
+            rows.iter()
+                .zip(dex_order)
+                .map(|(metadata, dex)| (dex.clone(), metadata)),
+        );
+    } else {
+        collect_perp_meta_groups(&value, None, &mut groups)?;
+    }
+    if groups.is_empty() || groups.len() > 21 {
+        return Err(PublicReadError::InvalidPayload);
+    }
+    let mut universe = Vec::new();
+    let mut names = BTreeSet::new();
+    let mut dexes = BTreeSet::new();
+    for (dex, metadata) in groups {
+        if !dex.is_empty() {
+            if dex.len() > 32
+                || !dex
+                    .bytes()
+                    .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit())
+            {
+                return Err(PublicReadError::InvalidPayload);
+            }
+            dexes.insert(dex.clone());
+        }
+        let rows = metadata
+            .get("universe")
+            .and_then(Value::as_array)
+            .ok_or(PublicReadError::InvalidPayload)?;
+        if rows.is_empty() || rows.len() > 1_000 {
+            return Err(PublicReadError::InvalidPayload);
+        }
+        for row in rows {
+            let raw_name = row
+                .get("name")
+                .and_then(Value::as_str)
+                .ok_or(PublicReadError::InvalidPayload)?;
+            let name = if dex.is_empty() || raw_name.contains(':') {
+                raw_name.to_string()
+            } else {
+                format!("{dex}:{raw_name}")
+            };
+            let size_decimals = row
+                .get("szDecimals")
+                .and_then(Value::as_u64)
+                .and_then(|value| u32::try_from(value).ok())
+                .filter(|value| *value <= 18)
+                .ok_or(PublicReadError::InvalidPayload)?;
+            if name.is_empty() || name.len() > 64 || !names.insert(name.clone()) {
+                return Err(PublicReadError::InvalidPayload);
+            }
+            universe.push(MarketMetadataAsset {
+                name,
+                size_decimals,
+            });
+        }
+    }
+    if universe.is_empty() || universe.len() > 850 {
+        return Err(PublicReadError::InvalidPayload);
+    }
+    Ok((
+        MarketMetadataResponse {
+            universe,
+            contexts: BTreeMap::new(),
+            live_taker_fee_bps: None,
+        },
+        dexes,
+    ))
+}
+
+fn parse_perp_dex_order(bytes: &[u8]) -> Result<Vec<String>, PublicReadError> {
+    let rows: Vec<Value> =
+        serde_json::from_slice(bytes).map_err(|_| PublicReadError::InvalidPayload)?;
+    if rows.is_empty() || rows.len() > 21 || !rows[0].is_null() {
+        return Err(PublicReadError::InvalidPayload);
+    }
+    let mut order = vec![String::new()];
+    let mut unique = BTreeSet::new();
+    for row in rows.into_iter().skip(1) {
+        let name = row
+            .get("name")
+            .and_then(Value::as_str)
+            .ok_or(PublicReadError::InvalidPayload)?;
+        if name.is_empty()
+            || name.len() > 32
+            || !name
+                .bytes()
+                .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit())
+            || !unique.insert(name.to_string())
+        {
+            return Err(PublicReadError::InvalidPayload);
+        }
+        order.push(name.to_string());
+    }
+    Ok(order)
+}
+
+fn collect_perp_meta_groups<'a>(
+    value: &'a Value,
+    dex_hint: Option<&str>,
+    groups: &mut Vec<(String, &'a Value)>,
+) -> Result<(), PublicReadError> {
+    if value.get("universe").and_then(Value::as_array).is_some() {
+        groups.push((dex_hint.unwrap_or("").to_string(), value));
+        return Ok(());
+    }
+    if let Some(parts) = value.as_array() {
+        if parts.len() == 2
+            && (parts[0].is_null() || parts[0].is_string())
+            && parts[1].get("universe").and_then(Value::as_array).is_some()
+        {
+            let dex = parts[0].as_str().unwrap_or("");
+            groups.push((dex.to_string(), &parts[1]));
+            return Ok(());
+        }
+        if parts.len() > 21 {
+            return Err(PublicReadError::InvalidPayload);
+        }
+        for part in parts {
+            collect_perp_meta_groups(part, dex_hint, groups)?;
+        }
+        return Ok(());
+    }
+    if let Some(object) = value.as_object() {
+        if let Some(meta) = object.get("meta") {
+            let dex = object
+                .get("dex")
+                .or_else(|| object.get("name"))
+                .and_then(Value::as_str)
+                .or(dex_hint);
+            return collect_perp_meta_groups(meta, dex, groups);
+        }
+        if object.len() > 21 {
+            return Err(PublicReadError::InvalidPayload);
+        }
+        for (dex, child) in object {
+            if child.get("universe").and_then(Value::as_array).is_some() {
+                collect_perp_meta_groups(child, Some(dex), groups)?;
+            }
+        }
+    }
+    Ok(())
+}
+
 fn ranked_technical_assets(
     universe: &[MarketMetadataAsset],
     day_notionals: &BTreeMap<String, Decimal>,
@@ -1520,6 +1766,7 @@ mod tests {
             transport_p99_allowance_ms: 10_000,
             market_validity_ms: 20_000,
             perp_dexes: Vec::new(),
+            streaming: StreamingPolicy::default(),
         }
     }
 
@@ -1534,6 +1781,27 @@ mod tests {
             validate_endpoint(&Url::parse("https://api.hyperliquid.xyz/exchange").unwrap())
                 .is_err()
         );
+    }
+
+    #[test]
+    fn all_perp_metas_discovers_default_and_builder_markets() {
+        let bytes = serde_json::to_vec(&json!([
+            {"universe":[{"name":"BTC","szDecimals":5}]},
+            {"universe":[{"name":"XYZ100","szDecimals":2}]}
+        ]))
+        .unwrap();
+        let dex_bytes = serde_json::to_vec(&json!([null,{"name":"xyz"}])).unwrap();
+        let dex_order = parse_perp_dex_order(&dex_bytes).unwrap();
+        let (metadata, dexes) = parse_all_perp_metas(&bytes, &dex_order).unwrap();
+        assert_eq!(
+            metadata
+                .universe
+                .iter()
+                .map(|asset| asset.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["BTC", "xyz:XYZ100"]
+        );
+        assert_eq!(dexes, BTreeSet::from(["xyz".to_string()]));
     }
 
     #[test]
