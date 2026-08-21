@@ -1206,13 +1206,19 @@ impl Display for LiveShadowError {
 }
 impl Error for LiveShadowError {}
 
-#[derive(Clone)]
-struct PendingShadow {
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct PendingAction {
     action: copytrade_core::decision::PlannedAction,
     root_planned_cloid: String,
+    component_attribution: BTreeMap<String, Decimal>,
+    #[serde(skip)]
+    execution: Option<PendingExecutionContext>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PendingExecutionContext {
     parent_planned_cloid: Option<String>,
     decision_book: ShadowMarketSnapshot,
-    component_targets: BTreeMap<String, Decimal>,
     price_tick: Decimal,
     size_step: Decimal,
     projection_input: PortfolioProjectionInput,
@@ -1536,7 +1542,7 @@ pub struct LiveShadowEngine {
     books: BTreeMap<String, (OrderBookResponse, Timestamp)>,
     previous_target: Option<PreviousTargetState>,
     decision_sequence: u64,
-    pending: BTreeMap<String, PendingShadow>,
+    pending: BTreeMap<String, PendingAction>,
     pending_book: BTreeMap<String, PendingBookIntent>,
     continuations: BTreeMap<String, ContinuationIntent>,
     desired_books: BTreeSet<String>,
@@ -1574,7 +1580,7 @@ pub struct LiveShadowEngine {
     snapshot_generation: Option<u64>,
 }
 
-pub const UNSIGNED_SNAPSHOT_SCHEMA_VERSION: u32 = 8;
+pub const UNSIGNED_SNAPSHOT_SCHEMA_VERSION: u32 = 9;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -1598,6 +1604,7 @@ pub struct UnsignedObserverState {
     very_profitable_engine: VeryProfitableCohortEngine,
     very_profitable_layer_artifact_sha256: Option<String>,
     decision_sequence: u64,
+    pending: BTreeMap<String, PendingAction>,
     continuations: BTreeMap<String, ContinuationIntent>,
     accrued_funding: BTreeMap<String, Decimal>,
     last_mids: Option<MarketSnapshotResponse>,
@@ -3500,7 +3507,10 @@ impl LiveShadowEngine {
                     decision_id: previous.action.decision_id.to_string(),
                     planned_cloid: previous.action.planned_cloid.to_string(),
                     root_planned_cloid: previous.root_planned_cloid,
-                    parent_planned_cloid: previous.parent_planned_cloid,
+                    parent_planned_cloid: previous
+                        .execution
+                        .as_ref()
+                        .and_then(|context| context.parent_planned_cloid.clone()),
                     retry_generation: previous.action.retry_generation,
                     observed_at_mono: now,
                     requested_notional: previous.action.rounded_notional,
@@ -3619,6 +3629,21 @@ impl LiveShadowEngine {
                 )?;
                 let economic_attribution =
                     classify_economic_attribution(source_contributions.get(&asset));
+                let execution_context = |parent_planned_cloid, continuation_kind| {
+                    let mut input = projection_input.clone();
+                    input.unconstrained_targets = decision.projection.constrained_targets.clone();
+                    PendingExecutionContext {
+                        parent_planned_cloid,
+                        decision_book: snapshot.clone(),
+                        price_tick: rules.price_tick,
+                        size_step: rules.size_step,
+                        projection_input: input,
+                        risk_policy_hash: decision.risk_policy_hash,
+                        configuration_hash: decision.config_hash,
+                        continuation_kind,
+                        economic_attribution,
+                    }
+                };
                 let notional_tolerance = rules
                     .mark_price
                     .checked_mul(rules.size_step)
@@ -3632,12 +3657,12 @@ impl LiveShadowEngine {
                     .then(|| previous.root_planned_cloid.clone())
                 });
                 if let Some(root_planned_cloid) = preserved_root {
-                    // The retained action is already acknowledged/in flight.
-                    // Its component targets are immutable issuance provenance;
-                    // current desired targets may change, but cannot redefine
-                    // how a later fill from this action is attributed.
-                    if self.pending[&asset]
-                        .component_targets
+                    let previous = self.pending.get_mut(&asset).unwrap();
+                    if previous.execution.is_none() {
+                        previous.execution = Some(execution_context(None, None));
+                    }
+                    if previous
+                        .component_attribution
                         .keys()
                         .any(|candidate| candidate.starts_with("technical:"))
                     {
@@ -3694,7 +3719,10 @@ impl LiveShadowEngine {
                             decision_id: previous.action.decision_id.to_string(),
                             planned_cloid: previous.action.planned_cloid.to_string(),
                             root_planned_cloid: previous.root_planned_cloid.clone(),
-                            parent_planned_cloid: previous.parent_planned_cloid.clone(),
+                            parent_planned_cloid: previous
+                                .execution
+                                .as_ref()
+                                .and_then(|context| context.parent_planned_cloid.clone()),
                             retry_generation: previous.action.retry_generation,
                             observed_at_mono: now,
                             requested_notional: previous.action.rounded_notional,
@@ -3706,24 +3734,11 @@ impl LiveShadowEngine {
                 }
                 self.pending.insert(
                     asset,
-                    PendingShadow {
+                    PendingAction {
                         action,
                         root_planned_cloid,
-                        parent_planned_cloid,
-                        decision_book: snapshot,
-                        component_targets,
-                        price_tick: rules.price_tick,
-                        size_step: rules.size_step,
-                        projection_input: {
-                            let mut input = projection_input.clone();
-                            input.unconstrained_targets =
-                                decision.projection.constrained_targets.clone();
-                            input
-                        },
-                        risk_policy_hash: decision.risk_policy_hash,
-                        configuration_hash: decision.config_hash,
-                        continuation_kind,
-                        economic_attribution,
+                        component_attribution: component_targets,
+                        execution: Some(execution_context(parent_planned_cloid, continuation_kind)),
                     },
                 );
             }
@@ -3762,9 +3777,12 @@ impl LiveShadowEngine {
         let Some(pending) = self.pending.get(&book.asset).cloned() else {
             return Ok(ExecutionRecompute::None);
         };
+        let Some(context) = pending.execution.clone() else {
+            return Ok(ExecutionRecompute::None);
+        };
         let latency = self.config.latency_timeout_ms;
         if received_at
-            < pending
+            < context
                 .decision_book
                 .observed_at_mono
                 .saturating_add(latency)
@@ -3772,7 +3790,7 @@ impl LiveShadowEngine {
             return Ok(ExecutionRecompute::None);
         }
         let evaluation = shadow_snapshot(book, received_at)?;
-        let decision_midpoint = pending.decision_book.midpoint;
+        let decision_midpoint = context.decision_book.midpoint;
         let reference_price = evaluation.midpoint;
         let cushion = Decimal::from_f64(self.config.slippage_buffer_bps / 10_000.0)
             .ok_or(LiveShadowError::Arithmetic)?;
@@ -3780,8 +3798,8 @@ impl LiveShadowEngine {
             .ok_or(LiveShadowError::Arithmetic)?;
         let market_rules = MarketRules {
             mark_price: reference_price,
-            price_tick: pending.price_tick,
-            size_step: pending.size_step,
+            price_tick: context.price_tick,
+            size_step: context.size_step,
         };
         let floor_policy = ExecutionFloorPolicy {
             exchange_minimum_notional: Decimal::from_f64(
@@ -3873,7 +3891,7 @@ impl LiveShadowEngine {
                 .rounded_notional
                 .checked_div(reference_price)
                 .ok_or(LiveShadowError::Arithmetic)?;
-            let quantity = round_exchange_step(raw_quantity, pending.size_step, false)?;
+            let quantity = round_exchange_step(raw_quantity, context.size_step, false)?;
             let floor = copytrade_core::execution_floor::execution_floor_for_asset(
                 pending.action.side,
                 &market_rules,
@@ -3887,7 +3905,7 @@ impl LiveShadowEngine {
                 reference_price,
                 cushion,
                 maximum_slippage,
-                pending.price_tick,
+                context.price_tick,
             )
             .map_err(core)?;
             (quantity, price_plan, floor.minimum_order_notional)
@@ -3928,7 +3946,7 @@ impl LiveShadowEngine {
                 let expected_committed_after = expected_committed_before
                     .checked_add(signed_delta)
                     .ok_or(LiveShadowError::Arithmetic)?;
-                let mut projection_input = pending.projection_input.clone();
+                let mut projection_input = context.projection_input.clone();
                 if let Some(rules) = projection_input.market_rules.get_mut(&book.asset) {
                     rules.mark_price = reference_price;
                 }
@@ -3946,8 +3964,9 @@ impl LiveShadowEngine {
                     .ok_or_else(|| LiveShadowError::InvalidMarket(book.asset.clone()))?;
                 let root_cloid = parse_planned_cloid(&pending.root_planned_cloid)?;
                 let parent_cloid = pending
-                    .parent_planned_cloid
-                    .as_deref()
+                    .execution
+                    .as_ref()
+                    .and_then(|context| context.parent_planned_cloid.as_deref())
                     .map(parse_planned_cloid)
                     .transpose()?;
                 let intent = AuthorizedExecutionIntent {
@@ -3966,8 +3985,8 @@ impl LiveShadowEngine {
                     reduce_only: pending.action.reduce_only,
                     time_in_force: TimeInForce::Ioc,
                     projected_portfolio_hash,
-                    risk_policy_hash: pending.risk_policy_hash,
-                    configuration_hash: pending.configuration_hash,
+                    risk_policy_hash: context.risk_policy_hash,
+                    configuration_hash: context.configuration_hash,
                     market_rules_hash: identity.market_rules_hash,
                     dynamic_floor_policy_hash: identity.dynamic_floor_policy_hash,
                     ioc_policy_hash: identity.ioc_policy_hash,
@@ -3977,13 +3996,13 @@ impl LiveShadowEngine {
                     decision_reference_price: decision_midpoint,
                     expected_committed_before,
                     expected_committed_after,
-                    decision_timestamp_ms: pending.decision_book.observed_at_mono,
+                    decision_timestamp_ms: context.decision_book.observed_at_mono,
                     expires_at: received_at
                         .checked_add(identity.expires_after_ms)
                         .ok_or(LiveShadowError::Arithmetic)?,
                     authorization: PreSigningContext {
                         now_mono: received_at,
-                        deployed_risk_policy_hash: pending.risk_policy_hash,
+                        deployed_risk_policy_hash: context.risk_policy_hash,
                         projection_input,
                         exchange_minimum_notional: required_notional,
                     },
@@ -3997,7 +4016,7 @@ impl LiveShadowEngine {
         }
         self.accrue_funding(received_at)?;
         let pending_component_ids = pending
-            .component_targets
+            .component_attribution
             .keys()
             .cloned()
             .collect::<BTreeSet<_>>();
@@ -4022,8 +4041,8 @@ impl LiveShadowEngine {
         let pending_reduce_only = pending.action.reduce_only;
         let execution = execute_shadow_ioc(&ShadowExecutionInput {
             action: pending.action,
-            decision_timestamp_mono: pending.decision_book.observed_at_mono,
-            decision_market_snapshot: pending.decision_book,
+            decision_timestamp_mono: context.decision_book.observed_at_mono,
+            decision_market_snapshot: context.decision_book.clone(),
             evaluation_market_snapshot: evaluation,
             latency_scenario: LatencyScenario::Expected,
             configured_latency_ms: latency,
@@ -4043,7 +4062,7 @@ impl LiveShadowEngine {
             .checked_add(received_at)
             .ok_or(LiveShadowError::Arithmetic)?;
         self.ledger_time_high_watermark = self.ledger_time_high_watermark.max(ledger_timestamp);
-        let component_reference_price = pending
+        let component_reference_price = context
             .projection_input
             .market_rules
             .get(&book.asset)
@@ -4058,10 +4077,10 @@ impl LiveShadowEngine {
             &component_positions_before,
             execution.action.side,
             execution.modeled_filled_quantity,
-            &pending.component_targets,
+            &pending.component_attribution,
             component_reference_price,
             execution.position_after,
-            pending.size_step,
+            context.size_step,
         )?;
         let allocations = &component_partition.total_quantities;
         let closed_portfolio_episode = self
@@ -4075,7 +4094,7 @@ impl LiveShadowEngine {
         {
             self.technical_delivery.fills = self.technical_delivery.fills.saturating_add(1);
         }
-        if pending.continuation_kind == Some(ContinuationKind::CloseFirstReversal)
+        if context.continuation_kind == Some(ContinuationKind::CloseFirstReversal)
             && !execution.modeled_filled_quantity.is_zero()
         {
             self.technical_delivery.addition_filled =
@@ -4261,7 +4280,7 @@ impl LiveShadowEngine {
             &self.ledger,
             &book.asset,
             execution.position_after,
-            pending.size_step,
+            context.size_step,
         )?;
         let (equity_after, source_equity_after) =
             self.accounting_equities_with_sources(&pending_component_ids)?;
@@ -4320,7 +4339,7 @@ impl LiveShadowEngine {
             }
             .to_string(),
             root_planned_cloid: pending.root_planned_cloid.clone(),
-            parent_planned_cloid: pending.parent_planned_cloid.clone(),
+            parent_planned_cloid: context.parent_planned_cloid.clone(),
             retry_generation: execution.action.retry_generation,
             decision_timestamp_mono: execution.decision_timestamp_mono,
             evaluation_timestamp_mono: received_at,
@@ -4348,7 +4367,7 @@ impl LiveShadowEngine {
             component_close_quantities: component_partition.close_quantities,
             component_open_quantities: component_partition.open_quantities,
             source_filled_quantities: component_partition.total_quantities,
-            economic_attribution: pending.economic_attribution,
+            economic_attribution: context.economic_attribution,
         });
         self.pending.remove(&book.asset);
         let partial_remainder = !execution.unfilled_ioc_remainder.is_zero();
@@ -4373,7 +4392,7 @@ impl LiveShadowEngine {
             decision_id: execution.action.decision_id.to_string(),
             planned_cloid: execution.action.planned_cloid.to_string(),
             root_planned_cloid: pending.root_planned_cloid.clone(),
-            parent_planned_cloid: pending.parent_planned_cloid.clone(),
+            parent_planned_cloid: context.parent_planned_cloid.clone(),
             retry_generation: execution.action.retry_generation,
             observed_at_mono: received_at,
             requested_notional: execution.action.rounded_notional,
@@ -4471,23 +4490,6 @@ impl LiveShadowEngine {
             self.metrics.persistence_failures += 1;
             LiveShadowError::Core(error.to_string())
         })?;
-        let mut continuations = self.continuations.clone();
-        for (asset, pending) in &self.pending {
-            if pending.action.retry_generation > 0 {
-                continuations.insert(
-                    asset.clone(),
-                    ContinuationIntent {
-                        root_planned_cloid: pending.root_planned_cloid.clone(),
-                        parent_planned_cloid: pending
-                            .parent_planned_cloid
-                            .clone()
-                            .unwrap_or_else(|| pending.root_planned_cloid.clone()),
-                        next_retry_generation: pending.action.retry_generation,
-                        kind: pending.continuation_kind.unwrap_or_default(),
-                    },
-                );
-            }
-        }
         let payload = UnsignedObserverState {
             ledger: self.ledger.clone(),
             target_ledger: self.target_ledger.clone(),
@@ -4499,7 +4501,8 @@ impl LiveShadowEngine {
                 .as_ref()
                 .map(|layer| layer.artifact_sha256.clone()),
             decision_sequence: self.decision_sequence,
-            continuations,
+            pending: self.pending.clone(),
+            continuations: self.continuations.clone(),
             accrued_funding: self.accrued_funding.clone(),
             last_mids: self.mids.as_ref().map(|(mids, _)| mids.clone()),
             mfce: self.mfce.state().clone(),
@@ -4605,6 +4608,7 @@ impl LiveShadowEngine {
         self.technical_decision_state = state.technical_decision_state;
         self.very_profitable_engine = state.very_profitable_engine;
         self.decision_sequence = state.decision_sequence;
+        self.pending = state.pending;
         self.continuations = state.continuations;
         self.accrued_funding = state.accrued_funding;
         self.mids = state.last_mids.map(|mids| (mids, 0));
@@ -4631,7 +4635,6 @@ impl LiveShadowEngine {
                 })
             })
             .transpose()?;
-        self.pending.clear();
         self.pending_book.clear();
         self.technical_targets.clear();
         self.technical_decision_records.clear();
@@ -4673,7 +4676,10 @@ impl LiveShadowEngine {
                 root_planned_cloid: pending.root_planned_cloid.clone(),
                 lifecycle: "pending_action",
                 planned_cloid: Some(pending.action.planned_cloid.to_string()),
-                parent_planned_cloid: pending.parent_planned_cloid.clone(),
+                parent_planned_cloid: pending
+                    .execution
+                    .as_ref()
+                    .and_then(|context| context.parent_planned_cloid.clone()),
                 decision_id: Some(pending.action.decision_id.to_string()),
                 retry_generation: Some(pending.action.retry_generation),
             });
@@ -5118,7 +5124,7 @@ impl LiveShadowEngine {
     fn retire_pending_action(
         &mut self,
         asset: &str,
-        pending: &PendingShadow,
+        pending: &PendingAction,
         observed_at_mono: Timestamp,
         outcome: ActionAttemptOutcome,
     ) {
@@ -5128,7 +5134,10 @@ impl LiveShadowEngine {
             decision_id: pending.action.decision_id.to_string(),
             planned_cloid: pending.action.planned_cloid.to_string(),
             root_planned_cloid: pending.root_planned_cloid.clone(),
-            parent_planned_cloid: pending.parent_planned_cloid.clone(),
+            parent_planned_cloid: pending
+                .execution
+                .as_ref()
+                .and_then(|context| context.parent_planned_cloid.clone()),
             retry_generation: pending.action.retry_generation,
             observed_at_mono,
             requested_notional: pending.action.rounded_notional,
@@ -7915,8 +7924,8 @@ mod tests {
     }
 
     #[test]
-    fn retained_gold_action_keeps_issuance_attribution_then_current_zero_target_flattens() {
-        let asset = "xyz:GOLD";
+    fn target_replacement_does_not_rewrite_live_action_attribution() {
+        let asset = "TEST";
         let component = "source:issuance";
         let issued_notional = Decimal::new(1_134_400, 5);
         let reference_price = Decimal::new(1, 1);
@@ -7931,8 +7940,14 @@ mod tests {
         pending.action.side = Side::Sell;
         pending.action.rounded_notional = issued_notional;
         pending.action.reduce_only = false;
-        pending.component_targets = BTreeMap::from([(component.to_string(), -issued_notional)]);
-        pending.projection_input.filled_positions.clear();
+        pending.component_attribution = BTreeMap::from([(component.to_string(), -issued_notional)]);
+        pending
+            .execution
+            .as_mut()
+            .unwrap()
+            .projection_input
+            .filled_positions
+            .clear();
         engine
             .target_ledger
             .replace_absolute_targets(
@@ -7949,7 +7964,7 @@ mod tests {
         // A current target replacement cannot rewrite issuance provenance for
         // the already-retained action.
         assert_eq!(
-            engine.pending[asset].component_targets,
+            engine.pending[asset].component_attribution,
             BTreeMap::from([(component.to_string(), -issued_notional)])
         );
 
@@ -8755,7 +8770,10 @@ mod tests {
         let follow_up = engine.pending.get("BTC").unwrap();
         assert_eq!(follow_up.action.retry_generation, 1);
         assert_eq!(
-            follow_up.parent_planned_cloid.as_deref(),
+            follow_up
+                .execution
+                .as_ref()
+                .and_then(|context| context.parent_planned_cloid.as_deref()),
             Some(partial.planned_cloid.as_str())
         );
         assert_ne!(
@@ -8803,6 +8821,7 @@ mod tests {
         let expected_sequence = engine.decision_sequence;
         let expected_deployment_equity = engine.deployment_equity().unwrap();
         let expected_technical_state = rmp_serde::to_vec(&engine.technical_engine).unwrap();
+        let expected_pending = rmp_serde::to_vec(&engine.pending).unwrap();
         let expected_funding = engine.accrued_funding.clone();
         let expected_mfce = engine.mfce.state().clone();
         let expected_mfce_time = engine.mfce_time_high_watermark;
@@ -8853,15 +8872,18 @@ mod tests {
         assert_eq!(restored.decision_sequence, expected_sequence);
         assert_eq!(restored.ledger.portfolio_open_count(), 1);
         assert!(restored.ledger_time_offset > engine.ledger_time_high_watermark);
-        assert!(restored.pending.is_empty());
         assert_eq!(
-            restored.continuations["BTC"].root_planned_cloid,
-            expected_root
+            rmp_serde::to_vec(&restored.pending).unwrap(),
+            expected_pending
         );
+        assert_eq!(restored.pending["BTC"].root_planned_cloid, expected_root);
+        assert!(engine.pending["BTC"].execution.is_some());
+        assert!(restored.pending["BTC"].execution.is_none());
         assert_eq!(
-            restored.continuations["BTC"].next_retry_generation,
+            restored.pending["BTC"].action.retry_generation,
             expected_retry_generation
         );
+        assert!(restored.continuations.is_empty());
         assert_eq!(restored.accrued_funding, expected_funding);
         assert_eq!(
             rmp_serde::to_vec(&restored.executions).unwrap(),

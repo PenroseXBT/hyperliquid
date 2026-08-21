@@ -616,7 +616,7 @@ impl Side {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PlannedAction {
     pub decision_id: DecisionId,
     pub target_version: TargetVersion,

@@ -704,7 +704,7 @@ async fn run_qualification_impl<const CONTINUOUS: bool>(
     let mut cohort_record_cursor = 0usize;
     let mut technical_record_cursor = 0usize;
     let state_identity = UnsignedShadowStateIdentity {
-        // Retain the schema-v8 identity shape while removing build artifacts
+        // Retain the snapshot identity shape while removing build artifacts
         // from restore authority. Runtime compatibility is bound to the
         // validated configuration/risk contract and persistence schema.
         source_tree_sha256: "build-time-only".into(),

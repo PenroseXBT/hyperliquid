@@ -14,7 +14,7 @@ const MARKER_TEMP_FILE_NAME: &str = "initialized.tmp";
 const SNAPSHOT_TEMP_FILE_NAME: &str = "unsigned-observer-state.tmp";
 
 pub const UNSIGNED_PERSISTENCE_SCHEMA_DESCRIPTOR: &str = concat!(
-    "copytrade-observer-unsigned-persistence-v8\n",
+    "copytrade-observer-unsigned-persistence-v9\n",
     "lock=.observer-state.lock:exclusive-os-lock:lifetime\n",
     "marker=initialized.json:",
     "InitializationMarker{schema_version:u32,snapshot_schema_version:u32,generation:u64,",
@@ -30,6 +30,8 @@ pub const UNSIGNED_PERSISTENCE_SCHEMA_DESCRIPTOR: &str = concat!(
     "technical_decision_state:BTreeMap<String,TechnicalDecisionUniquenessState>,",
     "very_profitable_engine:VeryProfitableCohortEngine,",
     "very_profitable_layer_artifact_sha256:Option<String>,decision_sequence:u64,",
+    "pending:BTreeMap<String,PendingAction{action:PlannedAction,",
+    "root_planned_cloid:String,component_attribution:BTreeMap<String,Decimal>}>,",
     "continuations:BTreeMap<String,ContinuationIntent>,",
     "accrued_funding:BTreeMap<String,Decimal>,last_mids:Option<MarketSnapshotResponse>,",
     "mfce:MfcePersistentState{schema_version:u32,source_epoch:u64,",
@@ -50,7 +52,7 @@ pub const UNSIGNED_PERSISTENCE_SCHEMA_DESCRIPTOR: &str = concat!(
     "exit_notional:Decimal,gross_pnl:Decimal,fees:Decimal,funding:Decimal,slippage:Decimal,",
     "net_pnl:Decimal,gains:Decimal,losses:Decimal}>\n",
     "checksum=sha256(canonical-messagepack((schema_version,generation,identity,payload)))\n",
-    "migration=v7-source-ewma-to-v8-empty-mfce:checksum-first:ledger-preserving\n",
+    "migration=v8-to-v9-live-action-attribution:checksum-first:ledger-preserving\n",
     "commit=temp-write,file-fsync,atomic-rename,directory-fsync,marker-update,directory-fsync\n",
 );
 
@@ -326,9 +328,9 @@ mod tests {
     }
 
     #[test]
-    fn descriptor_identifies_schema_v8_and_the_mfce_artifact_bounds() {
+    fn descriptor_identifies_schema_v9_and_the_mfce_artifact_bounds() {
         assert!(UNSIGNED_PERSISTENCE_SCHEMA_DESCRIPTOR
-            .starts_with("copytrade-observer-unsigned-persistence-v8\n"));
+            .starts_with("copytrade-observer-unsigned-persistence-v9\n"));
         assert!(UNSIGNED_PERSISTENCE_SCHEMA_DESCRIPTOR
             .contains("samples:VecDeque<MfceTrainingSample>:max=4096"));
         assert!(UNSIGNED_PERSISTENCE_SCHEMA_DESCRIPTOR.contains("max_bytes=2097152"));
