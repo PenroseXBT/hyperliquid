@@ -3632,11 +3632,12 @@ impl LiveShadowEngine {
                     .then(|| previous.root_planned_cloid.clone())
                 });
                 if let Some(root_planned_cloid) = preserved_root {
-                    self.pending
-                        .get_mut(&asset)
-                        .ok_or_else(|| LiveShadowError::Core("missing pending action".into()))?
-                        .component_targets = component_targets.clone();
-                    if component_targets
+                    // The retained action is already acknowledged/in flight.
+                    // Its component targets are immutable issuance provenance;
+                    // current desired targets may change, but cannot redefine
+                    // how a later fill from this action is attributed.
+                    if self.pending[&asset]
+                        .component_targets
                         .keys()
                         .any(|candidate| candidate.starts_with("technical:"))
                     {
@@ -7911,6 +7912,82 @@ mod tests {
             &refreshed,
             Decimal::ONE,
         ));
+    }
+
+    #[test]
+    fn retained_gold_action_keeps_issuance_attribution_then_current_zero_target_flattens() {
+        let asset = "xyz:GOLD";
+        let component = "source:issuance";
+        let issued_notional = Decimal::new(1_134_400, 5);
+        let reference_price = Decimal::new(1, 1);
+        let (mut engine, book) = pending_reduce_only_engine(
+            asset,
+            Decimal::from(100),
+            Decimal::new(11, 2),
+            reference_price,
+        );
+        engine.ledger = DualLedger::default();
+        let pending = engine.pending.get_mut(asset).unwrap();
+        pending.action.side = Side::Sell;
+        pending.action.rounded_notional = issued_notional;
+        pending.action.reduce_only = false;
+        pending.component_targets = BTreeMap::from([(component.to_string(), -issued_notional)]);
+        pending.projection_input.filled_positions.clear();
+        engine
+            .target_ledger
+            .replace_absolute_targets(
+                &BTreeMap::from([(asset.to_string(), Decimal::ZERO)]),
+                &BTreeMap::from([(asset.to_string(), Decimal::ZERO)]),
+                &BTreeMap::new(),
+                &BTreeMap::from([(asset.to_string(), -issued_notional)]),
+                &BTreeMap::new(),
+                TargetVersion(12_917),
+                SnapshotSetId([13; 32]),
+            )
+            .unwrap();
+
+        // A current target replacement cannot rewrite issuance provenance for
+        // the already-retained action.
+        assert_eq!(
+            engine.pending[asset].component_targets,
+            BTreeMap::from([(component.to_string(), -issued_notional)])
+        );
+
+        engine.try_execute_pending(&book, 10_000).unwrap();
+        let opening = engine.executions.last().unwrap();
+        assert_eq!(opening.asset, asset);
+        assert_eq!(opening.side, "sell");
+        assert_eq!(opening.position_before, Decimal::ZERO);
+        assert!(opening.position_after < Decimal::ZERO);
+        assert_eq!(
+            opening.source_filled_quantities.keys().collect::<Vec<_>>(),
+            vec![component]
+        );
+        assert_eq!(
+            engine.ledger.source_position(component, asset),
+            opening.position_after
+        );
+
+        // The newest desired state remains zero. Normal reconciliation must
+        // therefore emit a separate reduce-only BUY and return both ledgers
+        // to zero without reusing or duplicating the opening attribution.
+        engine.construct_next_decision(10_001).unwrap().unwrap();
+        let flatten = &engine.pending[asset].action;
+        assert_eq!(flatten.side, Side::Buy);
+        assert!(flatten.reduce_only);
+        engine.try_execute_pending(&book, 20_000).unwrap();
+        assert_eq!(engine.authoritative_position(asset), Decimal::ZERO);
+        assert_eq!(
+            engine.ledger.source_position(component, asset),
+            Decimal::ZERO
+        );
+        assert_eq!(engine.executions.len(), 2);
+        assert_eq!(
+            engine.executions[1].component_close_quantities,
+            BTreeMap::from([(component.to_string(), engine.executions[0].filled_quantity)])
+        );
+        assert!(engine.executions[1].component_open_quantities.is_empty());
+        validate_source_reconciliation(&engine.ledger, asset, Decimal::ZERO, Decimal::ONE).unwrap();
     }
 
     fn accepted(payload: PublicPayload, kind: ReadRequestKind, at: u64) -> AcceptedPublicResponse {
