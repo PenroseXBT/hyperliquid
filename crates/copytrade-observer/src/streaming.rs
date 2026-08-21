@@ -142,8 +142,13 @@ struct TradeIdentity {
 
 #[derive(Debug, Clone)]
 pub enum StreamingEvent {
-    Connected { epoch: u64 },
-    Gap { epoch: u64 },
+    Connected {
+        epoch: u64,
+    },
+    Gap {
+        epoch: u64,
+        affected_markets: BTreeSet<String>,
+    },
     Trades(Vec<PublicTrade>),
     AssetContexts(Value),
     OrderBook(OrderBookResponse),
@@ -258,7 +263,14 @@ async fn run_stream(
         let Ok((socket, _)) = connection else {
             epoch = epoch.saturating_add(1);
             metrics.gaps.fetch_add(1, Ordering::SeqCst);
-            if events.send(StreamingEvent::Gap { epoch }).await.is_err() {
+            if events
+                .send(StreamingEvent::Gap {
+                    epoch,
+                    affected_markets: markets.clone(),
+                })
+                .await
+                .is_err()
+            {
                 return;
             }
             tokio::select! {
@@ -372,7 +384,14 @@ async fn run_stream(
             return;
         }
         metrics.gaps.fetch_add(1, Ordering::SeqCst);
-        if events.send(StreamingEvent::Gap { epoch }).await.is_err() {
+        if events
+            .send(StreamingEvent::Gap {
+                epoch,
+                affected_markets: markets.clone(),
+            })
+            .await
+            .is_err()
+        {
             return;
         }
         backoff_ms = if connected_at.elapsed() >= Duration::from_secs(60) {

@@ -923,6 +923,19 @@ async fn run_qualification_impl<const CONTINUOUS: bool>(
                 transport_policy.streaming.reconciliation_interval_ms,
             )?;
         }
+        let scheduler_health = scheduler.health();
+        rearm_idle_stream_reconciliation(
+            &config,
+            source_dispatch_plan,
+            now,
+            tasks.is_empty()
+                && scheduler_health.pending == 0
+                && scheduler_health.successors == 0
+                && scheduler_health.in_flight == 0,
+            &reconciliation_remaining,
+            &coverage_reconciliation_remaining,
+            &mut source_due,
+        )?;
         for candidate in &config.candidates {
             let id = candidate.address.to_ascii_lowercase();
             if source_due[&id] <= now && (!streaming_enabled || market_directory.is_some()) {
@@ -1306,6 +1319,15 @@ async fn run_qualification_impl<const CONTINUOUS: bool>(
                 } else {
                     let _ = transport.take_accepted(&completed_request);
                 }
+                rearm_unresolved_source_request(
+                    &completed_request,
+                    outcome,
+                    clock.now_ms(),
+                    scheduler_config.retry.maximum_backoff_ms,
+                    &reconciliation_remaining,
+                    &coverage_reconciliation_remaining,
+                    &mut source_due,
+                )?;
             }
             stream_event = async {
                 match streaming.as_mut() {
@@ -1339,12 +1361,23 @@ async fn run_qualification_impl<const CONTINUOUS: bool>(
                             .await?;
                         }
                     }
-                    StreamingEvent::Gap { .. } => {
+                    StreamingEvent::Gap {
+                        affected_markets,
+                        ..
+                    } => {
                         stream_connected = false;
                         reconciliation_epoch_active = true;
                         reconciliation_started_at = observed_at;
-                        engine.mark_source_stream_gap();
-                        coverage_ready_markets.clear();
+                        let affected_markets = if affected_markets.is_empty() {
+                            subscribed_trade_markets.clone()
+                        } else {
+                            affected_markets
+                        };
+                        coverage_ready_markets
+                            .retain(|market| !affected_markets.contains(market));
+                        engine
+                            .mark_source_stream_gap(&affected_markets, observed_at)
+                            .map_err(|error| error.to_string())?;
                         coverage_pending_markets.clear();
                         coverage_reconciliation_remaining.clear();
                         coverage_gap_started_at = None;
@@ -1558,7 +1591,10 @@ async fn run_qualification_impl<const CONTINUOUS: bool>(
                         market_directory.as_ref(),
                         &subscribed_trade_markets,
                         &coverage_ready_markets,
-                        coverage_reconciliation_remaining.len(),
+                        reconciliation_pending_count(
+                            &reconciliation_remaining,
+                            &coverage_reconciliation_remaining,
+                        ),
                         coverage_reconciliations,
                         &subscribed_hot_books,
                     ),
@@ -1710,7 +1746,10 @@ async fn run_qualification_impl<const CONTINUOUS: bool>(
                 market_directory.as_ref(),
                 &subscribed_trade_markets,
                 &coverage_ready_markets,
-                coverage_reconciliation_remaining.len(),
+                reconciliation_pending_count(
+                    &reconciliation_remaining,
+                    &coverage_reconciliation_remaining,
+                ),
                 coverage_reconciliations,
                 &subscribed_hot_books,
             ),
@@ -2565,6 +2604,69 @@ fn phase_staggered_source_due(
             ))
         })
         .collect()
+}
+
+fn reconciliation_pending_count(
+    stream_reconciliation: &BTreeSet<String>,
+    coverage_reconciliation: &BTreeSet<String>,
+) -> usize {
+    stream_reconciliation.union(coverage_reconciliation).count()
+}
+
+fn rearm_unresolved_source_request(
+    request: &ScheduledReadRequest,
+    outcome: ExecutionOutcome,
+    now: Timestamp,
+    retry_delay_ms: u64,
+    stream_reconciliation: &BTreeSet<String>,
+    coverage_reconciliation: &BTreeSet<String>,
+    source_due: &mut BTreeMap<String, Timestamp>,
+) -> Result<bool, Box<dyn Error>> {
+    if !request.kind.is_source_state()
+        || matches!(
+            outcome,
+            ExecutionOutcome::RetryScheduled | ExecutionOutcome::Superseded
+        )
+    {
+        return Ok(false);
+    }
+    let Some(candidate) = request.candidate_id.as_ref() else {
+        return Ok(false);
+    };
+    if !stream_reconciliation.contains(candidate) && !coverage_reconciliation.contains(candidate) {
+        return Ok(false);
+    }
+    source_due.insert(
+        candidate.clone(),
+        now.checked_add(retry_delay_ms)
+            .ok_or("source reconciliation retry overflow")?,
+    );
+    Ok(true)
+}
+
+fn rearm_idle_stream_reconciliation(
+    config: &CopyTradeConfig,
+    plan: SourceDispatchPlan,
+    now: Timestamp,
+    scheduler_idle: bool,
+    stream_reconciliation: &BTreeSet<String>,
+    coverage_reconciliation: &BTreeSet<String>,
+    source_due: &mut BTreeMap<String, Timestamp>,
+) -> Result<bool, Box<dyn Error>> {
+    if !scheduler_idle
+        || (stream_reconciliation.is_empty() && coverage_reconciliation.is_empty())
+        || stream_reconciliation
+            .union(coverage_reconciliation)
+            .any(|candidate| {
+                source_due
+                    .get(candidate)
+                    .is_some_and(|due| *due != u64::MAX)
+            })
+    {
+        return Ok(false);
+    }
+    *source_due = phase_staggered_source_due(config, now, plan)?;
+    Ok(true)
 }
 
 fn phase_deadline(
@@ -3547,6 +3649,131 @@ mod tests {
             .checked_mul(scheduler.api.window_ms)
             .unwrap();
         assert!(minimum_sweep_ms <= transport.streaming.reconciliation_spread_ms);
+    }
+
+    #[test]
+    fn exhausted_or_stale_source_recovery_is_rearmed_while_uncertainty_remains() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let scheduler =
+            ReadOnlySchedulerConfig::from_path(root.join("config/read-api-policy.json")).unwrap();
+        let candidate = "0x0000000000000000000000000000000000000001".to_string();
+        let request = scheduler
+            .api
+            .request(
+                RequestKey {
+                    subject: RequestSubject::Candidate(candidate.clone()),
+                    kind: ReadRequestKind::ExpandedSourceState,
+                },
+                RequestPriority::Critical,
+                BudgetClass::SourcePolling,
+                Some(SourceTier::Inactive),
+                10,
+                10,
+                10_000,
+                0,
+            )
+            .unwrap();
+        let remaining = BTreeSet::from([candidate.clone()]);
+        let mut due = BTreeMap::from([(candidate.clone(), u64::MAX)]);
+
+        assert!(rearm_unresolved_source_request(
+            &request,
+            ExecutionOutcome::RetryExhausted,
+            100,
+            30_000,
+            &remaining,
+            &BTreeSet::new(),
+            &mut due,
+        )
+        .unwrap());
+        assert_eq!(due[&candidate], 30_100);
+
+        due.insert(candidate.clone(), u64::MAX);
+        assert!(rearm_unresolved_source_request(
+            &request,
+            ExecutionOutcome::CompletedButStale,
+            200,
+            30_000,
+            &remaining,
+            &BTreeSet::new(),
+            &mut due,
+        )
+        .unwrap());
+        assert_eq!(due[&candidate], 30_200);
+
+        due.insert(candidate.clone(), u64::MAX);
+        assert!(!rearm_unresolved_source_request(
+            &request,
+            ExecutionOutcome::RetryScheduled,
+            300,
+            30_000,
+            &remaining,
+            &BTreeSet::new(),
+            &mut due,
+        )
+        .unwrap());
+        assert_eq!(due[&candidate], u64::MAX);
+
+        assert!(!rearm_unresolved_source_request(
+            &request,
+            ExecutionOutcome::CompletedFresh,
+            400,
+            30_000,
+            &BTreeSet::new(),
+            &BTreeSet::new(),
+            &mut due,
+        )
+        .unwrap());
+    }
+
+    #[test]
+    fn idle_stale_reconciliation_rearms_a_bounded_sweep() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let config = CopyTradeConfig::from_path(root.join("config/copytrade.json")).unwrap();
+        let scheduler =
+            ReadOnlySchedulerConfig::from_path(root.join("config/read-api-policy.json")).unwrap();
+        let transport: PublicTransportPolicy = serde_json::from_slice(
+            &std::fs::read(root.join("config/public-mainnet-transport.json")).unwrap(),
+        )
+        .unwrap();
+        let plan = streaming_source_dispatch_plan(config.candidates.len(), &scheduler, &transport)
+            .unwrap();
+        let unresolved = config
+            .candidates
+            .iter()
+            .take(2)
+            .map(|candidate| candidate.address.to_ascii_lowercase())
+            .collect::<BTreeSet<_>>();
+        let mut due = config
+            .candidates
+            .iter()
+            .map(|candidate| (candidate.address.to_ascii_lowercase(), u64::MAX))
+            .collect::<BTreeMap<_, _>>();
+
+        assert_eq!(reconciliation_pending_count(&unresolved, &unresolved), 2);
+        assert!(rearm_idle_stream_reconciliation(
+            &config,
+            plan,
+            50_000,
+            true,
+            &unresolved,
+            &BTreeSet::new(),
+            &mut due,
+        )
+        .unwrap());
+        assert!(unresolved
+            .iter()
+            .all(|candidate| due[candidate] != u64::MAX));
+        assert!(!rearm_idle_stream_reconciliation(
+            &config,
+            plan,
+            60_000,
+            true,
+            &unresolved,
+            &BTreeSet::new(),
+            &mut due,
+        )
+        .unwrap());
     }
 
     #[test]

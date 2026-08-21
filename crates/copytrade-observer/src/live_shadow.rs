@@ -2152,9 +2152,21 @@ impl LiveShadowEngine {
         self.source_stream_healthy = false;
     }
 
-    pub fn mark_source_stream_gap(&mut self) {
-        self.source_stream_healthy = false;
-        self.source_market_coverage.clear();
+    pub fn mark_source_stream_gap(
+        &mut self,
+        affected_markets: &BTreeSet<String>,
+        now: Timestamp,
+    ) -> Result<(), LiveShadowError> {
+        if !self.source_stream_mode {
+            return Err(LiveShadowError::Core(
+                "source stream gap recorded outside stream mode".into(),
+            ));
+        }
+        self.source_market_coverage
+            .retain(|market| !affected_markets.contains(market));
+        self.source_stream_healthy = !self.source_market_coverage.is_empty();
+        self.construct_next_decision(now)?;
+        Ok(())
     }
 
     pub fn complete_source_stream_reconciliation(
@@ -5894,6 +5906,117 @@ mod tests {
             .unwrap();
         assert_eq!(engine.source_market_coverage_count(), 1);
         assert_eq!(engine.mfce_report().observed_transitions, 1);
+    }
+
+    #[test]
+    fn stream_gap_invalidates_only_its_dependent_markets() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let mut config = CopyTradeConfig::from_path(root.join("config/copytrade.json")).unwrap();
+        config.candidates.truncate(1);
+        config.technical.enabled = false;
+        let candidate = config.candidates[0].address.to_ascii_lowercase();
+        let mut engine =
+            LiveShadowEngine::new(config, b"local-stream-gap", "run", 40_000, 80_000).unwrap();
+        engine.enable_source_stream_mode();
+        engine.set_source_tier(&candidate, SourceTier::Inactive);
+        engine
+            .ingest(
+                accepted(
+                    PublicPayload::SourceState(SourceStateResponse {
+                        candidate_id: candidate,
+                        account_value: Decimal::from(1_000),
+                        source_time_ms: 1_000,
+                        positions: BTreeMap::from([
+                            (
+                                "BTC".into(),
+                                SourceAssetPosition {
+                                    asset: "BTC".into(),
+                                    signed_size: Decimal::ONE,
+                                    signed_notional: Decimal::from(100),
+                                    entry_price: Some(Decimal::from(100)),
+                                    unrealized_pnl: Some(Decimal::ZERO),
+                                },
+                            ),
+                            (
+                                "ETH".into(),
+                                SourceAssetPosition {
+                                    asset: "ETH".into(),
+                                    signed_size: Decimal::ONE,
+                                    signed_notional: Decimal::from(200),
+                                    entry_price: Some(Decimal::from(200)),
+                                    unrealized_pnl: Some(Decimal::ZERO),
+                                },
+                            ),
+                        ]),
+                        closed_candles: Vec::new(),
+                    }),
+                    ReadRequestKind::ExpandedSourceState,
+                    1_000,
+                ),
+                1_000,
+            )
+            .unwrap();
+        engine
+            .ingest(
+                accepted(
+                    PublicPayload::MarketSnapshot(MarketSnapshotResponse {
+                        mids: BTreeMap::from([
+                            ("BTC".into(), Decimal::from(100)),
+                            ("ETH".into(), Decimal::from(200)),
+                        ]),
+                    }),
+                    ReadRequestKind::MarketMids,
+                    1_000,
+                ),
+                1_000,
+            )
+            .unwrap();
+        engine
+            .ingest(
+                accepted(
+                    PublicPayload::MarketMetadata(MarketMetadataResponse {
+                        universe: vec![
+                            MarketMetadataAsset {
+                                name: "BTC".into(),
+                                size_decimals: 3,
+                            },
+                            MarketMetadataAsset {
+                                name: "ETH".into(),
+                                size_decimals: 3,
+                            },
+                        ],
+                        contexts: BTreeMap::new(),
+                        live_taker_fee_bps: Some(Decimal::from(5)),
+                    }),
+                    ReadRequestKind::ExchangeMetadata,
+                    1_000,
+                ),
+                1_000,
+            )
+            .unwrap();
+        engine
+            .complete_source_stream_reconciliation(
+                BTreeSet::from(["BTC".into(), "ETH".into()]),
+                1_001,
+            )
+            .unwrap();
+
+        engine
+            .mark_source_stream_gap(&BTreeSet::from(["BTC".into()]), 1_002)
+            .unwrap();
+        assert!(engine.source_stream_healthy());
+        assert_eq!(engine.source_market_coverage_count(), 1);
+        assert_eq!(engine.mfce.previous_source_exposure("BTC"), Decimal::ZERO);
+        assert_eq!(
+            engine.mfce.previous_source_exposure("ETH"),
+            Decimal::new(2, 1)
+        );
+
+        engine
+            .mark_source_stream_gap(&BTreeSet::from(["ETH".into()]), 1_003)
+            .unwrap();
+        assert!(!engine.source_stream_healthy());
+        assert_eq!(engine.source_market_coverage_count(), 0);
     }
 
     #[test]
