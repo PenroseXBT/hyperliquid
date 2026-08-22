@@ -1,6 +1,5 @@
 #![forbid(unsafe_code)]
 
-pub mod outbox;
 pub mod production;
 pub mod reconciliation;
 pub mod transport;
@@ -604,14 +603,19 @@ pub struct ApiWalletSecret {
 }
 
 impl ApiWalletSecret {
+    pub fn from_private_key(secret: &str) -> Result<Self, SignerError> {
+        let wallet =
+            LocalWallet::from_str(secret.trim()).map_err(|_| SignerError::InvalidSecret)?;
+        Ok(Self { wallet })
+    }
+
     pub async fn load_from_file(path: &Path) -> Result<Self, SignerError> {
         validate_secret_file(path)?;
         let bytes = tokio::fs::read(path)
             .await
             .map_err(|error| SignerError::SecretIo(error.to_string()))?;
         let text = std::str::from_utf8(&bytes).map_err(|_| SignerError::InvalidSecret)?;
-        let wallet = LocalWallet::from_str(text.trim()).map_err(|_| SignerError::InvalidSecret)?;
-        Ok(Self { wallet })
+        Self::from_private_key(text)
     }
 
     fn sign_ioc(

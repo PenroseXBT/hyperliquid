@@ -34,9 +34,8 @@ while IFS= read -r package; do
   fi
 done < policy/hl1c-forbidden-packages.txt
 
-# MFCE owns native model execution in the observer only. The signer depends on
-# core, so this closure check also prevents LightGBM from entering core and
-# crossing the signing boundary transitively.
+# MFCE owns model execution. The signer library remains strategy-free even
+# though the lean daemon links it behind the live-only execution switch.
 for package in copytrade-mfce lightgbm3 lightgbm3-sys; do
   if sed -E 's/^[^[:alnum:]_]+//' target/hl1c/signer-dependencies.txt \
     | awk '{print $1}' | grep -F -x "$package" >/dev/null; then
@@ -56,16 +55,4 @@ while IFS= read -r symbol; do
   fi
 done < policy/hl1c-forbidden-source-symbols.txt
 
-nm target/release/copytrade-observer > target/hl1c/observer-symbols.txt
-strings target/release/copytrade-observer > target/hl1c/observer-strings.txt
-
-while IFS= read -r pattern; do
-  [[ -z "$pattern" || "$pattern" == \#* ]] && continue
-  if grep -F "$pattern" target/hl1c/observer-symbols.txt \
-    target/hl1c/observer-strings.txt >/dev/null; then
-    echo "forbidden mutation pattern present in observer artifact: $pattern" >&2
-    exit 1
-  fi
-done < policy/hl1c-forbidden-artifact-patterns.txt
-
-echo "HL1C isolation policy passed"
+echo "lean execution boundary policy passed"

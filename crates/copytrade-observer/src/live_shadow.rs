@@ -35,6 +35,9 @@ use copytrade_core::exit_planning::{
     plan_risk_reducing_ioc, ExitPlanningBlock, ExitPlanningInput, ResidualClass,
 };
 use copytrade_core::ledger::DualLedger;
+use copytrade_core::live_trading::{
+    shadow_execution_from_verified_fill, VerifiedExchangeFill, VerifiedFundingEvent,
+};
 use copytrade_core::portfolio_risk::project_and_validate_portfolio;
 use copytrade_core::portfolio_risk::{
     MarketRules, OpenOrderExposure, OpenOrderLifecycle, OrderSide, PortfolioProjectionInput,
@@ -620,6 +623,7 @@ struct ComponentFillPartition {
     close_quantities: BTreeMap<String, Decimal>,
     open_quantities: BTreeMap<String, Decimal>,
     total_quantities: BTreeMap<String, Decimal>,
+    remaining_quantities: BTreeMap<String, Decimal>,
 }
 
 fn split_component_quantities(
@@ -657,6 +661,7 @@ fn split_component_quantities(
         close_quantities,
         open_quantities,
         total_quantities: allocations,
+        remaining_quantities: BTreeMap::new(),
     })
 }
 
@@ -700,6 +705,7 @@ fn consume_pending_component_fill(
             close_quantities: BTreeMap::new(),
             open_quantities: BTreeMap::new(),
             total_quantities: BTreeMap::new(),
+            remaining_quantities: component_remaining.clone(),
         });
     }
     let component_total = pending_component_total(side, component_remaining)?;
@@ -730,7 +736,24 @@ fn consume_pending_component_fill(
         canonicalize_allocation_total(&mut allocations, filled)?;
     }
 
-    split_component_quantities(current_positions, side, allocations)
+    let mut partition = split_component_quantities(current_positions, side, allocations.clone())?;
+    partition.remaining_quantities = component_remaining
+        .iter()
+        .filter_map(|(component, quantity)| {
+            let consumed = allocations.get(component).copied().unwrap_or_default();
+            let remaining = quantity.abs().checked_sub(consumed)?;
+            (!remaining.is_zero()).then(|| {
+                (
+                    component.clone(),
+                    match side {
+                        Side::Buy => remaining,
+                        Side::Sell => -remaining,
+                    },
+                )
+            })
+        })
+        .collect();
+    Ok(partition)
 }
 
 fn partition_component_fill(
@@ -747,6 +770,7 @@ fn partition_component_fill(
             close_quantities: BTreeMap::new(),
             open_quantities: BTreeMap::new(),
             total_quantities: BTreeMap::new(),
+            remaining_quantities: BTreeMap::new(),
         });
     }
     if reference_price <= Decimal::ZERO {
@@ -793,6 +817,7 @@ fn partition_component_fill(
             close_quantities: allocations.clone(),
             open_quantities: BTreeMap::new(),
             total_quantities: allocations,
+            remaining_quantities: BTreeMap::new(),
         });
     }
     let signed_fill = match side {
@@ -870,6 +895,7 @@ fn partition_component_fill(
             close_quantities: closes,
             open_quantities: opens,
             total_quantities,
+            remaining_quantities: BTreeMap::new(),
         });
     }
 
@@ -1885,18 +1911,299 @@ impl LiveShadowEngine {
         self.emitted_production_cloids.remove(&cloid);
     }
 
-    pub fn synchronize_production_state(
+    pub fn synchronize_live_state(
         &mut self,
-        state: &crate::production_state::ProductionTradingState,
+        state: &copytrade_core::live_trading::LiveTradingState,
     ) {
-        self.production_positions = Some(state.live.positions());
+        self.production_positions = Some(state.positions());
         self.production_equities = Some((
-            state.live.current_equity(),
-            state.live.settled_equity(),
-            state.live.deployment_equity(),
+            state.current_equity(),
+            state.settled_equity(),
+            state.deployment_equity(),
         ));
-        self.production_exposure_blocked =
-            !state.position_mismatches.is_empty() || state.equity_mismatch.is_some();
+        self.production_exposure_blocked = false;
+    }
+
+    /// Applies an authenticated exchange fill to the same target/component
+    /// lineage used by shadow execution. The fill consumes only the immutable
+    /// allocation carried by the matching pending action; current MFCE targets
+    /// remain authoritative solely for the next plan.
+    pub fn apply_live_execution_fill(
+        &mut self,
+        fill: &VerifiedExchangeFill,
+    ) -> Result<(), LiveShadowError> {
+        let pending = self.pending.get(&fill.asset).cloned().ok_or_else(|| {
+            LiveShadowError::Core("live fill has no matching pending action".into())
+        })?;
+        if pending.action.planned_cloid != fill.identity.cloid
+            || pending.action.side != fill.side
+            || pending.action.reduce_only != fill.reduce_only
+        {
+            return Err(LiveShadowError::Core(
+                "live fill identity does not match pending action".into(),
+            ));
+        }
+        let size_step = self
+            .metadata
+            .as_ref()
+            .and_then(|metadata| {
+                metadata
+                    .universe
+                    .iter()
+                    .find(|asset| asset.name == fill.asset)
+            })
+            .map(|asset| Decimal::new(1, asset.size_decimals))
+            .ok_or_else(|| LiveShadowError::InvalidMarket(fill.asset.clone()))?;
+        let pending_component_ids = pending
+            .component_remaining
+            .keys()
+            .cloned()
+            .collect::<BTreeSet<_>>();
+        let (equity_before, source_equity_before) =
+            self.accounting_equities_with_sources(&pending_component_ids)?;
+        let position_before = self.ledger.portfolio_position(&fill.asset);
+        let mut execution = shadow_execution_from_verified_fill(fill, position_before)
+            .map_err(|error| LiveShadowError::Core(error.to_string()))?;
+        execution.funding = self.accrued_funding.remove(&fill.asset).unwrap_or_default();
+        execution.action = pending.action.clone();
+        execution.rounded_quantity = pending.remaining_order_quantity;
+        execution.unfilled_ioc_remainder = pending
+            .remaining_order_quantity
+            .checked_sub(fill.filled_quantity)
+            .unwrap_or_default()
+            .max(Decimal::ZERO);
+        let component_positions_before = self.ledger.source_positions_for_asset(&fill.asset);
+        let component_partition = consume_pending_component_fill(
+            &component_positions_before,
+            fill.side,
+            fill.filled_quantity,
+            pending.remaining_order_quantity,
+            &pending.component_remaining,
+            size_step,
+        )?;
+        let ledger_timestamp = self
+            .ledger_time_high_watermark
+            .max(fill.decision_timestamp)
+            .checked_add(1)
+            .ok_or(LiveShadowError::Arithmetic)?;
+        self.ledger_time_high_watermark = ledger_timestamp;
+        self.apply_attributed_execution(
+            &fill.asset,
+            &execution,
+            ledger_timestamp,
+            &component_partition.total_quantities,
+        )?;
+        validate_source_reconciliation(
+            &self.ledger,
+            &fill.asset,
+            execution.position_after,
+            size_step,
+        )?;
+        let (equity_after, source_equity_after) =
+            self.accounting_equities_with_sources(&pending_component_ids)?;
+        let net_pnl_delta = equity_after
+            .checked_sub(equity_before)
+            .ok_or(LiveShadowError::Arithmetic)?;
+        let gross_pnl_delta = net_pnl_delta
+            .checked_add(execution.fees)
+            .and_then(|value| value.checked_add(execution.funding))
+            .and_then(|value| value.checked_add(execution.slippage))
+            .ok_or(LiveShadowError::Arithmetic)?;
+        let mut source_attributed_returns = BTreeMap::new();
+        for candidate in component_partition.total_quantities.keys() {
+            let before = source_equity_before
+                .get(candidate)
+                .copied()
+                .ok_or_else(|| LiveShadowError::Core("missing source equity".into()))?;
+            let after = source_equity_after
+                .get(candidate)
+                .copied()
+                .ok_or_else(|| LiveShadowError::Core("missing source equity".into()))?;
+            let change = after
+                .checked_sub(before)
+                .ok_or(LiveShadowError::Arithmetic)?;
+            source_attributed_returns.insert(
+                candidate.clone(),
+                if before.is_zero() {
+                    Decimal::ZERO
+                } else {
+                    change
+                        .checked_div(before)
+                        .ok_or(LiveShadowError::Arithmetic)?
+                },
+            );
+        }
+        let deployment = self.deployment_equity()?;
+        self.executions.push(ShadowActionAccounting {
+            shadow_execution_id: execution.shadow_execution_id.to_string(),
+            decision_id: execution.action.decision_id.to_string(),
+            asset: fill.asset.clone(),
+            side: format!("{:?}", fill.side).to_ascii_lowercase(),
+            execution_mode: "live_ioc".into(),
+            root_planned_cloid: pending.root_planned_cloid.clone(),
+            parent_planned_cloid: fill.parent_cloid.map(|cloid| cloid.to_string()),
+            retry_generation: fill.continuation_generation,
+            decision_timestamp_mono: fill.decision_timestamp,
+            evaluation_timestamp_mono: ledger_timestamp,
+            decision_midpoint: fill.decision_reference_price,
+            modeled_ioc_limit: fill.submitted_limit_price,
+            worst_required_depth_price: None,
+            visible_executable_quantity: fill.filled_quantity,
+            requested_quantity: pending.remaining_order_quantity,
+            filled_quantity: fill.filled_quantity,
+            unfilled_quantity: execution.unfilled_ioc_remainder,
+            average_fill_price: Some(fill.average_fill_price),
+            filled_notional: execution.modeled_filled_notional,
+            fees: fill.fee_amount,
+            funding: execution.funding,
+            execution_slippage: execution.slippage,
+            gross_pnl_delta,
+            net_pnl_delta,
+            portfolio_equity_return: if equity_before.is_zero() {
+                Decimal::ZERO
+            } else {
+                net_pnl_delta
+                    .checked_div(equity_before)
+                    .ok_or(LiveShadowError::Arithmetic)?
+            },
+            current_equity: deployment.current_equity,
+            settled_equity: deployment.settled_equity,
+            deployment_equity: deployment.deployment_equity,
+            source_attributed_returns,
+            position_before: execution.position_before,
+            position_after: execution.position_after,
+            component_close_quantities: component_partition.close_quantities,
+            component_open_quantities: component_partition.open_quantities,
+            source_filled_quantities: component_partition.total_quantities.clone(),
+            economic_attribution: pending
+                .execution
+                .as_ref()
+                .map(|context| context.economic_attribution)
+                .unwrap_or_else(|| {
+                    classify_economic_attribution(Some(&pending.component_remaining))
+                }),
+        });
+        if execution.unfilled_ioc_remainder.is_zero() {
+            self.pending.remove(&fill.asset);
+            self.emitted_production_cloids.remove(&fill.identity.cloid);
+            self.action_lifecycle_events.push(ActionLifecycleEvent {
+                asset: fill.asset.clone(),
+                decision_id: fill.decision_id.to_string(),
+                planned_cloid: fill.identity.cloid.to_string(),
+                root_planned_cloid: pending.root_planned_cloid,
+                parent_planned_cloid: fill.parent_cloid.map(|cloid| cloid.to_string()),
+                retry_generation: fill.continuation_generation,
+                observed_at_mono: ledger_timestamp,
+                requested_notional: execution.action.rounded_notional,
+                filled_quantity: Some(fill.filled_quantity),
+                unfilled_quantity: Some(Decimal::ZERO),
+                outcome: ActionAttemptOutcome::ExecutedFully,
+            });
+        } else {
+            let retained = self.pending.get_mut(&fill.asset).ok_or_else(|| {
+                LiveShadowError::Core("live partial fill lost its pending action".into())
+            })?;
+            retained.remaining_order_quantity = execution.unfilled_ioc_remainder;
+            retained.component_remaining = component_partition.remaining_quantities;
+        }
+        self.metrics.shadow_executions = self.metrics.shadow_executions.saturating_add(1);
+        self.refresh_desired_books();
+        Ok(())
+    }
+
+    pub fn apply_live_funding(
+        &mut self,
+        event: &VerifiedFundingEvent,
+    ) -> Result<(), LiveShadowError> {
+        let funding_cost = Decimal::ZERO
+            .checked_sub(event.amount)
+            .ok_or(LiveShadowError::Arithmetic)?;
+        let entry = self.accrued_funding.entry(event.asset.clone()).or_default();
+        *entry = entry
+            .checked_add(funding_cost)
+            .ok_or(LiveShadowError::Arithmetic)?;
+        Ok(())
+    }
+
+    /// Resolves an IOC after the exchange has made its terminal state
+    /// authoritative. Any unfilled remainder is released back to current-target
+    /// planning; an exchange-terminal action can no longer mutate the portfolio.
+    pub fn resolve_live_execution_terminal(
+        &mut self,
+        cloid: copytrade_core::decision::PlannedCloid,
+        original_quantity: Decimal,
+        filled_quantity: Decimal,
+        observed_at: Timestamp,
+        rejected: bool,
+    ) -> Result<(), LiveShadowError> {
+        let Some((asset, pending)) = self
+            .pending
+            .iter()
+            .find(|(_, pending)| pending.action.planned_cloid == cloid)
+            .map(|(asset, pending)| (asset.clone(), pending.clone()))
+        else {
+            self.emitted_production_cloids.remove(&cloid);
+            return Ok(());
+        };
+        let expected_remaining = original_quantity
+            .checked_sub(filled_quantity)
+            .ok_or(LiveShadowError::Arithmetic)?
+            .max(Decimal::ZERO);
+        let size_step = self
+            .metadata
+            .as_ref()
+            .and_then(|metadata| metadata.universe.iter().find(|item| item.name == asset))
+            .map(|item| Decimal::new(1, item.size_decimals))
+            .ok_or_else(|| LiveShadowError::InvalidMarket(asset.clone()))?;
+        let (difference, tolerance) = reconciliation_difference(
+            pending.remaining_order_quantity,
+            expected_remaining,
+            size_step,
+        )?;
+        if difference > tolerance {
+            return Err(LiveShadowError::Core(
+                "terminal live action does not reconcile with applied fills".into(),
+            ));
+        }
+        self.pending.remove(&asset);
+        self.emitted_production_cloids.remove(&cloid);
+        if !expected_remaining.is_zero() && !rejected {
+            self.continuations.insert(
+                asset.clone(),
+                ContinuationIntent {
+                    root_planned_cloid: pending.root_planned_cloid.clone(),
+                    parent_planned_cloid: cloid.to_string(),
+                    next_retry_generation: pending
+                        .action
+                        .retry_generation
+                        .checked_add(1)
+                        .ok_or(LiveShadowError::Arithmetic)?,
+                    kind: ContinuationKind::PartialIocRemainder,
+                },
+            );
+        }
+        self.action_lifecycle_events.push(ActionLifecycleEvent {
+            asset: asset.clone(),
+            decision_id: pending.action.decision_id.to_string(),
+            planned_cloid: cloid.to_string(),
+            root_planned_cloid: pending.root_planned_cloid,
+            parent_planned_cloid: pending
+                .execution
+                .as_ref()
+                .and_then(|context| context.parent_planned_cloid.clone()),
+            retry_generation: pending.action.retry_generation,
+            observed_at_mono: observed_at,
+            requested_notional: pending.action.rounded_notional,
+            filled_quantity: Some(filled_quantity),
+            unfilled_quantity: Some(expected_remaining),
+            outcome: if rejected {
+                ActionAttemptOutcome::ExchangeRejected
+            } else {
+                ActionAttemptOutcome::ExecutedPartiallyRemainderReplanned
+            },
+        });
+        self.refresh_desired_books();
+        Ok(())
     }
 
     /// Returns the bounded observer-only MFCE state suitable for inclusion in
@@ -4171,9 +4478,188 @@ impl LiveShadowEngine {
             context.size_step,
         )?;
         let allocations = &component_partition.total_quantities;
+        self.apply_attributed_execution(&book.asset, &execution, ledger_timestamp, allocations)?;
+        if context.continuation_kind == Some(ContinuationKind::CloseFirstReversal)
+            && !execution.modeled_filled_quantity.is_zero()
+        {
+            self.technical_delivery.addition_filled =
+                self.technical_delivery.addition_filled.saturating_add(1);
+        }
+        validate_source_reconciliation(
+            &self.ledger,
+            &book.asset,
+            execution.position_after,
+            context.size_step,
+        )?;
+        let (equity_after, source_equity_after) =
+            self.accounting_equities_with_sources(&pending_component_ids)?;
+        let deployment_after = self.deployment_equity()?;
+        let net_pnl_delta = equity_after
+            .checked_sub(equity_before)
+            .ok_or(LiveShadowError::Arithmetic)?;
+        let gross_pnl_delta = net_pnl_delta
+            .checked_add(execution.fees)
+            .and_then(|value| value.checked_add(execution.funding))
+            .and_then(|value| value.checked_add(execution.slippage))
+            .ok_or(LiveShadowError::Arithmetic)?;
+        let portfolio_equity_return = if equity_before.is_zero() {
+            Decimal::ZERO
+        } else {
+            net_pnl_delta
+                .checked_div(equity_before)
+                .ok_or(LiveShadowError::Arithmetic)?
+        };
+        let mut source_attributed_returns = BTreeMap::new();
+        for candidate in allocations.keys() {
+            let before = source_equity_before
+                .get(candidate)
+                .copied()
+                .ok_or_else(|| LiveShadowError::Core("missing source equity".into()))?;
+            let after = source_equity_after
+                .get(candidate)
+                .copied()
+                .ok_or_else(|| LiveShadowError::Core("missing source equity".into()))?;
+            let change = after
+                .checked_sub(before)
+                .ok_or(LiveShadowError::Arithmetic)?;
+            source_attributed_returns.insert(
+                candidate.clone(),
+                if before.is_zero() {
+                    Decimal::ZERO
+                } else {
+                    change
+                        .checked_div(before)
+                        .ok_or(LiveShadowError::Arithmetic)?
+                },
+            );
+        }
+        self.executions.push(ShadowActionAccounting {
+            shadow_execution_id: execution.shadow_execution_id.to_string(),
+            decision_id: execution.action.decision_id.to_string(),
+            asset: book.asset.clone(),
+            side: format!("{:?}", execution.action.side).to_ascii_lowercase(),
+            execution_mode: match price_plan.pricing_mode {
+                MarketableIocPricingMode::CompleteVisibleDepth => {
+                    "marketable_ioc_complete_visible_depth"
+                }
+                MarketableIocPricingMode::BoundedReferenceFallback => {
+                    "marketable_ioc_bounded_reference_fallback"
+                }
+            }
+            .to_string(),
+            root_planned_cloid: pending.root_planned_cloid.clone(),
+            parent_planned_cloid: context.parent_planned_cloid.clone(),
+            retry_generation: execution.action.retry_generation,
+            decision_timestamp_mono: execution.decision_timestamp_mono,
+            evaluation_timestamp_mono: received_at,
+            decision_midpoint,
+            modeled_ioc_limit: price_plan.limit_price,
+            worst_required_depth_price: price_plan.worst_required_depth_price,
+            visible_executable_quantity: price_plan.visible_executable_quantity,
+            requested_quantity: execution.rounded_quantity,
+            filled_quantity: execution.modeled_filled_quantity,
+            unfilled_quantity: execution.unfilled_ioc_remainder,
+            average_fill_price: execution.modeled_average_fill_price,
+            filled_notional: execution.modeled_filled_notional,
+            fees: execution.fees,
+            funding: execution.funding,
+            execution_slippage: execution.slippage,
+            gross_pnl_delta,
+            net_pnl_delta,
+            portfolio_equity_return,
+            current_equity: deployment_after.current_equity,
+            settled_equity: deployment_after.settled_equity,
+            deployment_equity: deployment_after.deployment_equity,
+            source_attributed_returns,
+            position_before: execution.position_before,
+            position_after: execution.position_after,
+            component_close_quantities: component_partition.close_quantities,
+            component_open_quantities: component_partition.open_quantities,
+            source_filled_quantities: component_partition.total_quantities,
+            economic_attribution: context.economic_attribution,
+        });
+        self.pending.remove(&book.asset);
+        let partial_remainder = !execution.unfilled_ioc_remainder.is_zero();
+        let close_first_completed = completed_close_first_reversal(
+            pending_reduce_only,
+            raw_desired_notional,
+            technical_desired_notional,
+            execution.position_before,
+            execution.position_after,
+            execution.modeled_filled_quantity,
+            execution.unfilled_ioc_remainder,
+        );
+        let execution_recompute = if partial_remainder {
+            ExecutionRecompute::PartialIocRemainder
+        } else if close_first_completed {
+            ExecutionRecompute::CloseFirstReversal
+        } else {
+            ExecutionRecompute::None
+        };
+        self.action_lifecycle_events.push(ActionLifecycleEvent {
+            asset: book.asset.clone(),
+            decision_id: execution.action.decision_id.to_string(),
+            planned_cloid: execution.action.planned_cloid.to_string(),
+            root_planned_cloid: pending.root_planned_cloid.clone(),
+            parent_planned_cloid: context.parent_planned_cloid.clone(),
+            retry_generation: execution.action.retry_generation,
+            observed_at_mono: received_at,
+            requested_notional: execution.action.rounded_notional,
+            filled_quantity: Some(execution.modeled_filled_quantity),
+            unfilled_quantity: Some(execution.unfilled_ioc_remainder),
+            outcome: if partial_remainder {
+                ActionAttemptOutcome::ExecutedPartiallyRemainderReplanned
+            } else if close_first_completed {
+                ActionAttemptOutcome::CloseFirstCompletedRecompute
+            } else {
+                ActionAttemptOutcome::ExecutedFully
+            },
+        });
+        if execution_recompute.is_required() {
+            let next_retry_generation = execution
+                .action
+                .retry_generation
+                .checked_add(1)
+                .ok_or(LiveShadowError::Arithmetic)?;
+            self.continuations.insert(
+                book.asset.clone(),
+                ContinuationIntent {
+                    root_planned_cloid: pending.root_planned_cloid,
+                    parent_planned_cloid: execution.action.planned_cloid.to_string(),
+                    next_retry_generation,
+                    kind: match execution_recompute {
+                        ExecutionRecompute::PartialIocRemainder => {
+                            ContinuationKind::PartialIocRemainder
+                        }
+                        ExecutionRecompute::CloseFirstReversal => {
+                            ContinuationKind::CloseFirstReversal
+                        }
+                        ExecutionRecompute::None => unreachable!(),
+                    },
+                },
+            );
+        }
+        if close_first_completed {
+            self.technical_delivery.close_first_completed = self
+                .technical_delivery
+                .close_first_completed
+                .saturating_add(1);
+        }
+        self.metrics.shadow_executions += 1;
+        self.refresh_desired_books();
+        Ok(execution_recompute)
+    }
+
+    fn apply_attributed_execution(
+        &mut self,
+        asset: &str,
+        execution: &copytrade_core::shadow::ShadowExecution,
+        ledger_timestamp: Timestamp,
+        allocations: &BTreeMap<String, Decimal>,
+    ) -> Result<(), LiveShadowError> {
         let closed_portfolio_episode = self
             .ledger
-            .apply_portfolio_execution(&execution, ledger_timestamp)
+            .apply_portfolio_execution(execution, ledger_timestamp)
             .map_err(core)?
             .cloned();
         if allocations
@@ -4182,18 +4668,12 @@ impl LiveShadowEngine {
         {
             self.technical_delivery.fills = self.technical_delivery.fills.saturating_add(1);
         }
-        if context.continuation_kind == Some(ContinuationKind::CloseFirstReversal)
-            && !execution.modeled_filled_quantity.is_zero()
-        {
-            self.technical_delivery.addition_filled =
-                self.technical_delivery.addition_filled.saturating_add(1);
-        }
         let mut closed_attributions = Vec::new();
         for (candidate, quantity) in allocations {
             let source_execution = scaled_source_execution(
-                &execution,
+                execution,
                 *quantity,
-                self.ledger.source_position(candidate, &book.asset),
+                self.ledger.source_position(candidate, asset),
             )?;
             if let Some(closed) = self
                 .ledger
@@ -4364,171 +4844,8 @@ impl LiveShadowEngine {
                 }
             }
         }
-        validate_source_reconciliation(
-            &self.ledger,
-            &book.asset,
-            execution.position_after,
-            context.size_step,
-        )?;
-        let (equity_after, source_equity_after) =
-            self.accounting_equities_with_sources(&pending_component_ids)?;
-        let deployment_after = self.deployment_equity()?;
-        let net_pnl_delta = equity_after
-            .checked_sub(equity_before)
-            .ok_or(LiveShadowError::Arithmetic)?;
-        let gross_pnl_delta = net_pnl_delta
-            .checked_add(execution.fees)
-            .and_then(|value| value.checked_add(execution.funding))
-            .and_then(|value| value.checked_add(execution.slippage))
-            .ok_or(LiveShadowError::Arithmetic)?;
-        let portfolio_equity_return = if equity_before.is_zero() {
-            Decimal::ZERO
-        } else {
-            net_pnl_delta
-                .checked_div(equity_before)
-                .ok_or(LiveShadowError::Arithmetic)?
-        };
-        let mut source_attributed_returns = BTreeMap::new();
-        for candidate in allocations.keys() {
-            let before = source_equity_before
-                .get(candidate)
-                .copied()
-                .ok_or_else(|| LiveShadowError::Core("missing source equity".into()))?;
-            let after = source_equity_after
-                .get(candidate)
-                .copied()
-                .ok_or_else(|| LiveShadowError::Core("missing source equity".into()))?;
-            let change = after
-                .checked_sub(before)
-                .ok_or(LiveShadowError::Arithmetic)?;
-            source_attributed_returns.insert(
-                candidate.clone(),
-                if before.is_zero() {
-                    Decimal::ZERO
-                } else {
-                    change
-                        .checked_div(before)
-                        .ok_or(LiveShadowError::Arithmetic)?
-                },
-            );
-        }
-        self.executions.push(ShadowActionAccounting {
-            shadow_execution_id: execution.shadow_execution_id.to_string(),
-            decision_id: execution.action.decision_id.to_string(),
-            asset: book.asset.clone(),
-            side: format!("{:?}", execution.action.side).to_ascii_lowercase(),
-            execution_mode: match price_plan.pricing_mode {
-                MarketableIocPricingMode::CompleteVisibleDepth => {
-                    "marketable_ioc_complete_visible_depth"
-                }
-                MarketableIocPricingMode::BoundedReferenceFallback => {
-                    "marketable_ioc_bounded_reference_fallback"
-                }
-            }
-            .to_string(),
-            root_planned_cloid: pending.root_planned_cloid.clone(),
-            parent_planned_cloid: context.parent_planned_cloid.clone(),
-            retry_generation: execution.action.retry_generation,
-            decision_timestamp_mono: execution.decision_timestamp_mono,
-            evaluation_timestamp_mono: received_at,
-            decision_midpoint,
-            modeled_ioc_limit: price_plan.limit_price,
-            worst_required_depth_price: price_plan.worst_required_depth_price,
-            visible_executable_quantity: price_plan.visible_executable_quantity,
-            requested_quantity: execution.rounded_quantity,
-            filled_quantity: execution.modeled_filled_quantity,
-            unfilled_quantity: execution.unfilled_ioc_remainder,
-            average_fill_price: execution.modeled_average_fill_price,
-            filled_notional: execution.modeled_filled_notional,
-            fees: execution.fees,
-            funding: execution.funding,
-            execution_slippage: execution.slippage,
-            gross_pnl_delta,
-            net_pnl_delta,
-            portfolio_equity_return,
-            current_equity: deployment_after.current_equity,
-            settled_equity: deployment_after.settled_equity,
-            deployment_equity: deployment_after.deployment_equity,
-            source_attributed_returns,
-            position_before: execution.position_before,
-            position_after: execution.position_after,
-            component_close_quantities: component_partition.close_quantities,
-            component_open_quantities: component_partition.open_quantities,
-            source_filled_quantities: component_partition.total_quantities,
-            economic_attribution: context.economic_attribution,
-        });
-        self.pending.remove(&book.asset);
-        let partial_remainder = !execution.unfilled_ioc_remainder.is_zero();
-        let close_first_completed = completed_close_first_reversal(
-            pending_reduce_only,
-            raw_desired_notional,
-            technical_desired_notional,
-            execution.position_before,
-            execution.position_after,
-            execution.modeled_filled_quantity,
-            execution.unfilled_ioc_remainder,
-        );
-        let execution_recompute = if partial_remainder {
-            ExecutionRecompute::PartialIocRemainder
-        } else if close_first_completed {
-            ExecutionRecompute::CloseFirstReversal
-        } else {
-            ExecutionRecompute::None
-        };
-        self.action_lifecycle_events.push(ActionLifecycleEvent {
-            asset: book.asset.clone(),
-            decision_id: execution.action.decision_id.to_string(),
-            planned_cloid: execution.action.planned_cloid.to_string(),
-            root_planned_cloid: pending.root_planned_cloid.clone(),
-            parent_planned_cloid: context.parent_planned_cloid.clone(),
-            retry_generation: execution.action.retry_generation,
-            observed_at_mono: received_at,
-            requested_notional: execution.action.rounded_notional,
-            filled_quantity: Some(execution.modeled_filled_quantity),
-            unfilled_quantity: Some(execution.unfilled_ioc_remainder),
-            outcome: if partial_remainder {
-                ActionAttemptOutcome::ExecutedPartiallyRemainderReplanned
-            } else if close_first_completed {
-                ActionAttemptOutcome::CloseFirstCompletedRecompute
-            } else {
-                ActionAttemptOutcome::ExecutedFully
-            },
-        });
-        if execution_recompute.is_required() {
-            let next_retry_generation = execution
-                .action
-                .retry_generation
-                .checked_add(1)
-                .ok_or(LiveShadowError::Arithmetic)?;
-            self.continuations.insert(
-                book.asset.clone(),
-                ContinuationIntent {
-                    root_planned_cloid: pending.root_planned_cloid,
-                    parent_planned_cloid: execution.action.planned_cloid.to_string(),
-                    next_retry_generation,
-                    kind: match execution_recompute {
-                        ExecutionRecompute::PartialIocRemainder => {
-                            ContinuationKind::PartialIocRemainder
-                        }
-                        ExecutionRecompute::CloseFirstReversal => {
-                            ContinuationKind::CloseFirstReversal
-                        }
-                        ExecutionRecompute::None => unreachable!(),
-                    },
-                },
-            );
-        }
-        if close_first_completed {
-            self.technical_delivery.close_first_completed = self
-                .technical_delivery
-                .close_first_completed
-                .saturating_add(1);
-        }
-        self.metrics.shadow_executions += 1;
-        self.refresh_desired_books();
-        Ok(execution_recompute)
+        Ok(())
     }
-
     pub fn persist(&mut self, path: impl AsRef<std::path::Path>) -> Result<(), LiveShadowError> {
         self.ledger.save_atomic(path).map_err(|error| {
             self.metrics.persistence_failures += 1;
@@ -5390,6 +5707,10 @@ impl LiveShadowEngine {
     }
 
     fn accrue_funding(&mut self, now: Timestamp) -> Result<(), LiveShadowError> {
+        if self.production_positions.is_some() {
+            self.last_funding_accrual = Some(now);
+            return Ok(());
+        }
         let Some(previous) = self.last_funding_accrual else {
             self.last_funding_accrual = Some(now);
             return Ok(());
@@ -5654,7 +5975,10 @@ mod tests {
     };
     use copytrade_core::decision::MarketSnapshotId;
     use copytrade_core::decision::{
-        DecisionId, PlannedAction, PlannedCloid, SnapshotSetId, TargetVersion,
+        DecisionId, PayloadHash, PlannedAction, PlannedCloid, SnapshotSetId, TargetVersion,
+    };
+    use copytrade_core::live_trading::{
+        ExchangeFillIdentity, ExchangeOrderId, ExchangeTradeId, LiquidityClassification,
     };
     use copytrade_core::scheduler::ReadRequestKind;
     use copytrade_core::shadow::ShadowExecutionId;
@@ -5662,6 +5986,109 @@ mod tests {
     use serde::ser::SerializeMap;
     use serde::Deserialize;
     use std::path::Path;
+
+    #[test]
+    fn authenticated_fill_consumes_frozen_pending_component_quantities() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let config = CopyTradeConfig::from_path(root.join("config/copytrade.json")).unwrap();
+        let mut engine =
+            LiveShadowEngine::new(config, b"live-fill", "run", 40_000, 80_000).unwrap();
+        engine.metadata = Some(MarketMetadataResponse {
+            universe: vec![MarketMetadataAsset {
+                name: "BTC".into(),
+                size_decimals: 2,
+            }],
+            contexts: BTreeMap::new(),
+            live_taker_fee_bps: None,
+        });
+        engine.mids = Some((
+            MarketSnapshotResponse {
+                mids: BTreeMap::from([("BTC".into(), Decimal::from(100))]),
+            },
+            1,
+        ));
+        let action = PlannedAction {
+            decision_id: DecisionId([1; 32]),
+            target_version: TargetVersion(1),
+            asset: "BTC".into(),
+            side: Side::Buy,
+            rounded_notional: Decimal::from(100),
+            reduce_only: false,
+            action_ordinal: 0,
+            retry_generation: 0,
+            planned_cloid: PlannedCloid([2; 16]),
+        };
+        engine.pending.insert(
+            "BTC".into(),
+            PendingAction {
+                action,
+                root_planned_cloid: PlannedCloid([2; 16]).to_string(),
+                remaining_order_quantity: Decimal::ONE,
+                component_remaining: BTreeMap::from([
+                    ("source:a".into(), Decimal::new(6, 1)),
+                    ("source:b".into(), Decimal::new(4, 1)),
+                ]),
+                execution: None,
+            },
+        );
+        let mut fill = VerifiedExchangeFill {
+            identity: ExchangeFillIdentity {
+                exchange_order_id: ExchangeOrderId("order-1".into()),
+                trade_id: ExchangeTradeId("trade-1".into()),
+                cloid: PlannedCloid([2; 16]),
+            },
+            decision_id: DecisionId([1; 32]),
+            target_version: TargetVersion(1),
+            root_cloid: PlannedCloid([2; 16]),
+            parent_cloid: None,
+            continuation_generation: 0,
+            asset: "BTC".into(),
+            side: Side::Buy,
+            reduce_only: false,
+            filled_quantity: Decimal::new(25, 2),
+            average_fill_price: Decimal::from(100),
+            submitted_limit_price: Decimal::from(101),
+            fee_amount: Decimal::new(125, 4),
+            exchange_closed_pnl: Decimal::ZERO,
+            fee_asset: "USDC".into(),
+            liquidity: LiquidityClassification::Taker,
+            decision_reference_price: Decimal::from(99),
+            occurred_at: 10,
+            decision_timestamp: 5,
+            exchange_equity_after: Decimal::new(999875, 4),
+            source_hash: PayloadHash([3; 32]),
+        };
+        engine.apply_live_execution_fill(&fill).unwrap();
+        assert_eq!(
+            engine.pending["BTC"].remaining_order_quantity,
+            Decimal::new(75, 2)
+        );
+        assert_eq!(
+            engine.pending["BTC"].component_remaining,
+            BTreeMap::from([
+                ("source:a".into(), Decimal::new(45, 2)),
+                ("source:b".into(), Decimal::new(30, 2)),
+            ])
+        );
+
+        fill.identity.trade_id = ExchangeTradeId("trade-2".into());
+        fill.filled_quantity = Decimal::new(75, 2);
+        fill.fee_amount = Decimal::new(375, 4);
+        fill.occurred_at = 11;
+        fill.exchange_equity_after = Decimal::new(9995, 2);
+        engine.apply_live_execution_fill(&fill).unwrap();
+        assert_eq!(
+            engine.ledger.source_position("source:a", "BTC"),
+            Decimal::new(6, 1)
+        );
+        assert_eq!(
+            engine.ledger.source_position("source:b", "BTC"),
+            Decimal::new(4, 1)
+        );
+        assert_eq!(engine.ledger.portfolio_position("BTC"), Decimal::ONE);
+        assert!(!engine.pending.contains_key("BTC"));
+        assert_eq!(engine.executions.last().unwrap().execution_mode, "live_ioc");
+    }
 
     #[test]
     fn projected_usage_counts_outstanding_increment_before_fill_without_double_counting() {

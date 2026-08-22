@@ -20,6 +20,12 @@ readonly RUNTIME_ROOT="${DATA_ROOT}/runtime"
 readonly FAILURE_ROOT="${DATA_ROOT}/failure"
 readonly FATAL_STOP_MARKER="${STATE_ROOT}/fatal-stop.json"
 readonly PROCESS_STDERR="${FAILURE_ROOT}/process.stderr"
+readonly EXECUTION_MODE="${SU6_EXECUTION_MODE:-shadow}"
+
+[[ "$EXECUTION_MODE" == "shadow" || "$EXECUTION_MODE" == "live" ]] || {
+    printf 'SU6_EXECUTION_MODE must be shadow or live\n' >&2
+    exit 1
+}
 
 OBSERVER_PID=""
 STOP_REQUESTED=0
@@ -45,7 +51,7 @@ if [[ -e "$FATAL_STOP_MARKER" ]]; then
 fi
 
 : > "$PROCESS_STDERR"
-log "continuous_observer_start=true data_root=${DATA_ROOT} unsigned=true planned_only=true submission=false"
+log "continuous_observer_start=true data_root=${DATA_ROOT} execution_mode=${EXECUTION_MODE}"
 
 set +e
 "$OBSERVER" continuous \

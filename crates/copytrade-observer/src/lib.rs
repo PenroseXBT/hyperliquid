@@ -1,18 +1,15 @@
 #![forbid(unsafe_code)]
 
 pub mod cohort_layer;
+pub mod execution;
 pub mod ingestion;
-pub mod ipc_client;
 pub mod live_shadow;
 pub mod mfce;
-pub mod production_state;
 pub mod profitability;
 pub mod public_mainnet;
 pub mod qualification;
 pub mod qualification_evidence;
 pub mod railway_aggregate;
-// The legacy observer-side reconciliation journal is intentionally not part of
-// production. The signer owns the sole authoritative fill/funding ledger.
 pub mod replay;
 pub mod state_root;
 pub mod streaming;
@@ -32,15 +29,8 @@ pub use copytrade_core::portfolio_risk::{
     SignedNotional,
 };
 
-pub const OBSERVER_ARCHITECTURE_VERSION: &str = "HL1C-1";
-pub const FORBIDDEN_DEPENDENCY_PACKAGES: &[&str] = &[
-    "hyperliquid_rust_sdk",
-    "ethers",
-    "ethers-signers",
-    "dotenv",
-    "k256",
-    "secp256k1",
-];
+pub const OBSERVER_ARCHITECTURE_VERSION: &str = "LEAN-LIVE-1";
+pub const FORBIDDEN_DEPENDENCY_PACKAGES: &[&str] = &["hyperliquid_rust_sdk", "dotenv"];
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ObserverBuildManifest {

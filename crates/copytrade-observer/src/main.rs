@@ -1,24 +1,18 @@
-use copytrade_core::ipc::{IpcPolicy, ProcessRole, ProductionHandshake, IPC_STATE_SCHEMA_VERSION};
 #[cfg(feature = "research-cli")]
 use copytrade_core::planning_fixture::{construct_plan_from_fixture, execute_fixture_shadow};
 use copytrade_core::release::{canonical_manifest_json, create_release_manifest};
-use copytrade_core::release::{sha256_file, ReleaseManifest};
 #[cfg(feature = "research-cli")]
 use copytrade_core::scheduler::{
     BudgetClass, Clock, MonotonicClock, ReadOnlyDataSource, ReadOnlySchedulerConfig,
     ReadRequestKind, RequestKey, RequestPriority, RequestScheduler, RequestSubject,
     ScheduleOutcome, ScheduledReadRequest,
 };
-use copytrade_observer::ipc_client::{
-    DurableHandoffQueue, ObserverSignerClient, ProductionIntentDispatcher,
-};
-use copytrade_observer::live_shadow::ProductionIntentIdentity;
 #[cfg(feature = "research-cli")]
 use copytrade_observer::public_mainnet::{HyperliquidPublicTransport, PublicTransportPolicy};
 #[cfg(feature = "research-cli")]
 use copytrade_observer::qualification::{finalize_qualification, run_qualification};
 use copytrade_observer::qualification::{
-    parse_duration_seconds, run_continuous_daemon, ProductionObserverRuntime, QualificationOptions,
+    parse_duration_seconds, run_continuous_daemon, QualificationOptions,
 };
 #[cfg(feature = "research-cli")]
 use copytrade_observer::railway_aggregate::aggregate_railway_window;
@@ -55,11 +49,6 @@ struct Arguments {
     frozen_identity_sha256: Option<String>,
     bundle: Option<PathBuf>,
     journal: Option<PathBuf>,
-    signer_socket: PathBuf,
-    ipc_policy: PathBuf,
-    intent_journal: PathBuf,
-    expected_signer_uid: Option<u32>,
-    expected_signer_gid: Option<u32>,
     operation: Operation,
 }
 
@@ -95,7 +84,6 @@ enum Operation {
     #[cfg(feature = "research-cli")]
     AuditCandidates,
     Continuous,
-    Production,
 }
 
 #[tokio::main]
@@ -163,7 +151,6 @@ async fn run() -> Result<(), Box<dyn Error>> {
                 transport_gate: false,
                 profitability_gate: false,
                 micro_density_gate: false,
-                production: None,
                 continuous: false,
             })
             .await?;
@@ -183,7 +170,6 @@ async fn run() -> Result<(), Box<dyn Error>> {
                 transport_gate: true,
                 profitability_gate: false,
                 micro_density_gate: false,
-                production: None,
                 continuous: false,
             })
             .await?;
@@ -203,7 +189,6 @@ async fn run() -> Result<(), Box<dyn Error>> {
                 transport_gate: false,
                 profitability_gate: true,
                 micro_density_gate: false,
-                production: None,
                 continuous: false,
             })
             .await?;
@@ -223,7 +208,6 @@ async fn run() -> Result<(), Box<dyn Error>> {
                 transport_gate: false,
                 profitability_gate: false,
                 micro_density_gate: true,
-                production: None,
                 continuous: false,
             })
             .await?;
@@ -294,12 +278,10 @@ async fn run() -> Result<(), Box<dyn Error>> {
                 transport_gate: false,
                 profitability_gate: false,
                 micro_density_gate: false,
-                production: None,
                 continuous: true,
             })
             .await?;
         }
-        Operation::Production => run_production_observer(&arguments).await?,
     }
     Ok(())
 }
@@ -325,11 +307,6 @@ fn parse_arguments(arguments: impl Iterator<Item = String>) -> Result<Arguments,
     let mut frozen_identity_sha256 = None;
     let mut bundle = None;
     let mut journal = None;
-    let mut signer_socket = PathBuf::from("/run/hype-arb/signer.sock");
-    let mut ipc_policy = PathBuf::from("policy/production-ipc-v1.json");
-    let mut intent_journal = PathBuf::from("/var/lib/hype-arb/observer/intents.json");
-    let mut expected_signer_uid = None;
-    let mut expected_signer_gid = None;
     let mut operation = Operation::Initialize;
     let mut arguments = arguments.peekable();
     while let Some(argument) = arguments.next() {
@@ -446,33 +423,6 @@ fn parse_arguments(arguments: impl Iterator<Item = String>) -> Result<Arguments,
                     arguments.next().ok_or("--journal requires a path")?,
                 ))
             }
-            "--signer-socket" => {
-                signer_socket =
-                    PathBuf::from(arguments.next().ok_or("--signer-socket requires a path")?)
-            }
-            "--ipc-policy" => {
-                ipc_policy = PathBuf::from(arguments.next().ok_or("--ipc-policy requires a path")?)
-            }
-            "--intent-journal" => {
-                intent_journal =
-                    PathBuf::from(arguments.next().ok_or("--intent-journal requires a path")?)
-            }
-            "--expected-signer-uid" => {
-                expected_signer_uid = Some(
-                    arguments
-                        .next()
-                        .ok_or("--expected-signer-uid requires a value")?
-                        .parse()?,
-                )
-            }
-            "--expected-signer-gid" => {
-                expected_signer_gid = Some(
-                    arguments
-                        .next()
-                        .ok_or("--expected-signer-gid requires a value")?
-                        .parse()?,
-                )
-            }
             #[cfg(feature = "research-cli")]
             "observe" => set_operation(&mut operation, Operation::Observe)?,
             #[cfg(feature = "research-cli")]
@@ -505,7 +455,6 @@ fn parse_arguments(arguments: impl Iterator<Item = String>) -> Result<Arguments,
             #[cfg(feature = "research-cli")]
             "audit-candidates" => set_operation(&mut operation, Operation::AuditCandidates)?,
             "continuous" => set_operation(&mut operation, Operation::Continuous)?,
-            "production" => set_operation(&mut operation, Operation::Production)?,
             "--validate-config" => set_operation(&mut operation, Operation::ValidateConfig)?,
             "--print-effective-config" => {
                 set_operation(&mut operation, Operation::PrintEffectiveConfig)?
@@ -546,11 +495,6 @@ fn parse_arguments(arguments: impl Iterator<Item = String>) -> Result<Arguments,
         frozen_identity_sha256,
         bundle,
         journal,
-        signer_socket,
-        ipc_policy,
-        intent_journal,
-        expected_signer_uid,
-        expected_signer_gid,
         operation,
     })
 }
@@ -636,142 +580,6 @@ fn run_deterministic_shadow(
         );
     }
     Ok(())
-}
-
-async fn run_production_observer(arguments: &Arguments) -> Result<(), Box<dyn Error>> {
-    let policy: IpcPolicy = serde_json::from_slice(&std::fs::read(&arguments.ipc_policy)?)?;
-    policy.validate()?;
-    let manifest: ReleaseManifest =
-        serde_json::from_slice(&std::fs::read(&arguments.release_manifest)?)?;
-    if manifest.deployment_scope != "local-only"
-        || manifest.source_tree_clean != (manifest.git_tree_state == "clean")
-        || manifest.git_commit_required
-        || manifest.qualification_stage != "PRODUCTION_RELEASE"
-        || manifest.global_risk_scale != "0.1"
-    {
-        return Err("production observer requires a valid local-only production manifest".into());
-    }
-    let observer_hash = parse_hash32(
-        manifest
-            .observer_binary_sha256
-            .as_deref()
-            .ok_or("manifest observer hash missing")?,
-    )?;
-    let signer_hash = parse_hash32(
-        manifest
-            .signer_binary_sha256
-            .as_deref()
-            .ok_or("manifest signer hash missing")?,
-    )?;
-    if parse_hash32(&sha256_file(std::env::current_exe()?)?)? != observer_hash {
-        return Err("running observer binary does not match release manifest".into());
-    }
-    let ipc_policy_hash = parse_hash32(&sha256_file(&arguments.ipc_policy)?)?;
-    if manifest.ipc_policy_sha256.as_deref() != Some(&sha256_file(&arguments.ipc_policy)?) {
-        return Err("IPC policy hash mismatch".into());
-    }
-    let mut nonce = [0u8; 32];
-    std::io::Read::read_exact(&mut std::fs::File::open("/dev/urandom")?, &mut nonce)?;
-    let client = ObserverSignerClient::connect_authenticated(
-        &arguments.signer_socket,
-        policy.clone(),
-        arguments
-            .expected_signer_uid
-            .ok_or("--expected-signer-uid is required")?,
-        arguments
-            .expected_signer_gid
-            .ok_or("--expected-signer-gid is required")?,
-        signer_hash,
-        ProductionHandshake {
-            protocol_version: policy.protocol_version,
-            process_role: ProcessRole::Observer,
-            release_binary_hash: observer_hash,
-            source_tree_sha256: manifest.source_tree_sha256.clone(),
-            ipc_policy_hash,
-            state_schema_version: IPC_STATE_SCHEMA_VERSION,
-            nonce,
-            peer_nonce: None,
-        },
-    )
-    .await?;
-    let queue = if arguments.intent_journal.exists() {
-        DurableHandoffQueue::restore(&arguments.intent_journal, policy.maximum_pending_intents)?
-    } else {
-        DurableHandoffQueue::with_lanes(
-            policy.maximum_pending_risk_reducing,
-            policy.maximum_pending_exposure_increasing,
-        )?
-    };
-    let dispatcher = std::sync::Arc::new(ProductionIntentDispatcher::new(
-        queue,
-        arguments.intent_journal.clone(),
-        client,
-    ));
-    let dispatch_handle = dispatcher.spawn_bounded_worker();
-    let production_state_path = arguments.output.join("production-trading-state.json");
-    let production_state = if production_state_path.exists() {
-        copytrade_observer::production_state::ProductionTradingState::load(&production_state_path)?
-    } else {
-        copytrade_observer::production_state::ProductionTradingState::new(
-            copytrade_core::live_trading::LiveTradingState::new(
-                rust_decimal::Decimal::from(100),
-                0,
-            )?,
-        )
-    };
-    let hash = |value: Option<&String>, name: &str| -> Result<[u8; 32], Box<dyn Error>> {
-        parse_hash32(value.ok_or_else(|| format!("manifest {name} hash missing"))?)
-    };
-    run_continuous_daemon(QualificationOptions {
-        config_path: arguments.config.clone(),
-        very_profitable_layer_path: arguments.very_profitable_layer.clone(),
-        request_policy_path: arguments.request_policy.clone(),
-        transport_policy_path: arguments.transport_policy.clone(),
-        release_manifest_path: arguments.release_manifest.clone(),
-        isolation_report_path: arguments.isolation_report.clone(),
-        output: arguments.output.clone(),
-        state_root: arguments.state_root.clone(),
-        duration_seconds: arguments.duration_seconds.unwrap_or(315_360_000),
-        transport_gate: false,
-        profitability_gate: false,
-        micro_density_gate: false,
-        production: Some(ProductionObserverRuntime {
-            dispatcher,
-            dispatch_handle,
-            state: std::sync::Arc::new(tokio::sync::Mutex::new(production_state)),
-            state_path: production_state_path,
-            identity: ProductionIntentIdentity {
-                observer_release_hash: observer_hash,
-                signer_release_hash: signer_hash,
-                release_manifest_hash: parse_hash32(&sha256_file(&arguments.release_manifest)?)?,
-                market_rules_hash: hash(
-                    manifest.market_rule_policy_sha256.as_ref(),
-                    "market rules",
-                )?,
-                dynamic_floor_policy_hash: hash(
-                    manifest.dynamic_floor_policy_sha256.as_ref(),
-                    "dynamic floor",
-                )?,
-                ioc_policy_hash: hash(manifest.ioc_pricing_policy_sha256.as_ref(), "IOC")?,
-                expires_after_ms: 20_000,
-            },
-        }),
-        continuous: true,
-    })
-    .await?;
-    Ok(())
-}
-
-fn parse_hash32(value: &str) -> Result<[u8; 32], Box<dyn Error>> {
-    let value = value.strip_prefix("0x").unwrap_or(value);
-    if value.len() != 64 || !value.bytes().all(|byte| byte.is_ascii_hexdigit()) {
-        return Err("invalid 32-byte hexadecimal hash".into());
-    }
-    let mut output = [0u8; 32];
-    for (index, byte) in output.iter_mut().enumerate() {
-        *byte = u8::from_str_radix(&value[index * 2..index * 2 + 2], 16)?;
-    }
-    Ok(output)
 }
 
 fn set_operation(current: &mut Operation, requested: Operation) -> Result<(), Box<dyn Error>> {

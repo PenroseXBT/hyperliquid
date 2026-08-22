@@ -402,29 +402,10 @@ impl LiveTradingState {
     }
 }
 
-pub fn apply_exchange_fill(
-    state: &mut LiveTradingState,
-    fill: VerifiedExchangeFill,
-) -> Result<AppliedFillResult, LedgerError> {
-    validate_fill(&fill)?;
-    if state.applied_fills.contains(&fill.identity) {
-        return if state
-            .verified_fills
-            .iter()
-            .any(|existing| existing == &fill)
-        {
-            Ok(AppliedFillResult::AlreadyApplied)
-        } else {
-            Err(LedgerError::InvalidLiveEvent(
-                "exchange fill identity payload conflict",
-            ))
-        };
-    }
-    // Apply to a clone so every validation/arithmetic failure is transactional.
-    let mut next = state.clone();
-    let verified_fill = fill.clone();
-    let position_before = next.ledger.portfolio_position(&fill.asset);
-    let strategy_attribution = next.open_episode_attribution.get(&fill.asset).cloned();
+pub fn shadow_execution_from_verified_fill(
+    fill: &VerifiedExchangeFill,
+    position_before: Decimal,
+) -> Result<ShadowExecution, LedgerError> {
     let signed_delta = match fill.side {
         Side::Buy => fill.filled_quantity,
         Side::Sell => -fill.filled_quantity,
@@ -441,7 +422,7 @@ pub fn apply_exchange_fill(
         .checked_sub(fill.decision_reference_price)
         .and_then(|difference| difference.abs().checked_mul(fill.filled_quantity))
         .ok_or(LedgerError::ArithmeticOverflow("live slippage"))?;
-    let shadow = ShadowExecution {
+    Ok(ShadowExecution {
         shadow_execution_id: ShadowExecutionId(derive_execution_id(&fill.identity)),
         action: PlannedAction {
             decision_id: fill.decision_id,
@@ -470,7 +451,35 @@ pub fn apply_exchange_fill(
         slippage,
         position_before,
         position_after,
-    };
+    })
+}
+
+pub fn apply_exchange_fill(
+    state: &mut LiveTradingState,
+    fill: VerifiedExchangeFill,
+) -> Result<AppliedFillResult, LedgerError> {
+    validate_fill(&fill)?;
+    if state.applied_fills.contains(&fill.identity) {
+        return if state
+            .verified_fills
+            .iter()
+            .any(|existing| existing == &fill)
+        {
+            Ok(AppliedFillResult::AlreadyApplied)
+        } else {
+            Err(LedgerError::InvalidLiveEvent(
+                "exchange fill identity payload conflict",
+            ))
+        };
+    }
+    // Apply to a clone so every validation/arithmetic failure is transactional.
+    let mut next = state.clone();
+    let verified_fill = fill.clone();
+    let position_before = next.ledger.portfolio_position(&fill.asset);
+    let strategy_attribution = next.open_episode_attribution.get(&fill.asset).cloned();
+    let shadow = shadow_execution_from_verified_fill(&fill, position_before)?;
+    let position_after = shadow.position_after;
+    let slippage = shadow.slippage;
     let closed_before = next.ledger.portfolio_closed().len();
     next.ledger
         .apply_portfolio_execution(&shadow, fill.occurred_at)?;

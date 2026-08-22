@@ -122,6 +122,39 @@ pub fn validate_authorized_intent(
     Ok(())
 }
 
+fn open_order_exposure(
+    (_cloid, durable, state): (&str, &ApprovedExecutionIntent, &SubmissionState),
+) -> Option<OpenOrderExposure> {
+    let (remaining_quantity, lifecycle) = match state {
+        SubmissionState::SubmissionStarted { .. } | SubmissionState::UnknownResult { .. } => {
+            (durable.quantity, OpenOrderLifecycle::SubmissionUnknown)
+        }
+        SubmissionState::Acknowledged { .. } => {
+            (durable.quantity, OpenOrderLifecycle::Acknowledged)
+        }
+        SubmissionState::PartiallyFilled { filled, .. } => (
+            durable.quantity.checked_sub(*filled)?,
+            OpenOrderLifecycle::Acknowledged,
+        ),
+        _ => return None,
+    };
+    if remaining_quantity <= Decimal::ZERO {
+        return None;
+    }
+    let side = if durable.is_buy {
+        OrderSide::Buy
+    } else {
+        OrderSide::Sell
+    };
+    let notional = remaining_quantity.checked_mul(durable.limit_price)?;
+    Some(OpenOrderExposure {
+        asset: durable.asset.clone(),
+        side: Some(side),
+        notional: Some(notional),
+        lifecycle,
+    })
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ProductionSubmissionResult {
     Acknowledged,
@@ -494,29 +527,10 @@ impl<T: AuthenticatedExchangeTransport> ProductionSigner<T> {
         context.projection_input.open_order_state_complete = true;
 
         let mut registry = self.registry.lock().await;
-        context.projection_input.acknowledged_open_orders.extend(
-            registry
-                .entries()
-                .filter_map(|(_, durable, state)| {
-                    matches!(state, SubmissionState::UnknownResult { .. }).then(|| {
-                        let side = if durable.is_buy {
-                            OrderSide::Buy
-                        } else {
-                            OrderSide::Sell
-                        };
-                        durable
-                            .quantity
-                            .checked_mul(durable.limit_price)
-                            .map(|notional| OpenOrderExposure {
-                                asset: durable.asset.clone(),
-                                side: Some(side),
-                                notional: Some(notional),
-                                lifecycle: OpenOrderLifecycle::SubmissionUnknown,
-                            })
-                    })
-                })
-                .flatten(),
-        );
+        context
+            .projection_input
+            .acknowledged_open_orders
+            .extend(registry.entries().filter_map(open_order_exposure));
         validate_authorized_intent(&intent, &context, &registry)
             .map_err(|error| SignerError::Authorization(error.to_string()))?;
         let durable = durable_intent(&intent);
@@ -759,6 +773,18 @@ impl<T: AuthenticatedExchangeTransport> ProductionSigner<T> {
                 .ok_or(SignerError::UnknownCloid)?,
             registry.durable_sequence()?,
         ))
+    }
+
+    pub async fn action_states(
+        &self,
+    ) -> Result<Vec<(PlannedCloid, Decimal, SubmissionState)>, SignerError> {
+        let registry = self.registry.lock().await;
+        registry
+            .entries()
+            .map(|(cloid, intent, state)| {
+                Ok((decode_planned_cloid(cloid)?, intent.quantity, state.clone()))
+            })
+            .collect()
     }
 
     /// Returns the durable state for an identical CLOID replay. Reusing a
@@ -1014,6 +1040,33 @@ mod tests {
             validate_authorized_intent(&intent, &context, &registry),
             Err(AuthorizationFailure::ProjectionChanged)
         );
+    }
+
+    #[test]
+    fn signer_projection_counts_acknowledged_and_partial_exchange_risk() {
+        let (_, intent) = context_and_intent();
+        let durable = durable_intent(&intent);
+        let acknowledged = open_order_exposure((
+            durable.cloid.as_str(),
+            &durable,
+            &SubmissionState::Acknowledged {
+                order_id: "order".into(),
+            },
+        ))
+        .unwrap();
+        assert_eq!(acknowledged.notional, Some(Decimal::from(20)));
+
+        let partial = open_order_exposure((
+            durable.cloid.as_str(),
+            &durable,
+            &SubmissionState::PartiallyFilled {
+                order_id: "order".into(),
+                filled: Decimal::new(5, 2),
+            },
+        ))
+        .unwrap();
+        assert_eq!(partial.notional, Some(Decimal::from(15)));
+        assert_eq!(partial.lifecycle, OpenOrderLifecycle::Acknowledged);
     }
 
     #[test]

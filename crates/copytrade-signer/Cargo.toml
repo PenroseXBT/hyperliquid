@@ -3,6 +3,7 @@ name = "copytrade-signer"
 version = "0.1.0"
 edition = "2021"
 publish = false
+autobins = false
 
 [dependencies]
 async-trait = "0.1"

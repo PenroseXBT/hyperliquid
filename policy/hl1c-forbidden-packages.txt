@@ -1,7 +1,4 @@
-# Exact Cargo package names forbidden from copytrade-core and copytrade-observer.
+# Packages forbidden from the lean live-capable daemon. Signing is supplied by
+# copytrade-signer; the generic SDK and dotenv configuration remain excluded.
 hyperliquid_rust_sdk
-ethers
-ethers-signers
 dotenv
-k256
-secp256k1

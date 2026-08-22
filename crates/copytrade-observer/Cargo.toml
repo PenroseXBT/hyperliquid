@@ -11,6 +11,7 @@ research-cli = []
 [dependencies]
 copytrade-core = { path = "../copytrade-core" }
 copytrade-mfce = { path = "../copytrade-mfce" }
+copytrade-signer = { path = "../copytrade-signer" }
 fs2 = "0.4"
 futures-util = "0.3"
 reqwest = { version = "0.11", default-features = false, features = ["json", "rustls-tls"] }

@@ -1,7 +1,7 @@
 #[cfg(feature = "research-cli")]
 use crate::cohort_layer::VeryProfitableLayerArtifact;
-use crate::ipc_client::{
-    IntentDispatchState, ProductionDispatchHandle, ProductionIntentDispatcher,
+use crate::execution::{
+    ExecutionMode, LiveExecutionRuntime, LiveExecutionSettings, LiveExecutionUpdate,
 };
 use crate::live_shadow::{
     EconomicAttribution, LiveShadowEngine, ProductionIntentIdentity, UnresolvedRootStatus,
@@ -116,7 +116,6 @@ pub struct QualificationOptions {
     pub transport_gate: bool,
     pub profitability_gate: bool,
     pub micro_density_gate: bool,
-    pub production: Option<ProductionObserverRuntime>,
     /// Run the hardened observer as a continuous daemon. Qualification
     /// evidence, deadlines, and profitability exit gates are disabled; only
     /// safety/integrity errors terminate the process.
@@ -274,15 +273,6 @@ fn append_new_technical_records(
     Ok(())
 }
 
-#[derive(Clone)]
-pub struct ProductionObserverRuntime {
-    pub dispatcher: std::sync::Arc<ProductionIntentDispatcher>,
-    pub dispatch_handle: ProductionDispatchHandle,
-    pub identity: ProductionIntentIdentity,
-    pub state: std::sync::Arc<tokio::sync::Mutex<crate::production_state::ProductionTradingState>>,
-    pub state_path: PathBuf,
-}
-
 #[derive(Debug, Default, Serialize)]
 struct Counters {
     schedule_rejections: u64,
@@ -410,16 +400,19 @@ pub async fn run_qualification(options: QualificationOptions) -> Result<PathBuf,
 async fn run_qualification_impl<const CONTINUOUS: bool>(
     options: QualificationOptions,
 ) -> Result<PathBuf, Box<dyn Error>> {
+    let execution_mode = if CONTINUOUS {
+        ExecutionMode::from_environment()?
+    } else {
+        ExecutionMode::Shadow
+    };
+    let live_settings = LiveExecutionSettings::load_if_live(execution_mode)?;
     if CONTINUOUS
         && (options.transport_gate || options.profitability_gate || options.micro_density_gate)
     {
         return Err("continuous runtime cannot enable qualification gates".into());
     }
-    if CONTINUOUS && options.state_root.is_none() && options.production.is_none() {
+    if CONTINUOUS && options.state_root.is_none() {
         return Err("continuous runtime requires --state-root".into());
-    }
-    if options.production.is_some() && options.state_root.is_some() {
-        return Err("unsigned state restoration is forbidden in production mode".into());
     }
     if options.state_root.is_some() && !options.profitability_gate && !CONTINUOUS {
         return Err(
@@ -428,10 +421,6 @@ async fn run_qualification_impl<const CONTINUOUS: bool>(
     }
     if CONTINUOUS {
         // No elapsed-time or profitability lifecycle controls the daemon.
-    } else if options.production.is_some() {
-        if options.duration_seconds < 60 {
-            return Err("production observer duration must be at least 60 seconds".into());
-        }
     } else if options.micro_density_gate {
         if !(600..=1_800).contains(&options.duration_seconds) {
             return Err("micro-density gate duration must be 10–30 minutes".into());
@@ -512,8 +501,7 @@ async fn run_qualification_impl<const CONTINUOUS: bool>(
         let manifest = load_release_manifest(&options.release_manifest_path)?;
         verify_isolation_report(&options.isolation_report_path)?;
         let production_manifest = manifest.qualification_stage == "PRODUCTION_RELEASE";
-        let stage_matches =
-            manifest_stage_matches(options.production.is_some(), &manifest.qualification_stage);
+        let stage_matches = manifest_stage_matches(false, &manifest.qualification_stage);
         let binary_matches = if production_manifest {
             manifest.observer_binary_sha256.as_deref()
                 == Some(&sha256_file(std::env::current_exe()?)?)
@@ -600,10 +588,10 @@ async fn run_qualification_impl<const CONTINUOUS: bool>(
         candidate_count: config.candidates.len(),
         process_id: std::process::id(),
         host_identity: std::env::var("HOSTNAME").unwrap_or_else(|_| "unavailable".into()),
-        unsigned: true,
-        planned_only: true,
-        submission_capable: false,
-        api_wallet_present: false,
+        unsigned: execution_mode == ExecutionMode::Shadow,
+        planned_only: execution_mode == ExecutionMode::Shadow,
+        submission_capable: execution_mode == ExecutionMode::Live,
+        api_wallet_present: execution_mode == ExecutionMode::Live,
     };
     #[cfg(feature = "research-cli")]
     let qualification_config = serde_json::json!({"copytrade":config,"read_policy":read_policy_value,"transport_policy":transport_policy_value});
@@ -653,11 +641,14 @@ async fn run_qualification_impl<const CONTINUOUS: bool>(
             output.join("observer-release-binary"),
         )?;
     }
-    evidence.append_log(false, if options.production.is_some() {
-        "observer_key_access=false signer_handoff_enabled=true observer_submission_capable=false"
-    } else {
-        "unsigned=true planned_only=true submission_capable=false api_wallet_present=false"
-    })?;
+    evidence.append_log(
+        false,
+        if execution_mode == ExecutionMode::Live {
+            "execution_mode=live signer=in_process submission_capable=true"
+        } else {
+            "unsigned=true planned_only=true submission_capable=false api_wallet_present=false"
+        },
+    )?;
     let scheduler = RequestScheduler::new(
         clock.clone(),
         scheduler_config.api.clone(),
@@ -739,19 +730,35 @@ async fn run_qualification_impl<const CONTINUOUS: bool>(
             }
         }
     }
-    if let Some(production) = &options.production {
-        engine.enable_production_intents(production.identity.clone());
-        let mut state = production.state.lock().await;
-        engine
-            .restore_mfce_persistent_state(state.mfce.clone(), state.mfce_time_high_watermark)
-            .map_err(|error| error.to_string())?;
-        production
-            .dispatcher
-            .reconcile_into(&mut state, &production.state_path)
-            .await?;
-        engine.synchronize_production_state(&state);
-        state.save_atomic(&production.state_path)?;
-    }
+    let direct_live = if execution_mode == ExecutionMode::Live {
+        let settings = live_settings.ok_or("live execution settings are unavailable")?;
+        let live_root = options
+            .state_root
+            .as_ref()
+            .ok_or("live execution requires --state-root")?
+            .join("live");
+        let runtime = LiveExecutionRuntime::initialize(
+            settings,
+            &live_root,
+            derive_risk_policy_hash(&config.global_risk)?,
+            derive_config_hash(&config)?,
+            wall_ms,
+        )
+        .await?;
+        engine.enable_production_intents(ProductionIntentIdentity {
+            observer_release_hash: [0; 32],
+            signer_release_hash: [0; 32],
+            release_manifest_hash: [0; 32],
+            market_rules_hash: [0; 32],
+            dynamic_floor_policy_hash: [0; 32],
+            ioc_policy_hash: [0; 32],
+            expires_after_ms: 20_000,
+        });
+        engine.synchronize_live_state(runtime.state());
+        Some(std::sync::Arc::new(tokio::sync::Mutex::new(runtime)))
+    } else {
+        None
+    };
     let mut streaming = streaming_enabled
         .then(|| {
             StreamingHandle::start(
@@ -1296,7 +1303,7 @@ async fn run_qualification_impl<const CONTINUOUS: bool>(
                         }
                         dispatch_production_intents(
                             &mut engine,
-                            options.production.as_ref(),
+                            direct_live.as_ref(),
                         )
                         .await?;
                         append_new_cohort_records(
@@ -1356,7 +1363,7 @@ async fn run_qualification_impl<const CONTINUOUS: bool>(
                             coverage_ready_markets = subscribed_trade_markets.clone();
                             dispatch_production_intents(
                                 &mut engine,
-                                options.production.as_ref(),
+                                direct_live.as_ref(),
                             )
                             .await?;
                         }
@@ -1419,7 +1426,11 @@ async fn run_qualification_impl<const CONTINUOUS: bool>(
                                 engine.ingest(response, observed_at).map_err(|e| e.to_string())?;
                             }
                         }
-                        dispatch_production_intents(&mut engine, options.production.as_ref()).await?;
+                        dispatch_production_intents(
+                            &mut engine,
+                            direct_live.as_ref(),
+                        )
+                        .await?;
                         if engine.metrics().shadow_executions != executions_before {
                             persist_unsigned_state(&mut engine, &mut state_root)?;
                         }
@@ -1479,7 +1490,11 @@ async fn run_qualification_impl<const CONTINUOUS: bool>(
                             )?,
                             observed_at,
                         )?;
-                        dispatch_production_intents(&mut engine, options.production.as_ref()).await?;
+                        dispatch_production_intents(
+                            &mut engine,
+                            direct_live.as_ref(),
+                        )
+                        .await?;
                         if engine.metrics().shadow_executions != executions_before {
                             persist_unsigned_state(&mut engine, &mut state_root)?;
                         }
@@ -1511,7 +1526,7 @@ async fn run_qualification_impl<const CONTINUOUS: bool>(
             let _ = engine
                 .construct_next_decision(now)
                 .map_err(|e| e.to_string())?;
-            dispatch_production_intents(&mut engine, options.production.as_ref()).await?;
+            dispatch_production_intents(&mut engine, direct_live.as_ref()).await?;
             append_new_cohort_records(&mut evidence, &engine, &mut cohort_record_cursor, now)?;
             append_new_technical_records(&mut evidence, &engine, &mut technical_record_cursor)?;
             persist_unsigned_state(&mut engine, &mut state_root)?;
@@ -1579,6 +1594,7 @@ async fn run_qualification_impl<const CONTINUOUS: bool>(
                     &header.run_id,
                     start,
                     now,
+                    execution_mode,
                     &config,
                     &engine,
                     &counters,
@@ -1694,7 +1710,7 @@ async fn run_qualification_impl<const CONTINUOUS: bool>(
                 engine
                     .ingest(response, accepted_at)
                     .map_err(|e| e.to_string())?;
-                dispatch_production_intents(&mut engine, options.production.as_ref()).await?;
+                dispatch_production_intents(&mut engine, direct_live.as_ref()).await?;
                 append_new_cohort_records(
                     &mut evidence,
                     &engine,
@@ -1723,7 +1739,6 @@ async fn run_qualification_impl<const CONTINUOUS: bool>(
             None => return Err("initial equity boundary missing".into()),
         }
     }
-    persist_production_mfce_state(&engine, options.production.as_ref()).await?;
     evidence.flush_replay_events()?;
     if CONTINUOUS {
         persist_unsigned_state(&mut engine, &mut state_root)?;
@@ -1734,6 +1749,7 @@ async fn run_qualification_impl<const CONTINUOUS: bool>(
             &header.run_id,
             start,
             now,
+            execution_mode,
             &config,
             &engine,
             &counters,
@@ -1953,6 +1969,7 @@ fn write_continuous_status(
     run_id: &str,
     start: Timestamp,
     now: Timestamp,
+    execution_mode: ExecutionMode,
     config: &CopyTradeConfig,
     engine: &LiveShadowEngine,
     counters: &Counters,
@@ -1975,7 +1992,10 @@ fn write_continuous_status(
     let metrics = engine.metrics();
     let deployment_equity = engine.deployment_equity()?;
     let status = ContinuousStatus {
-        mode: "continuous_unsigned_planned_only",
+        mode: match execution_mode {
+            ExecutionMode::Shadow => "continuous_shadow",
+            ExecutionMode::Live => "continuous_live",
+        },
         run_id,
         started_at_mono: start,
         observed_at_mono: now,
@@ -2295,69 +2315,88 @@ fn manifest_stage_matches(production_enabled: bool, stage: &str) -> bool {
     }
 }
 
-fn synchronize_production_mfce_state(
-    engine: &LiveShadowEngine,
-    state: &mut crate::production_state::ProductionTradingState,
-) -> bool {
-    let (mfce, time_high_watermark) = engine.mfce_persistence_snapshot();
-    if state.mfce == mfce && state.mfce_time_high_watermark == time_high_watermark {
-        return false;
-    }
-    state.mfce = mfce;
-    state.mfce_time_high_watermark = time_high_watermark;
-    true
-}
-
-async fn persist_production_mfce_state(
-    engine: &LiveShadowEngine,
-    production: Option<&ProductionObserverRuntime>,
-) -> Result<(), Box<dyn Error>> {
-    let Some(production) = production else {
-        return Ok(());
-    };
-    let mut state = production.state.lock().await;
-    if synchronize_production_mfce_state(engine, &mut state) {
-        state.save_atomic(&production.state_path)?;
-    }
-    Ok(())
-}
-
 async fn dispatch_production_intents(
     engine: &mut LiveShadowEngine,
-    production: Option<&ProductionObserverRuntime>,
+    direct_live: Option<
+        &std::sync::Arc<
+            tokio::sync::Mutex<
+                LiveExecutionRuntime<copytrade_signer::transport::HyperliquidMainnetTransport>,
+            >,
+        >,
+    >,
 ) -> Result<(), Box<dyn Error>> {
-    let Some(production) = production else {
+    let Some(direct_live) = direct_live else {
         return Ok(());
     };
-    // Commit the observer-only model/sample snapshot before any newly prepared
-    // intent can reach the signing boundary.
-    persist_production_mfce_state(engine, Some(production)).await?;
-    for intent in engine.take_prepared_authorized_intents() {
-        let cloid = intent.planned_cloid;
-        let outcome = production.dispatch_handle.persist_and_queue(intent).await?;
-        if outcome == IntentDispatchState::CapacityUnavailableTargetRetained {
-            engine.release_unaccepted_production_intent(cloid);
-        }
+    let intents = engine.take_prepared_authorized_intents();
+    let mut live = direct_live.lock().await;
+    let mut latest_exchange_timestamp = None;
+    for intent in intents {
+        let unix_ms: u64 = SystemTime::now()
+            .duration_since(UNIX_EPOCH)?
+            .as_millis()
+            .try_into()?;
+        let (_, update) = live.submit(intent, unix_ms).await?;
+        latest_exchange_timestamp =
+            latest_exchange_timestamp.max(apply_live_update(engine, update, unix_ms)?);
     }
-    let mut state = production.state.lock().await;
-    production
-        .dispatcher
-        .reconcile_into(&mut state, &production.state_path)
-        .await?;
-    let requires_recompute = !state.assets_requiring_replan.is_empty();
-    let reconciliation_timestamp = state.live.latest_exchange_event_timestamp();
-    engine.synchronize_production_state(&state);
-    if requires_recompute {
-        engine.recompute_after_production_updates(
-            reconciliation_timestamp.ok_or("production replan has no exchange event timestamp")?,
-        )?;
-        state.assets_requiring_replan.clear();
+    let unix_ms: u64 = SystemTime::now()
+        .duration_since(UNIX_EPOCH)?
+        .as_millis()
+        .try_into()?;
+    if let Some(update) = live.reconcile_if_due(unix_ms).await? {
+        latest_exchange_timestamp =
+            latest_exchange_timestamp.max(apply_live_update(engine, update, unix_ms)?);
     }
-    let mfce_changed_after_recompute = synchronize_production_mfce_state(engine, &mut state);
-    if requires_recompute || mfce_changed_after_recompute {
-        state.save_atomic(&production.state_path)?;
+    engine.synchronize_live_state(live.state());
+    if let Some(timestamp) = latest_exchange_timestamp {
+        engine.recompute_after_production_updates(timestamp)?;
     }
     Ok(())
+}
+
+fn apply_live_update(
+    engine: &mut LiveShadowEngine,
+    update: LiveExecutionUpdate,
+    observed_at: u64,
+) -> Result<Option<u64>, Box<dyn Error>> {
+    enum ExchangeEvent<'a> {
+        Fill(&'a copytrade_core::live_trading::VerifiedExchangeFill),
+        Funding(&'a copytrade_core::live_trading::VerifiedFundingEvent),
+    }
+    impl ExchangeEvent<'_> {
+        fn occurred_at(&self) -> u64 {
+            match self {
+                Self::Fill(fill) => fill.occurred_at,
+                Self::Funding(event) => event.occurred_at,
+            }
+        }
+    }
+    let mut events = update
+        .applied
+        .fills
+        .iter()
+        .map(ExchangeEvent::Fill)
+        .chain(update.applied.funding.iter().map(ExchangeEvent::Funding))
+        .collect::<Vec<_>>();
+    events.sort_by_key(ExchangeEvent::occurred_at);
+    let latest_exchange_timestamp = events.last().map(ExchangeEvent::occurred_at);
+    for event in events {
+        match event {
+            ExchangeEvent::Fill(fill) => engine.apply_live_execution_fill(fill)?,
+            ExchangeEvent::Funding(event) => engine.apply_live_funding(event)?,
+        }
+    }
+    for terminal in update.terminal {
+        engine.resolve_live_execution_terminal(
+            terminal.cloid,
+            terminal.original_quantity,
+            terminal.filled_quantity,
+            observed_at,
+            terminal.rejected,
+        )?;
+    }
+    Ok(latest_exchange_timestamp)
 }
 
 #[cfg(test)]
@@ -3410,27 +3449,6 @@ mod tests {
     fn duration_is_exact() {
         assert_eq!(parse_duration_seconds("24h").unwrap(), 86_400);
         assert!(parse_duration_seconds("24").is_err());
-    }
-
-    #[test]
-    fn production_sync_copies_mfce_state_and_time_as_one_snapshot() {
-        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
-        let config = CopyTradeConfig::from_path(root.join("config/copytrade.json")).unwrap();
-        let mut engine =
-            LiveShadowEngine::new(config, b"mfce-production-sync", "test", 40_000, 80_000).unwrap();
-        let mut mfce = crate::mfce::MfcePersistentState::default();
-        mfce.source_epoch = 7;
-        engine
-            .restore_mfce_persistent_state(mfce.clone(), 91_000)
-            .unwrap();
-        let mut production = crate::production_state::ProductionTradingState::new(
-            copytrade_core::live_trading::LiveTradingState::new(Decimal::from(100), 0).unwrap(),
-        );
-
-        assert!(synchronize_production_mfce_state(&engine, &mut production));
-        assert_eq!(production.mfce, mfce);
-        assert_eq!(production.mfce_time_high_watermark, 91_000);
-        assert!(!synchronize_production_mfce_state(&engine, &mut production));
     }
 
     #[test]
