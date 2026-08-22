@@ -622,223 +622,11 @@ struct ComponentFillPartition {
     total_quantities: BTreeMap<String, Decimal>,
 }
 
-fn partition_component_fill(
+fn split_component_quantities(
     current_positions: &BTreeMap<String, Decimal>,
     side: Side,
-    filled: Decimal,
-    absolute_targets: &BTreeMap<String, Decimal>,
-    reference_price: Decimal,
-    portfolio_position_after: Decimal,
-    size_step: Decimal,
+    allocations: BTreeMap<String, Decimal>,
 ) -> Result<ComponentFillPartition, LiveShadowError> {
-    if filled.is_zero() {
-        return Ok(ComponentFillPartition {
-            close_quantities: BTreeMap::new(),
-            open_quantities: BTreeMap::new(),
-            total_quantities: BTreeMap::new(),
-        });
-    }
-    if reference_price <= Decimal::ZERO {
-        return Err(LiveShadowError::InvalidMarket(
-            "component target reference price must be positive".into(),
-        ));
-    }
-    // A portfolio flatten is authoritative. Component books can differ from
-    // the exchange position by sub-lot Decimal division dust after earlier
-    // proportional fills. Re-proportioning the final exchange fill would
-    // strand that dust and leave attribution episodes open indefinitely.
-    // Instead, close every component by its exact stored quantity, provided
-    // the aggregate discrepancy is within the same exchange-aware tolerance
-    // used by source reconciliation.
-    if portfolio_position_after.is_zero() {
-        let allocations = current_positions
-            .iter()
-            .filter_map(|(component, position)| {
-                if position.is_zero() {
-                    return None;
-                }
-                let closes_position = match side {
-                    Side::Buy => position.is_sign_negative(),
-                    Side::Sell => position.is_sign_positive(),
-                };
-                Some((component.clone(), *position, closes_position))
-            })
-            .collect::<Vec<_>>();
-        if allocations.is_empty() || allocations.iter().any(|(_, _, closes)| !closes) {
-            return Err(LiveShadowError::Core(
-                "portfolio flatten does not exclusively close component positions".into(),
-            ));
-        }
-        let allocations = allocations
-            .into_iter()
-            .map(|(component, position, _)| (component, position.abs()))
-            .collect::<BTreeMap<_, _>>();
-        let attributed = allocations
-            .values()
-            .try_fold(Decimal::ZERO, |sum, value| sum.checked_add(*value))
-            .ok_or(LiveShadowError::Arithmetic)?;
-        let (difference, tolerance) = reconciliation_difference(attributed, filled, size_step)?;
-        if difference > tolerance {
-            return Err(LiveShadowError::Core(format!(
-                "portfolio flatten component quantities do not reconcile: {attributed} != {filled} (difference {difference}, tolerance {tolerance})"
-            )));
-        }
-        return Ok(ComponentFillPartition {
-            close_quantities: allocations.clone(),
-            open_quantities: BTreeMap::new(),
-            total_quantities: allocations,
-        });
-    }
-    let signed_fill = match side {
-        Side::Buy => filled,
-        Side::Sell => -filled,
-    };
-    let portfolio_position_before = portfolio_position_after
-        .checked_sub(signed_fill)
-        .ok_or(LiveShadowError::Arithmetic)?;
-    let crossing = !portfolio_position_before.is_zero()
-        && !portfolio_position_after.is_zero()
-        && portfolio_position_before.is_sign_positive()
-            != portfolio_position_after.is_sign_positive();
-
-    if crossing {
-        let closes = current_positions
-            .iter()
-            .filter_map(|(component, position)| {
-                let closes_position = match side {
-                    Side::Buy => position.is_sign_negative(),
-                    Side::Sell => position.is_sign_positive(),
-                };
-                (closes_position && !position.is_zero())
-                    .then(|| (component.clone(), position.abs()))
-            })
-            .collect::<BTreeMap<_, _>>();
-        let close_total = closes
-            .values()
-            .try_fold(Decimal::ZERO, |sum, quantity| sum.checked_add(*quantity))
-            .ok_or(LiveShadowError::Arithmetic)?;
-        let (close_difference, close_tolerance) =
-            reconciliation_difference(close_total, portfolio_position_before.abs(), size_step)?;
-        if closes.is_empty() || close_difference > close_tolerance {
-            return Err(LiveShadowError::Core(format!(
-                "crossing fill old-side component close quantity does not reconcile: {close_total} != {} (difference {close_difference}, tolerance {close_tolerance})",
-                portfolio_position_before.abs()
-            )));
-        }
-        let opening_quantity = filled
-            .checked_sub(close_total)
-            .ok_or(LiveShadowError::Arithmetic)?;
-        if opening_quantity <= Decimal::ZERO {
-            return Err(LiveShadowError::Core(
-                "crossing fill has no quantity remaining for the new side".into(),
-            ));
-        }
-        let opening_capacity = absolute_targets
-            .iter()
-            .filter_map(|(component, target_notional)| {
-                let desired = target_notional.checked_div(reference_price)?;
-                let matches_fill = match side {
-                    Side::Buy => desired.is_sign_positive(),
-                    Side::Sell => desired.is_sign_negative(),
-                };
-                (matches_fill && !desired.is_zero()).then(|| (component.clone(), desired.abs()))
-            })
-            .collect::<BTreeMap<_, _>>();
-        if opening_capacity.is_empty() {
-            return Err(LiveShadowError::Core(
-                "crossing fill has no matching new-side component target".into(),
-            ));
-        }
-        let capacity_total = opening_capacity
-            .values()
-            .try_fold(Decimal::ZERO, |sum, quantity| sum.checked_add(*quantity))
-            .ok_or(LiveShadowError::Arithmetic)?;
-        let mut opens = if opening_quantity == capacity_total {
-            opening_capacity
-        } else {
-            proportional_allocations(opening_quantity, &opening_capacity)?
-        };
-        canonicalize_allocation_total(&mut opens, opening_quantity)?;
-        let mut total_quantities = closes.clone();
-        for (component, quantity) in &opens {
-            let combined = total_quantities
-                .get(component)
-                .copied()
-                .unwrap_or_default()
-                .checked_add(*quantity)
-                .ok_or(LiveShadowError::Arithmetic)?;
-            total_quantities.insert(component.clone(), combined);
-        }
-        let attributed_total = total_quantities
-            .values()
-            .try_fold(Decimal::ZERO, |sum, quantity| sum.checked_add(*quantity))
-            .ok_or(LiveShadowError::Arithmetic)?;
-        let (difference, tolerance) =
-            reconciliation_difference(attributed_total, filled, size_step)?;
-        if difference > tolerance {
-            return Err(LiveShadowError::Core(format!(
-                "crossing fill component partition does not reconcile: {attributed_total} != {filled} (difference {difference}, tolerance {tolerance})"
-            )));
-        }
-        return Ok(ComponentFillPartition {
-            close_quantities: closes,
-            open_quantities: opens,
-            total_quantities,
-        });
-    }
-
-    let components = current_positions
-        .keys()
-        .chain(absolute_targets.keys())
-        .cloned()
-        .collect::<BTreeSet<_>>();
-    let directional_deltas = components
-        .into_iter()
-        .filter_map(|component| {
-            let current = current_positions
-                .get(&component)
-                .copied()
-                .unwrap_or_default();
-            let desired = absolute_targets
-                .get(&component)
-                .copied()
-                .unwrap_or_default()
-                .checked_div(reference_price)?;
-            let delta = desired.checked_sub(current)?;
-            let matches_fill = match side {
-                Side::Buy => delta.is_sign_positive(),
-                Side::Sell => delta.is_sign_negative(),
-            };
-            (matches_fill && !delta.is_zero()).then(|| (component, delta.abs()))
-        })
-        .collect::<BTreeMap<_, _>>();
-    if directional_deltas.is_empty() {
-        return Err(LiveShadowError::Core(
-            "filled portfolio delta has no matching component target delta".into(),
-        ));
-    }
-    let directional_capacity = directional_deltas
-        .values()
-        .try_fold(Decimal::ZERO, |sum, value| sum.checked_add(*value))
-        .ok_or(LiveShadowError::Arithmetic)?;
-    // Preserve exact component quantities when the exchange fill satisfies
-    // the complete directional delta. Recomputing the same proportions can
-    // move one Decimal quantum and strand an otherwise closed episode.
-    let mut allocations = if filled == directional_capacity {
-        directional_deltas
-    } else {
-        proportional_allocations(filled, &directional_deltas)?
-    };
-    canonicalize_allocation_total(&mut allocations, filled)?;
-    let total = allocations
-        .values()
-        .try_fold(Decimal::ZERO, |sum, value| sum.checked_add(*value))
-        .ok_or(LiveShadowError::Arithmetic)?;
-    if total != filled {
-        return Err(LiveShadowError::Core(
-            "source fill quantities do not reconcile".into(),
-        ));
-    }
     let mut close_quantities = BTreeMap::new();
     let mut open_quantities = BTreeMap::new();
     for (component, quantity) in &allocations {
@@ -870,6 +658,263 @@ fn partition_component_fill(
         open_quantities,
         total_quantities: allocations,
     })
+}
+
+fn pending_component_total(
+    side: Side,
+    component_remaining: &BTreeMap<String, Decimal>,
+) -> Result<Decimal, LiveShadowError> {
+    if component_remaining.is_empty() {
+        return Err(LiveShadowError::Core(
+            "pending action has no attributable remaining quantity".into(),
+        ));
+    }
+    let total = component_remaining
+        .values()
+        .try_fold(Decimal::ZERO, |sum, quantity| {
+            let matches_action = match side {
+                Side::Buy => quantity.is_sign_positive(),
+                Side::Sell => quantity.is_sign_negative(),
+            };
+            if quantity.is_zero() || !matches_action {
+                return None;
+            }
+            sum.checked_add(quantity.abs())
+        })
+        .ok_or_else(|| {
+            LiveShadowError::Core("pending action has invalid component quantity".into())
+        })?;
+    Ok(total)
+}
+
+fn consume_pending_component_fill(
+    current_positions: &BTreeMap<String, Decimal>,
+    side: Side,
+    filled: Decimal,
+    remaining_order_quantity: Decimal,
+    component_remaining: &BTreeMap<String, Decimal>,
+    size_step: Decimal,
+) -> Result<ComponentFillPartition, LiveShadowError> {
+    if filled.is_zero() {
+        return Ok(ComponentFillPartition {
+            close_quantities: BTreeMap::new(),
+            open_quantities: BTreeMap::new(),
+            total_quantities: BTreeMap::new(),
+        });
+    }
+    let component_total = pending_component_total(side, component_remaining)?;
+    let (difference, tolerance) =
+        reconciliation_difference(component_total, remaining_order_quantity, size_step)?;
+    if difference > tolerance {
+        return Err(LiveShadowError::Core(
+            "pending component quantity does not reconcile with order quantity".into(),
+        ));
+    }
+    let remaining = component_remaining
+        .iter()
+        .map(|(component, quantity)| (component.clone(), quantity.abs()))
+        .collect::<BTreeMap<_, _>>();
+    let (overfill, tolerance) =
+        reconciliation_difference(filled, remaining_order_quantity, size_step)?;
+    if filled > remaining_order_quantity && overfill > tolerance {
+        return Err(LiveShadowError::Core(format!(
+            "fill exceeds attributable pending order quantity: {filled} > {remaining_order_quantity}"
+        )));
+    }
+    let mut allocations = if overfill <= tolerance {
+        remaining
+    } else {
+        proportional_allocations(filled, &remaining)?
+    };
+    if overfill > tolerance {
+        canonicalize_allocation_total(&mut allocations, filled)?;
+    }
+
+    split_component_quantities(current_positions, side, allocations)
+}
+
+fn partition_component_fill(
+    current_positions: &BTreeMap<String, Decimal>,
+    side: Side,
+    filled: Decimal,
+    absolute_targets: &BTreeMap<String, Decimal>,
+    reference_price: Decimal,
+    portfolio_position_after: Decimal,
+    size_step: Decimal,
+) -> Result<ComponentFillPartition, LiveShadowError> {
+    if filled.is_zero() {
+        return Ok(ComponentFillPartition {
+            close_quantities: BTreeMap::new(),
+            open_quantities: BTreeMap::new(),
+            total_quantities: BTreeMap::new(),
+        });
+    }
+    if reference_price <= Decimal::ZERO {
+        return Err(LiveShadowError::InvalidMarket(
+            "component target reference price must be positive".into(),
+        ));
+    }
+    let matches_side = |value: Decimal| match side {
+        Side::Buy => value.is_sign_positive(),
+        Side::Sell => value.is_sign_negative(),
+    };
+    let total = |quantities: &BTreeMap<String, Decimal>| {
+        quantities
+            .values()
+            .try_fold(Decimal::ZERO, |sum, value| sum.checked_add(*value))
+            .ok_or(LiveShadowError::Arithmetic)
+    };
+
+    // Preserve exact component quantities for a final flatten so sub-lot
+    // Decimal dust cannot strand an attribution episode.
+    if portfolio_position_after.is_zero() {
+        let allocations = current_positions
+            .iter()
+            .filter(|(_, position)| !position.is_zero())
+            .map(|(component, position)| (component.clone(), position.abs()))
+            .collect::<BTreeMap<_, _>>();
+        if allocations.is_empty()
+            || current_positions
+                .values()
+                .any(|position| !position.is_zero() && matches_side(*position))
+        {
+            return Err(LiveShadowError::Core(
+                "portfolio flatten does not exclusively close component positions".into(),
+            ));
+        }
+        let (difference, tolerance) =
+            reconciliation_difference(total(&allocations)?, filled, size_step)?;
+        if difference > tolerance {
+            return Err(LiveShadowError::Core(
+                "portfolio flatten component quantities do not reconcile".into(),
+            ));
+        }
+        return Ok(ComponentFillPartition {
+            close_quantities: allocations.clone(),
+            open_quantities: BTreeMap::new(),
+            total_quantities: allocations,
+        });
+    }
+    let signed_fill = match side {
+        Side::Buy => filled,
+        Side::Sell => -filled,
+    };
+    let portfolio_position_before = portfolio_position_after
+        .checked_sub(signed_fill)
+        .ok_or(LiveShadowError::Arithmetic)?;
+    let crossing = !portfolio_position_before.is_zero()
+        && !portfolio_position_after.is_zero()
+        && portfolio_position_before.is_sign_positive()
+            != portfolio_position_after.is_sign_positive();
+
+    if crossing {
+        let closes = current_positions
+            .iter()
+            .filter(|(_, position)| !position.is_zero() && !matches_side(**position))
+            .map(|(component, position)| (component.clone(), position.abs()))
+            .collect::<BTreeMap<_, _>>();
+        let close_total = total(&closes)?;
+        let (difference, tolerance) =
+            reconciliation_difference(close_total, portfolio_position_before.abs(), size_step)?;
+        if closes.is_empty() || difference > tolerance {
+            return Err(LiveShadowError::Core(
+                "crossing fill old-side component close quantity does not reconcile".into(),
+            ));
+        }
+        let opening_quantity = filled
+            .checked_sub(close_total)
+            .ok_or(LiveShadowError::Arithmetic)?;
+        if opening_quantity <= Decimal::ZERO {
+            return Err(LiveShadowError::Core(
+                "crossing fill has no quantity remaining for the new side".into(),
+            ));
+        }
+        let opening_capacity = absolute_targets
+            .iter()
+            .filter_map(|(component, target_notional)| {
+                let desired = target_notional.checked_div(reference_price)?;
+                (matches_side(desired) && !desired.is_zero())
+                    .then(|| (component.clone(), desired.abs()))
+            })
+            .collect::<BTreeMap<_, _>>();
+        if opening_capacity.is_empty() {
+            return Err(LiveShadowError::Core(
+                "crossing fill has no matching new-side component target".into(),
+            ));
+        }
+        let capacity_total = total(&opening_capacity)?;
+        let mut opens = if opening_quantity == capacity_total {
+            opening_capacity
+        } else {
+            proportional_allocations(opening_quantity, &opening_capacity)?
+        };
+        canonicalize_allocation_total(&mut opens, opening_quantity)?;
+        let mut total_quantities = closes.clone();
+        for (component, quantity) in &opens {
+            let combined = total_quantities
+                .get(component)
+                .copied()
+                .unwrap_or_default()
+                .checked_add(*quantity)
+                .ok_or(LiveShadowError::Arithmetic)?;
+            total_quantities.insert(component.clone(), combined);
+        }
+        let (difference, tolerance) =
+            reconciliation_difference(total(&total_quantities)?, filled, size_step)?;
+        if difference > tolerance {
+            return Err(LiveShadowError::Core(
+                "crossing fill component partition does not reconcile".into(),
+            ));
+        }
+        return Ok(ComponentFillPartition {
+            close_quantities: closes,
+            open_quantities: opens,
+            total_quantities,
+        });
+    }
+
+    let components = current_positions
+        .keys()
+        .chain(absolute_targets.keys())
+        .cloned()
+        .collect::<BTreeSet<_>>();
+    let directional_deltas = components
+        .into_iter()
+        .filter_map(|component| {
+            let current = current_positions
+                .get(&component)
+                .copied()
+                .unwrap_or_default();
+            let desired = absolute_targets
+                .get(&component)
+                .copied()
+                .unwrap_or_default()
+                .checked_div(reference_price)?;
+            let delta = desired.checked_sub(current)?;
+            (matches_side(delta) && !delta.is_zero()).then(|| (component, delta.abs()))
+        })
+        .collect::<BTreeMap<_, _>>();
+    if directional_deltas.is_empty() {
+        return Err(LiveShadowError::Core(
+            "filled portfolio delta has no matching component target delta".into(),
+        ));
+    }
+    let directional_capacity = total(&directional_deltas)?;
+    // Preserve exact component quantities when the exchange fill satisfies
+    // the complete directional delta. Recomputing the same proportions can
+    // move one Decimal quantum and strand an otherwise closed episode.
+    let mut allocations = if filled == directional_capacity {
+        directional_deltas
+    } else {
+        proportional_allocations(filled, &directional_deltas)?
+    };
+    canonicalize_allocation_total(&mut allocations, filled)?;
+    if total(&allocations)? != filled {
+        return Err(LiveShadowError::Core(
+            "source fill quantities do not reconcile".into(),
+        ));
+    }
+    split_component_quantities(current_positions, side, allocations)
 }
 
 #[cfg(test)]
@@ -1210,7 +1255,8 @@ impl Error for LiveShadowError {}
 struct PendingAction {
     action: copytrade_core::decision::PlannedAction,
     root_planned_cloid: String,
-    component_attribution: BTreeMap<String, Decimal>,
+    remaining_order_quantity: Decimal,
+    component_remaining: BTreeMap<String, Decimal>,
     #[serde(skip)]
     execution: Option<PendingExecutionContext>,
 }
@@ -1580,7 +1626,7 @@ pub struct LiveShadowEngine {
     snapshot_generation: Option<u64>,
 }
 
-pub const UNSIGNED_SNAPSHOT_SCHEMA_VERSION: u32 = 9;
+pub const UNSIGNED_SNAPSHOT_SCHEMA_VERSION: u32 = 10;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -3662,7 +3708,7 @@ impl LiveShadowEngine {
                         previous.execution = Some(execution_context(None, None));
                     }
                     if previous
-                        .component_attribution
+                        .component_remaining
                         .keys()
                         .any(|candidate| candidate.starts_with("technical:"))
                     {
@@ -3732,12 +3778,58 @@ impl LiveShadowEngine {
                         });
                     }
                 }
+                let remaining_order_quantity = round_exchange_step(
+                    action
+                        .rounded_notional
+                        .checked_div(rules.mark_price)
+                        .ok_or(LiveShadowError::Arithmetic)?,
+                    rules.size_step,
+                    false,
+                )?;
+                if remaining_order_quantity <= Decimal::ZERO {
+                    return Err(LiveShadowError::InvalidMarket(format!(
+                        "{asset} pending action rounded to zero quantity"
+                    )));
+                }
+                let signed_order_quantity = match action.side {
+                    Side::Buy => remaining_order_quantity,
+                    Side::Sell => -remaining_order_quantity,
+                };
+                let portfolio_position_after = self
+                    .ledger
+                    .portfolio_position(&asset)
+                    .checked_add(signed_order_quantity)
+                    .ok_or(LiveShadowError::Arithmetic)?;
+                let component_allocation = partition_component_fill(
+                    &self.ledger.source_positions_for_asset(&asset),
+                    action.side,
+                    remaining_order_quantity,
+                    &component_targets,
+                    rules.mark_price,
+                    portfolio_position_after,
+                    rules.size_step,
+                )?;
+                let component_remaining = component_allocation
+                    .total_quantities
+                    .into_iter()
+                    .map(|(component, quantity)| {
+                        (
+                            component,
+                            if action.side == Side::Buy {
+                                quantity
+                            } else {
+                                -quantity
+                            },
+                        )
+                    })
+                    .collect();
                 self.pending.insert(
                     asset,
                     PendingAction {
                         action,
                         root_planned_cloid,
-                        component_attribution: component_targets,
+                        remaining_order_quantity,
+                        component_remaining,
                         execution: Some(execution_context(parent_planned_cloid, continuation_kind)),
                     },
                 );
@@ -3880,18 +3972,22 @@ impl LiveShadowEngine {
                     )))
                 }
             };
+            if exit.side != pending.action.side {
+                self.retire_pending_action(
+                    &book.asset,
+                    &pending,
+                    received_at,
+                    ActionAttemptOutcome::SupersededByNewTarget,
+                );
+                return Ok(ExecutionRecompute::None);
+            }
             (
-                exit.quantity,
+                exit.quantity.min(pending.remaining_order_quantity),
                 exit.ioc,
                 exit.execution_floor.minimum_order_notional,
             )
         } else {
-            let raw_quantity = pending
-                .action
-                .rounded_notional
-                .checked_div(reference_price)
-                .ok_or(LiveShadowError::Arithmetic)?;
-            let quantity = round_exchange_step(raw_quantity, context.size_step, false)?;
+            let quantity = pending.remaining_order_quantity;
             let floor = copytrade_core::execution_floor::execution_floor_for_asset(
                 pending.action.side,
                 &market_rules,
@@ -4016,7 +4112,7 @@ impl LiveShadowEngine {
         }
         self.accrue_funding(received_at)?;
         let pending_component_ids = pending
-            .component_attribution
+            .component_remaining
             .keys()
             .cloned()
             .collect::<BTreeSet<_>>();
@@ -4062,24 +4158,16 @@ impl LiveShadowEngine {
             .checked_add(received_at)
             .ok_or(LiveShadowError::Arithmetic)?;
         self.ledger_time_high_watermark = self.ledger_time_high_watermark.max(ledger_timestamp);
-        let component_reference_price = context
-            .projection_input
-            .market_rules
-            .get(&book.asset)
-            .map(|rules| rules.mark_price)
-            .ok_or_else(|| LiveShadowError::InvalidMarket(book.asset.clone()))?;
-        // Construct and validate the complete close/open attribution split
-        // before mutating either ledger. A crossing order is one exchange
-        // fill but two economic transitions: exact old-side closes followed
-        // by any residual new-side opens.
+        // Consume the immutable per-component allocation carried by the
+        // issued action. Current strategy targets decide only what to plan
+        // after this action resolves.
         let component_positions_before = self.ledger.source_positions_for_asset(&book.asset);
-        let component_partition = partition_component_fill(
+        let component_partition = consume_pending_component_fill(
             &component_positions_before,
             execution.action.side,
             execution.modeled_filled_quantity,
-            &pending.component_attribution,
-            component_reference_price,
-            execution.position_after,
+            pending.remaining_order_quantity,
+            &pending.component_remaining,
             context.size_step,
         )?;
         let allocations = &component_partition.total_quantities;
@@ -4570,6 +4658,14 @@ impl LiveShadowEngine {
         state.ledger.validate_integrity().map_err(core)?;
         state.target_ledger.validate_integrity().map_err(core)?;
         state.mfce.validate().map_err(mfce_error)?;
+        for pending in state.pending.values() {
+            if pending.remaining_order_quantity <= Decimal::ZERO {
+                return Err(LiveShadowError::Core(
+                    "pending action has invalid remaining order quantity".into(),
+                ));
+            }
+            pending_component_total(pending.action.side, &pending.component_remaining)?;
+        }
         if state.mfce_time_high_watermark < state.mfce.time_high_watermark() {
             return Err(LiveShadowError::Core(
                 "unsigned shadow MFCE time high-watermark regressed".into(),
@@ -7190,6 +7286,20 @@ mod tests {
             allocated.values().copied().sum::<Decimal>(),
             Decimal::from(29)
         );
+        let pending = allocated
+            .iter()
+            .map(|(component, quantity)| (component.clone(), *quantity))
+            .collect();
+        let consumed = consume_pending_component_fill(
+            &current,
+            Side::Buy,
+            Decimal::from(29),
+            Decimal::from(29),
+            &pending,
+            Decimal::ONE,
+        )
+        .unwrap();
+        assert_eq!(consumed.total_quantities, allocated);
     }
 
     #[test]
@@ -7927,8 +8037,9 @@ mod tests {
     fn target_replacement_does_not_rewrite_live_action_attribution() {
         let asset = "TEST";
         let component = "source:issuance";
-        let issued_notional = Decimal::new(1_134_400, 5);
+        let issued_notional = Decimal::new(113, 1);
         let reference_price = Decimal::new(1, 1);
+        let issued_quantity = issued_notional.checked_div(reference_price).unwrap();
         let (mut engine, book) = pending_reduce_only_engine(
             asset,
             Decimal::from(100),
@@ -7940,7 +8051,8 @@ mod tests {
         pending.action.side = Side::Sell;
         pending.action.rounded_notional = issued_notional;
         pending.action.reduce_only = false;
-        pending.component_attribution = BTreeMap::from([(component.to_string(), -issued_notional)]);
+        pending.remaining_order_quantity = issued_quantity;
+        pending.component_remaining = BTreeMap::from([(component.to_string(), -issued_quantity)]);
         pending
             .execution
             .as_mut()
@@ -7964,8 +8076,8 @@ mod tests {
         // A current target replacement cannot rewrite issuance provenance for
         // the already-retained action.
         assert_eq!(
-            engine.pending[asset].component_attribution,
-            BTreeMap::from([(component.to_string(), -issued_notional)])
+            engine.pending[asset].component_remaining,
+            BTreeMap::from([(component.to_string(), -issued_quantity)])
         );
 
         engine.try_execute_pending(&book, 10_000).unwrap();
@@ -8768,6 +8880,10 @@ mod tests {
             ActionAttemptOutcome::ExecutedPartiallyRemainderReplanned
         );
         let follow_up = engine.pending.get("BTC").unwrap();
+        assert_eq!(
+            pending_component_total(follow_up.action.side, &follow_up.component_remaining).unwrap(),
+            follow_up.remaining_order_quantity
+        );
         assert_eq!(follow_up.action.retry_generation, 1);
         assert_eq!(
             follow_up
@@ -8877,6 +8993,14 @@ mod tests {
             expected_pending
         );
         assert_eq!(restored.pending["BTC"].root_planned_cloid, expected_root);
+        assert_eq!(
+            restored.pending["BTC"].component_remaining,
+            engine.pending["BTC"].component_remaining
+        );
+        assert_eq!(
+            restored.pending["BTC"].remaining_order_quantity,
+            engine.pending["BTC"].remaining_order_quantity
+        );
         assert!(engine.pending["BTC"].execution.is_some());
         assert!(restored.pending["BTC"].execution.is_none());
         assert_eq!(
