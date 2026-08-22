@@ -26,7 +26,7 @@ use copytrade_core::decision::{
     canonical_target_hash, construct_decision, construct_planned_actions, derive_config_hash,
     derive_planned_cloid, derive_projection_hash, derive_risk_policy_hash,
     hash_market_snapshot_bytes, hash_payload_bytes, DecisionConstructionInput, DecisionRecord,
-    EngineInstanceId, ExclusionReason, PlannedCloidInput, PreviousTargetState, Side,
+    EngineInstanceId, ExclusionReason, PlannedAction, PlannedCloidInput, PreviousTargetState, Side,
     SnapshotSetMember, SourceEligibilitySummary,
 };
 use copytrade_core::deployment_equity::{calculate_deployment_equity, DeploymentEquity};
@@ -3685,6 +3685,21 @@ impl LiveShadowEngine {
             unconstrained_targets: BTreeMap::new(),
             market_rules,
         };
+        let maximum_slippage = Decimal::from_f64(self.config.execution.max_slippage_bps / 10_000.0)
+            .ok_or(LiveShadowError::Arithmetic)?;
+        let execution_cushion = Decimal::from_f64(self.config.slippage_buffer_bps / 10_000.0)
+            .ok_or(LiveShadowError::Arithmetic)?;
+        let execution_floor_policy = ExecutionFloorPolicy {
+            exchange_minimum_notional: Decimal::from_f64(
+                self.config.global_risk.min_order_notional_usd,
+            )
+            .ok_or(LiveShadowError::Arithmetic)?,
+            rounding_buffer: Decimal::from_f64(self.config.global_risk.order_rounding_buffer_usd)
+                .ok_or(LiveShadowError::Arithmetic)?,
+            closeability_margin: Decimal::from_f64(self.config.global_risk.closeability_margin_usd)
+                .ok_or(LiveShadowError::Arithmetic)?,
+            maximum_slippage_fraction: maximum_slippage,
+        };
         let decision = construct_decision(DecisionConstructionInput {
             engine_instance_id: self.engine_instance,
             decision_sequence: self.decision_sequence,
@@ -3696,24 +3711,7 @@ impl LiveShadowEngine {
             consensus_inputs,
             maximum_source_exposure: self.config.global_risk.max_source_exposure,
             source_snapshot_max_age_ms: self.config.global_risk.source_snapshot_max_age_ms,
-            execution_floor_policy: ExecutionFloorPolicy {
-                exchange_minimum_notional: Decimal::from_f64(
-                    self.config.global_risk.min_order_notional_usd,
-                )
-                .ok_or(LiveShadowError::Arithmetic)?,
-                rounding_buffer: Decimal::from_f64(
-                    self.config.global_risk.order_rounding_buffer_usd,
-                )
-                .ok_or(LiveShadowError::Arithmetic)?,
-                closeability_margin: Decimal::from_f64(
-                    self.config.global_risk.closeability_margin_usd,
-                )
-                .ok_or(LiveShadowError::Arithmetic)?,
-                maximum_slippage_fraction: Decimal::from_f64(
-                    self.config.execution.max_slippage_bps / 10_000.0,
-                )
-                .ok_or(LiveShadowError::Arithmetic)?,
-            },
+            execution_floor_policy,
             slot_rank_hysteresis: Decimal::from_f64(
                 self.config.global_risk.slot_rank_hysteresis,
             )
@@ -4085,18 +4083,63 @@ impl LiveShadowEngine {
                         });
                     }
                 }
-                let remaining_order_quantity = round_exchange_step(
-                    action
-                        .rounded_notional
-                        .checked_div(rules.mark_price)
-                        .ok_or(LiveShadowError::Arithmetic)?,
-                    rules.size_step,
-                    false,
-                )?;
+                let mut preissue_outcome = None;
+                let remaining_order_quantity = if action.reduce_only {
+                    let reference_price = snapshot.midpoint;
+                    let filled_quantity = self.authoritative_position(&asset);
+                    let filled_notional = filled_quantity
+                        .checked_mul(reference_price)
+                        .ok_or(LiveShadowError::Arithmetic)?;
+                    let current_rules = MarketRules {
+                        mark_price: reference_price,
+                        price_tick: rules.price_tick,
+                        size_step: rules.size_step,
+                    };
+                    let input = ExitPlanningInput {
+                        asset: &asset,
+                        desired_target_notional: target,
+                        filled_notional,
+                        filled_quantity,
+                        acknowledged_open_notional: Decimal::ZERO,
+                        unknown_result_notional: Decimal::ZERO,
+                        continuation_notional: Decimal::ZERO,
+                        reference_price,
+                        market_rules: &current_rules,
+                        market_snapshot: &snapshot,
+                        execution_floor_policy,
+                        execution_cushion,
+                        maximum_slippage,
+                    };
+                    let (quantity, outcome) = preissue_reduce_only_quantity(&action, &input)?;
+                    preissue_outcome = outcome;
+                    quantity
+                } else {
+                    round_exchange_step(
+                        action
+                            .rounded_notional
+                            .checked_div(rules.mark_price)
+                            .ok_or(LiveShadowError::Arithmetic)?,
+                        rules.size_step,
+                        false,
+                    )?
+                };
                 if remaining_order_quantity <= Decimal::ZERO {
-                    return Err(LiveShadowError::InvalidMarket(format!(
-                        "{asset} pending action rounded to zero quantity"
-                    )));
+                    self.action_lifecycle_events.push(ActionLifecycleEvent {
+                        asset,
+                        decision_id: action.decision_id.to_string(),
+                        planned_cloid: action.planned_cloid.to_string(),
+                        root_planned_cloid,
+                        parent_planned_cloid,
+                        retry_generation: action.retry_generation,
+                        observed_at_mono: now,
+                        requested_notional: action.rounded_notional,
+                        filled_quantity: None,
+                        unfilled_quantity: None,
+                        outcome: preissue_outcome.unwrap_or(
+                            ActionAttemptOutcome::BelowExchangeMinimumAfterCurrentRecompute,
+                        ),
+                    });
+                    continue;
                 }
                 let signed_order_quantity = match action.side {
                     Side::Buy => remaining_order_quantity,
@@ -5744,6 +5787,35 @@ impl LiveShadowEngine {
         }
         self.last_funding_accrual = Some(now);
         Ok(())
+    }
+}
+
+fn preissue_reduce_only_quantity(
+    action: &PlannedAction,
+    input: &ExitPlanningInput<'_>,
+) -> Result<(Decimal, Option<ActionAttemptOutcome>), LiveShadowError> {
+    debug_assert!(action.reduce_only);
+    match plan_risk_reducing_ioc(input) {
+        Ok(exit)
+            if exit.residual_class != ResidualClass::DirectionFlipCloseLeg
+                && exit.side == action.side =>
+        {
+            Ok((exit.quantity, None))
+        }
+        Ok(_) | Err(ExitPlanningBlock::ExposureIncreasing) => Ok((
+            Decimal::ZERO,
+            Some(ActionAttemptOutcome::SupersededByNewTarget),
+        )),
+        Err(ExitPlanningBlock::AlreadySatisfied) => {
+            Ok((Decimal::ZERO, Some(ActionAttemptOutcome::NoLongerRequired)))
+        }
+        Err(ExitPlanningBlock::BelowExchangeMinimum { .. }) => Ok((
+            Decimal::ZERO,
+            Some(ActionAttemptOutcome::BelowExchangeMinimumAfterCurrentRecompute),
+        )),
+        Err(error) => Err(LiveShadowError::Core(format!(
+            "pre-issuance exit planning blocked: {error:?}"
+        ))),
     }
 }
 
@@ -8461,6 +8533,137 @@ mod tests {
     }
 
     #[test]
+    fn preissue_reduce_only_uses_current_position_and_target_not_trigger_size() {
+        let action = PlannedAction {
+            decision_id: DecisionId([1; 32]),
+            target_version: TargetVersion(1),
+            asset: "TEST".into(),
+            side: Side::Sell,
+            rounded_notional: Decimal::new(1, 2),
+            reduce_only: true,
+            action_ordinal: 0,
+            retry_generation: 0,
+            planned_cloid: PlannedCloid([2; 16]),
+        };
+        let snapshot = ShadowMarketSnapshot {
+            snapshot_id: MarketSnapshotId([3; 32]),
+            observed_at_mono: 1,
+            midpoint: Decimal::from(100),
+            bids: vec![DepthLevel {
+                price: Decimal::from(99),
+                quantity: Decimal::from(10),
+            }],
+            asks: vec![DepthLevel {
+                price: Decimal::from(101),
+                quantity: Decimal::from(10),
+            }],
+        };
+        let rules = MarketRules {
+            mark_price: Decimal::from(100),
+            price_tick: Decimal::new(1, 1),
+            size_step: Decimal::new(1, 2),
+        };
+        let policy = ExecutionFloorPolicy {
+            exchange_minimum_notional: Decimal::from(10),
+            rounding_buffer: Decimal::new(2, 1),
+            closeability_margin: Decimal::new(5, 1),
+            maximum_slippage_fraction: Decimal::new(1, 2),
+        };
+        let input = |desired_target_notional, filled_notional, filled_quantity| ExitPlanningInput {
+            asset: &action.asset,
+            desired_target_notional,
+            filled_notional,
+            filled_quantity,
+            acknowledged_open_notional: Decimal::ZERO,
+            unknown_result_notional: Decimal::ZERO,
+            continuation_notional: Decimal::ZERO,
+            reference_price: Decimal::from(100),
+            market_rules: &rules,
+            market_snapshot: &snapshot,
+            execution_floor_policy: policy,
+            execution_cushion: Decimal::new(1, 3),
+            maximum_slippage: Decimal::new(1, 2),
+        };
+
+        assert_eq!(
+            round_exchange_step(
+                action.rounded_notional / Decimal::from(100),
+                rules.size_step,
+                false,
+            )
+            .unwrap(),
+            Decimal::ZERO
+        );
+        assert_eq!(
+            preissue_reduce_only_quantity(
+                &action,
+                &input(Decimal::ZERO, Decimal::from(100), Decimal::ONE),
+            )
+            .unwrap(),
+            (Decimal::ONE, None)
+        );
+        assert_eq!(
+            preissue_reduce_only_quantity(
+                &action,
+                &input(Decimal::from(50), Decimal::from(100), Decimal::ONE),
+            )
+            .unwrap(),
+            (Decimal::new(5, 1), None)
+        );
+        assert_eq!(
+            preissue_reduce_only_quantity(
+                &action,
+                &input(Decimal::ZERO, Decimal::from(5), Decimal::new(5, 2)),
+            )
+            .unwrap(),
+            (
+                Decimal::ZERO,
+                Some(ActionAttemptOutcome::BelowExchangeMinimumAfterCurrentRecompute),
+            )
+        );
+        assert_eq!(
+            preissue_reduce_only_quantity(
+                &action,
+                &input(Decimal::from(100), Decimal::from(100), Decimal::ONE),
+            )
+            .unwrap(),
+            (Decimal::ZERO, Some(ActionAttemptOutcome::NoLongerRequired),)
+        );
+        assert_eq!(
+            preissue_reduce_only_quantity(
+                &action,
+                &input(Decimal::from(120), Decimal::from(100), Decimal::ONE),
+            )
+            .unwrap(),
+            (
+                Decimal::ZERO,
+                Some(ActionAttemptOutcome::SupersededByNewTarget),
+            )
+        );
+    }
+
+    #[test]
+    fn issued_pending_action_with_zero_remaining_quantity_is_still_invalid() {
+        let (mut engine, book) = pending_reduce_only_engine(
+            "TEST",
+            Decimal::from(1_000),
+            Decimal::new(11, 2),
+            Decimal::new(1, 1),
+        );
+        engine
+            .pending
+            .get_mut("TEST")
+            .unwrap()
+            .remaining_order_quantity = Decimal::ZERO;
+
+        assert!(matches!(
+            engine.try_execute_pending(&book, 10_000),
+            Err(LiveShadowError::InvalidMarket(message))
+                if message == "TEST rounded to zero quantity"
+        ));
+    }
+
+    #[test]
     fn target_replacement_does_not_rewrite_live_action_attribution() {
         let asset = "TEST";
         let component = "source:issuance";
@@ -8469,7 +8672,7 @@ mod tests {
         let issued_quantity = issued_notional.checked_div(reference_price).unwrap();
         let (mut engine, book) = pending_reduce_only_engine(
             asset,
-            Decimal::from(100),
+            Decimal::from(1_000),
             Decimal::new(11, 2),
             reference_price,
         );
