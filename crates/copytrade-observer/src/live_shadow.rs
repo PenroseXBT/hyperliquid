@@ -3663,6 +3663,26 @@ impl LiveShadowEngine {
                     self.metrics.mfce_retrain_failures.saturating_add(1)
             }
         }
+        let in_flight_pending_assets = self
+            .pending
+            .iter()
+            .filter(|(_, pending)| {
+                self.emitted_production_cloids
+                    .contains(&pending.action.planned_cloid)
+            })
+            .map(|(asset, _)| asset.clone())
+            .collect::<BTreeSet<_>>();
+        let pending_replacement_assets = allocation_replacement_assets
+            .iter()
+            .filter(|asset| !in_flight_pending_assets.contains(asset.as_str()))
+            .cloned()
+            .chain(
+                self.pending
+                    .keys()
+                    .filter(|asset| !in_flight_pending_assets.contains(asset.as_str()))
+                    .cloned(),
+            )
+            .collect::<BTreeSet<_>>();
         let projection_filled_positions = filled_positions.clone();
         let market_bytes =
             serde_json::to_vec(&mids).map_err(|error| LiveShadowError::Core(error.to_string()))?;
@@ -3680,7 +3700,7 @@ impl LiveShadowEngine {
             filled_positions,
             filled_position_state_complete: true,
             acknowledged_open_orders: self
-                .pending_open_orders_excluding(&allocation_replacement_assets),
+                .pending_open_orders_excluding(&pending_replacement_assets),
             open_order_state_complete: true,
             unconstrained_targets: BTreeMap::new(),
             market_rules,
@@ -3789,6 +3809,10 @@ impl LiveShadowEngine {
                 continuation.next_retry_generation,
             )?;
         }
+        // A submitted IOC remains authoritative until exchange resolution. A
+        // local, not-yet-emitted action is instead replaced from actual
+        // committed exposure by the current target below.
+        actions.retain(|action| !in_flight_pending_assets.contains(&action.asset));
         let proposed_action_notionals = actions
             .iter()
             .map(|action| (action.asset.clone(), action.rounded_notional))
@@ -3832,23 +3856,24 @@ impl LiveShadowEngine {
             .into_iter()
             .map(|action| (action.asset.clone(), action))
             .collect::<BTreeMap<_, _>>();
-        for asset in &allocation_replacement_assets {
-            let rules = execution_rules
-                .get(asset)
-                .ok_or_else(|| LiveShadowError::InvalidMarket(asset.clone()))?;
-            let tolerance = rules
-                .mark_price
-                .checked_mul(rules.size_step)
-                .ok_or(LiveShadowError::Arithmetic)?;
-            let should_retain = self.pending.get(asset).is_some_and(|previous| {
-                executable_by_asset.get(asset).is_some_and(|replacement| {
+        for asset in &pending_replacement_assets {
+            let should_retain = match (self.pending.get(asset), executable_by_asset.get(asset)) {
+                (Some(previous), Some(replacement)) => {
+                    let rules = execution_rules
+                        .get(asset)
+                        .ok_or_else(|| LiveShadowError::InvalidMarket(asset.clone()))?;
+                    let tolerance = rules
+                        .mark_price
+                        .checked_mul(rules.size_step)
+                        .ok_or(LiveShadowError::Arithmetic)?;
                     pending_action_is_immaterial_replacement(
                         &previous.action,
                         replacement,
                         tolerance,
                     )
-                })
-            });
+                }
+                _ => false,
+            };
             if should_retain {
                 continue;
             }
@@ -8661,6 +8686,80 @@ mod tests {
             Err(LiveShadowError::InvalidMarket(message))
                 if message == "TEST rounded to zero quantity"
         ));
+    }
+
+    #[test]
+    fn unissued_pending_action_is_superseded_from_actual_committed_position() {
+        let asset = "TEST";
+        let component = "source:pending";
+        let (mut engine, _) = pending_reduce_only_engine(
+            asset,
+            Decimal::from(1_000),
+            Decimal::new(11, 2),
+            Decimal::new(1, 1),
+        );
+        engine.ledger = DualLedger::default();
+        let pending = engine.pending.get_mut(asset).unwrap();
+        pending.action.side = Side::Sell;
+        pending.action.rounded_notional = Decimal::from(20);
+        pending.action.reduce_only = false;
+        pending.remaining_order_quantity = Decimal::from(200);
+        pending.component_remaining =
+            BTreeMap::from([(component.to_string(), Decimal::from(-200))]);
+        let old_cloid = pending.action.planned_cloid;
+
+        let decision = engine.construct_next_decision(2_000).unwrap().unwrap();
+
+        assert_eq!(
+            decision
+                .projection
+                .constrained_targets
+                .get(asset)
+                .copied()
+                .unwrap_or_default(),
+            Decimal::ZERO
+        );
+        assert!(!engine.pending.contains_key(asset));
+        assert!(engine.executions.is_empty());
+        assert!(engine.action_lifecycle_events.iter().any(|event| {
+            event.planned_cloid == old_cloid.to_string()
+                && event.outcome == ActionAttemptOutcome::SupersededByNewTarget
+        }));
+    }
+
+    #[test]
+    fn emitted_pending_action_waits_for_terminal_resolution_before_replan() {
+        let asset = "TEST";
+        let component = "source:pending";
+        let (mut engine, _) = pending_reduce_only_engine(
+            asset,
+            Decimal::from(1_000),
+            Decimal::new(11, 2),
+            Decimal::new(1, 1),
+        );
+        engine.ledger = DualLedger::default();
+        let pending = engine.pending.get_mut(asset).unwrap();
+        pending.action.side = Side::Sell;
+        pending.action.rounded_notional = Decimal::from(20);
+        pending.action.reduce_only = false;
+        pending.remaining_order_quantity = Decimal::from(200);
+        pending.component_remaining =
+            BTreeMap::from([(component.to_string(), Decimal::from(-200))]);
+        let old_cloid = pending.action.planned_cloid;
+        let old_attribution = pending.component_remaining.clone();
+        engine.emitted_production_cloids.insert(old_cloid);
+        engine.production_positions = Some(BTreeMap::from([(asset.to_string(), Decimal::ZERO)]));
+        engine.production_equities =
+            Some((Decimal::from(100), Decimal::from(100), Decimal::from(100)));
+
+        engine.construct_next_decision(2_000).unwrap().unwrap();
+
+        assert_eq!(engine.pending[asset].action.planned_cloid, old_cloid);
+        assert_eq!(engine.pending[asset].component_remaining, old_attribution);
+        assert!(!engine.action_lifecycle_events.iter().any(|event| {
+            event.planned_cloid == old_cloid.to_string()
+                && event.outcome == ActionAttemptOutcome::SupersededByNewTarget
+        }));
     }
 
     #[test]
