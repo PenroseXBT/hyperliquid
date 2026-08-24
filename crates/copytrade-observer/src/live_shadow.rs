@@ -1735,6 +1735,14 @@ fn encode_unsigned_snapshot(
     rmp_serde::to_vec(envelope).map_err(|error| LiveShadowError::Core(error.to_string()))
 }
 
+fn normalize_unsigned_snapshot_payload(
+    payload: UnsignedObserverState,
+) -> Result<UnsignedObserverState, LiveShadowError> {
+    let encoded =
+        rmp_serde::to_vec(&payload).map_err(|error| LiveShadowError::Core(error.to_string()))?;
+    rmp_serde::from_slice(&encoded).map_err(|error| LiveShadowError::Core(error.to_string()))
+}
+
 fn decode_unsigned_snapshot(
     bytes: &[u8],
     expected_identity: &SnapshotIdentity,
@@ -5041,7 +5049,7 @@ impl LiveShadowEngine {
             self.metrics.persistence_failures += 1;
             LiveShadowError::Core(error.to_string())
         })?;
-        let payload = UnsignedObserverState {
+        let payload = normalize_unsigned_snapshot_payload(UnsignedObserverState {
             ledger: self.ledger.clone(),
             target_ledger: self.target_ledger.clone(),
             technical_engine: self.technical_engine.clone(),
@@ -5064,7 +5072,11 @@ impl LiveShadowEngine {
             equity_buckets: self.equity_buckets.clone(),
             last_bucket: self.last_bucket.clone(),
             micro_density: self.micro_density.clone(),
-        };
+        })
+        .map_err(|error| {
+            self.metrics.persistence_failures += 1;
+            error
+        })?;
         let generation = match self.snapshot_generation {
             Some(previous) => previous.checked_add(1).ok_or(LiveShadowError::Arithmetic)?,
             None => 0,
@@ -9970,6 +9982,64 @@ mod tests {
             restored_equity.deployment_equity,
             expected_deployment_equity.deployment_equity
         );
+    }
+
+    #[test]
+    fn unsigned_snapshot_persistence_canonicalizes_decimal_signed_zero() {
+        let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../config/copytrade.json");
+        let config = CopyTradeConfig::from_path(path).unwrap();
+        let identity = SnapshotIdentity {
+            source_tree_sha256: "source".into(),
+            observer_binary_sha256: "observer".into(),
+            configuration_sha256: "configuration".into(),
+            risk_policy_sha256: "risk".into(),
+        };
+        let first_path = std::env::temp_dir().join(format!(
+            "copytrade-signed-zero-first-{}.msgpack",
+            std::process::id()
+        ));
+        let second_path = std::env::temp_dir().join(format!(
+            "copytrade-signed-zero-second-{}.msgpack",
+            std::process::id()
+        ));
+        let mut engine =
+            LiveShadowEngine::new(config.clone(), b"signed-zero", "first", 40_000, 80_000).unwrap();
+        let negative_zero = -Decimal::ZERO;
+        assert_eq!(negative_zero.to_string(), "-0");
+        engine
+            .accrued_funding
+            .insert("signed-zero".into(), negative_zero);
+        assert_eq!(
+            engine
+                .persist_unsigned_state(&first_path, &identity)
+                .unwrap(),
+            0
+        );
+        let first_bytes = std::fs::read(&first_path).unwrap();
+
+        let mut restored =
+            LiveShadowEngine::new(config, b"signed-zero", "second", 40_000, 80_000).unwrap();
+        assert_eq!(
+            restored
+                .restore_unsigned_state(&first_path, &identity)
+                .unwrap(),
+            0
+        );
+        assert_eq!(restored.accrued_funding["signed-zero"], Decimal::ZERO);
+        assert_eq!(restored.accrued_funding["signed-zero"].to_string(), "0");
+
+        restored.snapshot_generation = None;
+        assert_eq!(
+            restored
+                .persist_unsigned_state(&second_path, &identity)
+                .unwrap(),
+            0
+        );
+        let second_bytes = std::fs::read(&second_path).unwrap();
+        std::fs::remove_file(first_path).unwrap();
+        std::fs::remove_file(second_path).unwrap();
+        assert_eq!(first_bytes, second_bytes);
+        assert!(decode_unsigned_snapshot(&second_bytes, &identity).is_ok());
     }
 
     #[test]
