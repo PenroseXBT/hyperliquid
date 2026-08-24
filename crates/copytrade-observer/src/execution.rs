@@ -76,6 +76,8 @@ pub struct LiveExecutionRuntime<T: AuthenticatedExchangeTransport> {
     ledger_path: PathBuf,
     active_cloids: BTreeSet<PlannedCloid>,
     next_reconciliation_ms: u64,
+    recovery_only: bool,
+    application_recovery_failures: u32,
 }
 
 pub struct LiveTerminalResolution {
@@ -97,7 +99,7 @@ impl LiveExecutionRuntime<HyperliquidMainnetTransport> {
         risk_policy_hash: RiskPolicyHash,
         configuration_hash: ConfigHash,
         now_ms: u64,
-    ) -> Result<Self, SignerError> {
+    ) -> Result<(Self, Option<LiveExecutionUpdate>), SignerError> {
         let (master_account, wallet) = settings.into_wallet()?;
         let transport = HyperliquidMainnetTransport::new(master_account, 10_000)
             .map_err(|error| SignerError::Reconciliation(error.to_string()))?;
@@ -121,7 +123,7 @@ impl<T: AuthenticatedExchangeTransport + Clone> LiveExecutionRuntime<T> {
         risk_policy_hash: RiskPolicyHash,
         configuration_hash: ConfigHash,
         now_ms: u64,
-    ) -> Result<Self, SignerError> {
+    ) -> Result<(Self, Option<LiveExecutionUpdate>), SignerError> {
         std::fs::create_dir_all(state_root)
             .map_err(|error| SignerError::RegistryIo(error.to_string()))?;
         let registry_path = state_root.join("live-submission-registry.json");
@@ -159,8 +161,9 @@ impl<T: AuthenticatedExchangeTransport + Clone> LiveExecutionRuntime<T> {
             ledger_path,
             active_cloids: BTreeSet::new(),
             next_reconciliation_ms: now_ms,
+            recovery_only: true,
+            application_recovery_failures: 0,
         };
-        runtime.reconcile(now_ms).await?;
         runtime.active_cloids.extend(
             runtime
                 .signer
@@ -169,7 +172,27 @@ impl<T: AuthenticatedExchangeTransport + Clone> LiveExecutionRuntime<T> {
                 .into_iter()
                 .map(|(cloid, _, _)| cloid),
         );
-        Ok(runtime)
+        let startup_update = match runtime.reconcile_update(now_ms).await {
+            Ok(update) => {
+                runtime.recovery_only = false;
+                Some(LiveExecutionUpdate {
+                    applied: AppliedExchangeBatch {
+                        fills: runtime.state.verified_fills().to_vec(),
+                        funding: runtime.state.verified_funding().to_vec(),
+                    },
+                    terminal: update.terminal,
+                })
+            }
+            Err(error) if recoverable_reconciliation_error(&error) => {
+                // No partial startup truth is handed to the observer. The next
+                // successful authenticated reconciliation returns the complete
+                // verified history and applies it transactionally.
+                runtime.next_reconciliation_ms = now_ms.saturating_add(1_000);
+                None
+            }
+            Err(error) => return Err(error),
+        };
+        Ok((runtime, startup_update))
     }
 
     pub async fn submit(
@@ -198,14 +221,24 @@ impl<T: AuthenticatedExchangeTransport + Clone> LiveExecutionRuntime<T> {
         &mut self,
         now_ms: u64,
     ) -> Result<Option<LiveExecutionUpdate>, SignerError> {
-        if self.active_cloids.is_empty() || now_ms < self.next_reconciliation_ms {
+        if (!self.recovery_only && self.active_cloids.is_empty())
+            || now_ms < self.next_reconciliation_ms
+        {
             return Ok(None);
         }
         self.reconcile_update(now_ms).await.map(Some)
     }
 
     async fn reconcile_update(&mut self, now_ms: u64) -> Result<LiveExecutionUpdate, SignerError> {
-        let applied = self.reconcile(now_ms).await?;
+        let newly_applied = self.reconcile(now_ms).await?;
+        let applied = if self.recovery_only {
+            AppliedExchangeBatch {
+                fills: self.state.verified_fills().to_vec(),
+                funding: self.state.verified_funding().to_vec(),
+            }
+        } else {
+            newly_applied
+        };
         self.next_reconciliation_ms = now_ms.saturating_add(1_000);
         let mut terminal = Vec::new();
         for (cloid, original_quantity, state) in self.signer.action_states().await? {
@@ -236,6 +269,37 @@ impl<T: AuthenticatedExchangeTransport + Clone> LiveExecutionRuntime<T> {
     pub fn state(&self) -> &LiveTradingState {
         &self.state
     }
+
+    pub fn defer_recovery(&mut self, now_ms: u64) {
+        self.recovery_only = true;
+        self.next_reconciliation_ms = now_ms.saturating_add(1_000);
+    }
+
+    pub fn leave_recovery_only(&mut self) {
+        self.recovery_only = false;
+        self.application_recovery_failures = 0;
+    }
+
+    pub fn recovery_only(&self) -> bool {
+        self.recovery_only
+    }
+
+    pub fn note_application_recovery_failure(&mut self) -> u32 {
+        self.application_recovery_failures = self.application_recovery_failures.saturating_add(1);
+        self.application_recovery_failures
+    }
+}
+
+pub fn recoverable_reconciliation_error(error: &SignerError) -> bool {
+    matches!(
+        error,
+        SignerError::Reconciliation(_)
+            | SignerError::StartupNotReconciled
+            | SignerError::Transport(_)
+            | SignerError::ExchangeHttp(_)
+            | SignerError::UnknownSubmissionResult { .. }
+            | SignerError::ConfirmationTooSoon
+    )
 }
 
 #[cfg(test)]
@@ -276,5 +340,21 @@ mod tests {
     #[test]
     fn invalid_execution_mode_fails_closed() {
         assert!(ExecutionMode::parse(Some("paper")).is_err());
+    }
+
+    #[test]
+    fn only_exchange_reconciliation_uncertainty_enters_recovery_only() {
+        assert!(recoverable_reconciliation_error(
+            &SignerError::StartupNotReconciled
+        ));
+        assert!(recoverable_reconciliation_error(&SignerError::Transport(
+            "temporary".into()
+        )));
+        assert!(!recoverable_reconciliation_error(
+            &SignerError::InvalidSecret
+        ));
+        assert!(!recoverable_reconciliation_error(
+            &SignerError::ExchangeFillMismatch
+        ));
     }
 }

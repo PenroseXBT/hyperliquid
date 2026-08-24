@@ -1,7 +1,8 @@
 #[cfg(feature = "research-cli")]
 use crate::cohort_layer::VeryProfitableLayerArtifact;
 use crate::execution::{
-    ExecutionMode, LiveExecutionRuntime, LiveExecutionSettings, LiveExecutionUpdate,
+    recoverable_reconciliation_error, ExecutionMode, LiveExecutionRuntime, LiveExecutionSettings,
+    LiveExecutionUpdate,
 };
 use crate::live_shadow::{
     EconomicAttribution, LiveShadowEngine, ProductionIntentIdentity, UnresolvedRootStatus,
@@ -737,7 +738,7 @@ async fn run_qualification_impl<const CONTINUOUS: bool>(
             .as_ref()
             .ok_or("live execution requires --state-root")?
             .join("live");
-        let runtime = LiveExecutionRuntime::initialize(
+        let (mut runtime, startup_update) = LiveExecutionRuntime::initialize(
             settings,
             &live_root,
             derive_risk_policy_hash(&config.global_risk)?,
@@ -754,7 +755,18 @@ async fn run_qualification_impl<const CONTINUOUS: bool>(
             ioc_policy_hash: [0; 32],
             expires_after_ms: 20_000,
         });
-        engine.synchronize_live_state(runtime.state());
+        engine.enter_live_recovery_only();
+        if let Some(update) = startup_update {
+            match apply_authenticated_reconciliation(&mut engine, &mut runtime, update, wall_ms)? {
+                AuthenticatedReconciliation::Applied(_) => {
+                    persist_unsigned_state(&mut engine, &mut state_root)?;
+                }
+                AuthenticatedReconciliation::RecoveryPending => {}
+            }
+        } else {
+            engine.enter_live_recovery_only();
+            runtime.defer_recovery(wall_ms);
+        }
         Some(std::sync::Arc::new(tokio::sync::Mutex::new(runtime)))
     } else {
         None
@@ -2328,34 +2340,127 @@ async fn dispatch_production_intents(
     let Some(direct_live) = direct_live else {
         return Ok(());
     };
-    let intents = engine.take_prepared_authorized_intents();
     let mut live = direct_live.lock().await;
+    let recovering = live.recovery_only();
+    let mut intents = engine.take_prepared_authorized_intents().into_iter();
+    if recovering {
+        for intent in intents.by_ref() {
+            engine.release_unaccepted_production_intent(intent.planned_cloid);
+        }
+    }
     let mut latest_exchange_timestamp = None;
-    for intent in intents {
-        let unix_ms: u64 = SystemTime::now()
-            .duration_since(UNIX_EPOCH)?
-            .as_millis()
-            .try_into()?;
-        let (_, update) = live.submit(intent, unix_ms).await?;
-        latest_exchange_timestamp =
-            latest_exchange_timestamp.max(apply_live_update(engine, update, unix_ms)?);
+    if !recovering {
+        while let Some(intent) = intents.next() {
+            let unix_ms: u64 = SystemTime::now()
+                .duration_since(UNIX_EPOCH)?
+                .as_millis()
+                .try_into()?;
+            let cloid = intent.planned_cloid;
+            let (_, update) = match live.submit(intent, unix_ms).await {
+                Ok(result) => result,
+                Err(error) if recoverable_reconciliation_error(&error) => {
+                    for unsubmitted in intents {
+                        engine.release_unaccepted_production_intent(unsubmitted.planned_cloid);
+                    }
+                    engine.enter_live_recovery_only();
+                    live.defer_recovery(unix_ms);
+                    // The durable submission registry and deterministic CLOID now
+                    // decide whether the action reached the exchange. Do not emit
+                    // another action until authenticated reconciliation resolves it.
+                    return Ok(());
+                }
+                Err(error) => {
+                    engine.release_unaccepted_production_intent(cloid);
+                    return Err(error.into());
+                }
+            };
+            match apply_authenticated_reconciliation(engine, &mut live, update, unix_ms)? {
+                AuthenticatedReconciliation::Applied(timestamp) => {
+                    latest_exchange_timestamp = latest_exchange_timestamp.max(timestamp);
+                }
+                AuthenticatedReconciliation::RecoveryPending => {
+                    for unsubmitted in intents {
+                        engine.release_unaccepted_production_intent(unsubmitted.planned_cloid);
+                    }
+                    return Ok(());
+                }
+            }
+        }
     }
     let unix_ms: u64 = SystemTime::now()
         .duration_since(UNIX_EPOCH)?
         .as_millis()
         .try_into()?;
-    if let Some(update) = live.reconcile_if_due(unix_ms).await? {
-        latest_exchange_timestamp =
-            latest_exchange_timestamp.max(apply_live_update(engine, update, unix_ms)?);
+    match live.reconcile_if_due(unix_ms).await {
+        Ok(Some(update)) => {
+            match apply_authenticated_reconciliation(engine, &mut live, update, unix_ms)? {
+                AuthenticatedReconciliation::Applied(timestamp) => {
+                    latest_exchange_timestamp = latest_exchange_timestamp.max(timestamp);
+                }
+                AuthenticatedReconciliation::RecoveryPending => return Ok(()),
+            }
+        }
+        Ok(None) => {}
+        Err(error) if recoverable_reconciliation_error(&error) => {
+            engine.enter_live_recovery_only();
+            live.defer_recovery(unix_ms);
+            return Ok(());
+        }
+        Err(error) => return Err(error.into()),
     }
-    engine.synchronize_live_state(live.state());
     if let Some(timestamp) = latest_exchange_timestamp {
         engine.recompute_after_production_updates(timestamp)?;
     }
     Ok(())
 }
 
-fn apply_live_update(
+enum AuthenticatedReconciliation {
+    Applied(Option<u64>),
+    RecoveryPending,
+}
+
+fn apply_authenticated_reconciliation(
+    engine: &mut LiveShadowEngine,
+    live: &mut LiveExecutionRuntime<copytrade_signer::transport::HyperliquidMainnetTransport>,
+    update: LiveExecutionUpdate,
+    observed_at: u64,
+) -> Result<AuthenticatedReconciliation, Box<dyn Error>> {
+    let checkpoint = engine.live_execution_checkpoint();
+    let result = apply_live_update_inner(engine, update, observed_at);
+    match result {
+        Ok(timestamp) if engine.live_positions_match(live.state()) => {
+            engine.synchronize_live_state(live.state());
+            live.leave_recovery_only();
+            Ok(AuthenticatedReconciliation::Applied(timestamp))
+        }
+        Ok(_) => {
+            engine.restore_live_execution_checkpoint(checkpoint);
+            engine.enter_live_recovery_only();
+            live.defer_recovery(observed_at);
+            if live.note_application_recovery_failure() >= 3 {
+                return Err(
+                    "authoritative exchange base positions still disagree with observer state after three bounded reconciliation attempts"
+                        .into(),
+                );
+            }
+            Ok(AuthenticatedReconciliation::RecoveryPending)
+        }
+        Err(error) => {
+            engine.restore_live_execution_checkpoint(checkpoint);
+            engine.enter_live_recovery_only();
+            live.defer_recovery(observed_at);
+            if live.note_application_recovery_failure() >= 3 {
+                return Err(format!(
+                    "authoritative exchange activity could not be applied after three bounded reconciliation attempts: {error}"
+                )
+                .into());
+            }
+            Ok(AuthenticatedReconciliation::RecoveryPending)
+        }
+    }
+}
+
+fn apply_live_update_inner(
     engine: &mut LiveShadowEngine,
     update: LiveExecutionUpdate,
     observed_at: u64,

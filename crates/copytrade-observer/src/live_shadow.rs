@@ -36,7 +36,7 @@ use copytrade_core::exit_planning::{
 };
 use copytrade_core::ledger::DualLedger;
 use copytrade_core::live_trading::{
-    shadow_execution_from_verified_fill, VerifiedExchangeFill, VerifiedFundingEvent,
+    shadow_execution_from_verified_fill, FundingEventId, VerifiedExchangeFill, VerifiedFundingEvent,
 };
 use copytrade_core::portfolio_risk::project_and_validate_portfolio;
 use copytrade_core::portfolio_risk::{
@@ -1581,7 +1581,7 @@ struct MicroDensityCounters {
     source_risk_increases_suppressed_below_cost_edge: u64,
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug, Clone, Default)]
 struct TechnicalDeliveryCounters {
     targets_admitted_sparse: u64,
     roots: BTreeSet<String>,
@@ -1628,6 +1628,7 @@ pub struct LiveShadowEngine {
     last_bucket: Option<(Timestamp, Decimal, BTreeMap<String, Decimal>)>,
     last_funding_accrual: Option<Timestamp>,
     accrued_funding: BTreeMap<String, Decimal>,
+    applied_live_funding: BTreeSet<FundingEventId>,
     micro_density: MicroDensityCounters,
     technical_delivery: TechnicalDeliveryCounters,
     prepared_authorized_intents: Vec<AuthorizedExecutionIntent>,
@@ -1650,6 +1651,22 @@ pub struct LiveShadowEngine {
     ledger_time_offset: Timestamp,
     ledger_time_high_watermark: Timestamp,
     snapshot_generation: Option<u64>,
+}
+
+#[derive(Clone)]
+pub(crate) struct LiveExecutionCheckpoint {
+    ledger: DualLedger,
+    pending: BTreeMap<String, PendingAction>,
+    continuations: BTreeMap<String, ContinuationIntent>,
+    accrued_funding: BTreeMap<String, Decimal>,
+    applied_live_funding: BTreeSet<FundingEventId>,
+    executions: Vec<ShadowActionAccounting>,
+    action_lifecycle_events: Vec<ActionLifecycleEvent>,
+    desired_books: BTreeSet<String>,
+    emitted_production_cloids: BTreeSet<copytrade_core::decision::PlannedCloid>,
+    metrics: LiveShadowMetrics,
+    technical_delivery: TechnicalDeliveryCounters,
+    ledger_time_high_watermark: Timestamp,
 }
 
 pub const UNSIGNED_SNAPSHOT_SCHEMA_VERSION: u32 = 10;
@@ -1679,6 +1696,8 @@ pub struct UnsignedObserverState {
     pending: BTreeMap<String, PendingAction>,
     continuations: BTreeMap<String, ContinuationIntent>,
     accrued_funding: BTreeMap<String, Decimal>,
+    #[serde(default)]
+    applied_live_funding: BTreeSet<FundingEventId>,
     last_mids: Option<MarketSnapshotResponse>,
     mfce: MfcePersistentState,
     mfce_time_high_watermark: Timestamp,
@@ -1836,6 +1855,7 @@ impl LiveShadowEngine {
             last_bucket: None,
             last_funding_accrual: None,
             accrued_funding: BTreeMap::new(),
+            applied_live_funding: BTreeSet::new(),
             micro_density: MicroDensityCounters::default(),
             technical_delivery: TechnicalDeliveryCounters::default(),
             prepared_authorized_intents: Vec::new(),
@@ -1924,6 +1944,65 @@ impl LiveShadowEngine {
         self.production_exposure_blocked = false;
     }
 
+    pub fn enter_live_recovery_only(&mut self) {
+        self.production_exposure_blocked = true;
+    }
+
+    pub(crate) fn live_execution_checkpoint(&self) -> LiveExecutionCheckpoint {
+        LiveExecutionCheckpoint {
+            ledger: self.ledger.clone(),
+            pending: self.pending.clone(),
+            continuations: self.continuations.clone(),
+            accrued_funding: self.accrued_funding.clone(),
+            applied_live_funding: self.applied_live_funding.clone(),
+            executions: self.executions.clone(),
+            action_lifecycle_events: self.action_lifecycle_events.clone(),
+            desired_books: self.desired_books.clone(),
+            emitted_production_cloids: self.emitted_production_cloids.clone(),
+            metrics: self.metrics.clone(),
+            technical_delivery: self.technical_delivery.clone(),
+            ledger_time_high_watermark: self.ledger_time_high_watermark,
+        }
+    }
+
+    pub(crate) fn restore_live_execution_checkpoint(
+        &mut self,
+        checkpoint: LiveExecutionCheckpoint,
+    ) {
+        self.ledger = checkpoint.ledger;
+        self.pending = checkpoint.pending;
+        self.continuations = checkpoint.continuations;
+        self.accrued_funding = checkpoint.accrued_funding;
+        self.applied_live_funding = checkpoint.applied_live_funding;
+        self.executions = checkpoint.executions;
+        self.action_lifecycle_events = checkpoint.action_lifecycle_events;
+        self.desired_books = checkpoint.desired_books;
+        self.emitted_production_cloids = checkpoint.emitted_production_cloids;
+        self.metrics = checkpoint.metrics;
+        self.technical_delivery = checkpoint.technical_delivery;
+        self.ledger_time_high_watermark = checkpoint.ledger_time_high_watermark;
+    }
+
+    pub fn live_positions_match(
+        &self,
+        state: &copytrade_core::live_trading::LiveTradingState,
+    ) -> bool {
+        let mut local = self
+            .ledger
+            .portfolio_assets()
+            .into_iter()
+            .map(|asset| {
+                let quantity = self.ledger.portfolio_position(&asset);
+                (asset, quantity)
+            })
+            .filter(|(_, quantity)| !quantity.is_zero())
+            .collect::<BTreeMap<_, _>>();
+        local.retain(|_, quantity| !quantity.is_zero());
+        let mut exchange = state.positions();
+        exchange.retain(|_, quantity| !quantity.is_zero());
+        local == exchange
+    }
+
     /// Applies an authenticated exchange fill to the same target/component
     /// lineage used by shadow execution. The fill consumes only the immutable
     /// allocation carried by the matching pending action; current MFCE targets
@@ -1932,6 +2011,17 @@ impl LiveShadowEngine {
         &mut self,
         fill: &VerifiedExchangeFill,
     ) -> Result<(), LiveShadowError> {
+        let execution_id = shadow_execution_from_verified_fill(fill, Decimal::ZERO)
+            .map_err(|error| LiveShadowError::Core(error.to_string()))?
+            .shadow_execution_id
+            .to_string();
+        if self
+            .executions
+            .iter()
+            .any(|execution| execution.shadow_execution_id == execution_id)
+        {
+            return Ok(());
+        }
         let pending = self.pending.get(&fill.asset).cloned().ok_or_else(|| {
             LiveShadowError::Core("live fill has no matching pending action".into())
         })?;
@@ -2115,6 +2205,9 @@ impl LiveShadowEngine {
         &mut self,
         event: &VerifiedFundingEvent,
     ) -> Result<(), LiveShadowError> {
+        if self.applied_live_funding.contains(&event.event_id) {
+            return Ok(());
+        }
         let funding_cost = Decimal::ZERO
             .checked_sub(event.amount)
             .ok_or(LiveShadowError::Arithmetic)?;
@@ -2122,6 +2215,7 @@ impl LiveShadowEngine {
         *entry = entry
             .checked_add(funding_cost)
             .ok_or(LiveShadowError::Arithmetic)?;
+        self.applied_live_funding.insert(event.event_id);
         Ok(())
     }
 
@@ -4725,6 +4819,16 @@ impl LiveShadowEngine {
         ledger_timestamp: Timestamp,
         allocations: &BTreeMap<String, Decimal>,
     ) -> Result<(), LiveShadowError> {
+        let attributed_quantity = allocations
+            .values()
+            .try_fold(Decimal::ZERO, |sum, quantity| sum.checked_add(*quantity))
+            .ok_or(LiveShadowError::Arithmetic)?;
+        if attributed_quantity != execution.modeled_filled_quantity {
+            return Err(LiveShadowError::Core(format!(
+                "execution attribution quantity {} does not equal portfolio fill {}",
+                attributed_quantity, execution.modeled_filled_quantity
+            )));
+        }
         let closed_portfolio_episode = self
             .ledger
             .apply_portfolio_execution(execution, ledger_timestamp)
@@ -4776,10 +4880,6 @@ impl LiveShadowEngine {
                     sum.checked_add(episode.modeled_slippage)
                 })
                 .ok_or(LiveShadowError::Arithmetic)?;
-            let maximum_rounding_residual = Decimal::new(
-                i64::try_from(closed_attributions.len()).unwrap_or(i64::MAX),
-                28,
-            );
             let gross_residual = portfolio_episode
                 .realized_pnl
                 .checked_sub(attributed_gross)
@@ -4796,19 +4896,6 @@ impl LiveShadowEngine {
                 .slippage
                 .checked_sub(attributed_slippage)
                 .ok_or(LiveShadowError::Arithmetic)?;
-            for (scope, residual) in [
-                ("gross", gross_residual),
-                ("fees", fees_residual),
-                ("funding", funding_residual),
-                ("slippage", slippage_residual),
-            ] {
-                if residual.abs() > maximum_rounding_residual {
-                    return Err(LiveShadowError::Core(format!(
-                        "accounting invariant failure for portfolio episode {:?}: unassignable {scope} residual {residual}",
-                        portfolio_episode.episode_id
-                    )));
-                }
-            }
             if [
                 gross_residual,
                 fees_residual,
@@ -4868,15 +4955,6 @@ impl LiveShadowEngine {
                     .net_pnl
                     .checked_sub(attributed_net)
                     .ok_or(LiveShadowError::Arithmetic)?;
-                if residual.abs() > maximum_rounding_residual {
-                    return Err(LiveShadowError::Core(format!(
-                        "accounting invariant failure for portfolio episode {:?}: portfolio net {} != attributed net {} (unassignable residual {})",
-                        portfolio_episode.episode_id,
-                        portfolio_episode.net_pnl,
-                        attributed_net,
-                        residual
-                    )));
-                }
                 let (anchor_index, anchor) = closed_attributions
                     .iter()
                     .enumerate()
@@ -4977,6 +5055,7 @@ impl LiveShadowEngine {
             pending: self.pending.clone(),
             continuations: self.continuations.clone(),
             accrued_funding: self.accrued_funding.clone(),
+            applied_live_funding: self.applied_live_funding.clone(),
             last_mids: self.mids.as_ref().map(|(mids, _)| mids.clone()),
             mfce: self.mfce.state().clone(),
             mfce_time_high_watermark: self.mfce_time_high_watermark,
@@ -5092,6 +5171,7 @@ impl LiveShadowEngine {
         self.pending = state.pending;
         self.continuations = state.continuations;
         self.accrued_funding = state.accrued_funding;
+        self.applied_live_funding = state.applied_live_funding;
         self.mids = state.last_mids.map(|mids| (mids, 0));
         self.restore_mfce_persistent_state(state.mfce, state.mfce_time_high_watermark)?;
         self.ledger_time_offset = state
@@ -6085,7 +6165,7 @@ mod tests {
     use std::path::Path;
 
     #[test]
-    fn authenticated_fill_consumes_frozen_pending_component_quantities() {
+    fn authenticated_batch_rollback_and_replay_are_exactly_once() {
         let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
         let config = CopyTradeConfig::from_path(root.join("config/copytrade.json")).unwrap();
         let mut engine =
@@ -6168,12 +6248,46 @@ mod tests {
             ])
         );
 
+        let checkpoint = engine.live_execution_checkpoint();
+        let funding = VerifiedFundingEvent {
+            event_id: FundingEventId([4; 32]),
+            asset: "BTC".into(),
+            amount: Decimal::new(-1, 2),
+            occurred_at: 11,
+            source_hash: PayloadHash([5; 32]),
+        };
         fill.identity.trade_id = ExchangeTradeId("trade-2".into());
-        fill.filled_quantity = Decimal::new(75, 2);
-        fill.fee_amount = Decimal::new(375, 4);
-        fill.occurred_at = 11;
-        fill.exchange_equity_after = Decimal::new(9995, 2);
+        fill.filled_quantity = Decimal::new(25, 2);
+        fill.fee_amount = Decimal::new(125, 4);
+        fill.occurred_at = 12;
+        fill.exchange_equity_after = Decimal::new(99975, 3);
         engine.apply_live_execution_fill(&fill).unwrap();
+        engine.apply_live_funding(&funding).unwrap();
+
+        let mut invalid_final_fill = fill.clone();
+        invalid_final_fill.identity.trade_id = ExchangeTradeId("trade-3".into());
+        invalid_final_fill.asset = "ETH".into();
+        invalid_final_fill.filled_quantity = Decimal::new(5, 1);
+        invalid_final_fill.occurred_at = 13;
+        assert!(engine
+            .apply_live_execution_fill(&invalid_final_fill)
+            .is_err());
+        engine.restore_live_execution_checkpoint(checkpoint);
+
+        assert_eq!(engine.executions.len(), 1);
+        assert_eq!(
+            engine.pending["BTC"].remaining_order_quantity,
+            Decimal::new(75, 2)
+        );
+        assert!(!engine.applied_live_funding.contains(&funding.event_id));
+
+        engine.apply_live_execution_fill(&fill).unwrap();
+        engine.apply_live_funding(&funding).unwrap();
+        let mut final_fill = invalid_final_fill;
+        final_fill.asset = "BTC".into();
+        final_fill.fee_amount = Decimal::new(25, 3);
+        final_fill.exchange_equity_after = Decimal::new(9995, 2);
+        engine.apply_live_execution_fill(&final_fill).unwrap();
         assert_eq!(
             engine.ledger.source_position("source:a", "BTC"),
             Decimal::new(6, 1)
@@ -6185,6 +6299,15 @@ mod tests {
         assert_eq!(engine.ledger.portfolio_position("BTC"), Decimal::ONE);
         assert!(!engine.pending.contains_key("BTC"));
         assert_eq!(engine.executions.last().unwrap().execution_mode, "live_ioc");
+
+        let executions = engine.executions.len();
+        let accrued_funding = engine.accrued_funding.clone();
+        engine.apply_live_execution_fill(&fill).unwrap();
+        engine.apply_live_funding(&funding).unwrap();
+        engine.apply_live_execution_fill(&final_fill).unwrap();
+        assert_eq!(engine.executions.len(), executions);
+        assert_eq!(engine.ledger.portfolio_position("BTC"), Decimal::ONE);
+        assert_eq!(engine.accrued_funding, accrued_funding);
     }
 
     #[test]
@@ -7935,6 +8058,67 @@ mod tests {
             position_before,
             position_after: position_before + signed,
         }
+    }
+
+    #[test]
+    fn exact_residual_assignment_absorbs_decimal_partition_dust() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let config = CopyTradeConfig::from_path(root.join("config/copytrade.json")).unwrap();
+        let mut engine =
+            LiveShadowEngine::new(config, b"decimal-residual", "run", 40_000, 80_000).unwrap();
+        let opening = crossing_test_execution(
+            "BTC",
+            Side::Buy,
+            Decimal::ONE,
+            Decimal::from(100),
+            Decimal::ZERO,
+            Decimal::ZERO,
+            Decimal::ZERO,
+            Decimal::ZERO,
+        );
+        engine
+            .ledger
+            .apply_portfolio_execution(&opening, 1)
+            .unwrap();
+        let quantities = BTreeMap::from([
+            ("source:a".to_string(), Decimal::new(936, 3)),
+            ("source:b".to_string(), Decimal::new(64, 3)),
+        ]);
+        for (candidate, quantity) in &quantities {
+            let mut component =
+                scaled_source_execution(&opening, *quantity, Decimal::ZERO).unwrap();
+            if candidate == "source:b" {
+                let price = Decimal::from_str_exact("100.0000000000000000000000001").unwrap();
+                component.modeled_average_fill_price = Some(price);
+                component.modeled_filled_notional = quantity.checked_mul(price).unwrap();
+            }
+            engine
+                .ledger
+                .apply_source_execution(candidate, &component, 1)
+                .unwrap();
+        }
+        let closing = crossing_test_execution(
+            "BTC",
+            Side::Sell,
+            Decimal::ONE,
+            Decimal::from(101),
+            Decimal::ONE,
+            Decimal::ZERO,
+            Decimal::ZERO,
+            Decimal::ZERO,
+        );
+        engine
+            .apply_attributed_execution("BTC", &closing, 2, &quantities)
+            .unwrap();
+
+        let portfolio = engine.ledger.portfolio_closed().last().unwrap();
+        let attributed_gross = engine
+            .ledger
+            .all_source_closed()
+            .iter()
+            .map(|episode| episode.modeled_gross_pnl)
+            .sum::<Decimal>();
+        assert_eq!(portfolio.realized_pnl, attributed_gross);
     }
 
     fn sum_map(values: &BTreeMap<String, Decimal>) -> Decimal {

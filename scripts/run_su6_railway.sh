@@ -18,7 +18,6 @@ readonly DATA_ROOT="${VOLUME_ROOT}/${DATA_ROOT_NAME}"
 readonly STATE_ROOT="${DATA_ROOT}/state"
 readonly RUNTIME_ROOT="${DATA_ROOT}/runtime"
 readonly FAILURE_ROOT="${DATA_ROOT}/failure"
-readonly FATAL_STOP_MARKER="${STATE_ROOT}/fatal-stop.json"
 readonly PROCESS_STDERR="${FAILURE_ROOT}/process.stderr"
 readonly EXECUTION_MODE="${SU6_EXECUTION_MODE:-shadow}"
 
@@ -45,11 +44,6 @@ trap stop_observer INT TERM
 
 mkdir -p "$STATE_ROOT" "$RUNTIME_ROOT" "$FAILURE_ROOT"
 
-if [[ -e "$FATAL_STOP_MARKER" ]]; then
-    log "fatal_stop_present=true state=quiescent marker=${FATAL_STOP_MARKER}"
-    while true; do sleep 3600; done
-fi
-
 : > "$PROCESS_STDERR"
 log "continuous_observer_start=true data_root=${DATA_ROOT} execution_mode=${EXECUTION_MODE}"
 
@@ -74,26 +68,14 @@ if (( STOP_REQUESTED == 1 )); then
 fi
 
 if (( observer_exit == 0 )); then
-    log "fatal=continuous_observer_exited_without_operator_request"
+    log "continuous_observer_exited_without_operator_request=true"
     observer_exit=1
 fi
 
-# A healthy daemon has no routine exit. Preserve exactly one bounded failure
-# diagnostic and fail closed on any unexpected termination.
-tail -c 1048576 "$PROCESS_STDERR" > "${FAILURE_ROOT}/fatal.stderr.tmp"
-mv "${FAILURE_ROOT}/fatal.stderr.tmp" "${FAILURE_ROOT}/fatal.stderr"
+# Preserve one bounded diagnostic and return control to Railway's existing
+# bounded service restart policy. Exchange recovery remains observer-owned.
+tail -c 1048576 "$PROCESS_STDERR" > "${FAILURE_ROOT}/last-exit.stderr.tmp"
+mv "${FAILURE_ROOT}/last-exit.stderr.tmp" "${FAILURE_ROOT}/last-exit.stderr"
 rm -f "$PROCESS_STDERR"
-cat > "${FATAL_STOP_MARKER}.tmp" <<EOF
-{
-  "schema_version": 1,
-  "timestamp": "$(date -u '+%Y-%m-%dT%H:%M:%SZ')",
-  "classification": "continuous_runtime_failure",
-  "observer_exit": ${observer_exit},
-  "diagnostic": "${FAILURE_ROOT}/fatal.stderr"
-}
-EOF
-sync -f "${FATAL_STOP_MARKER}.tmp"
-mv "${FATAL_STOP_MARKER}.tmp" "$FATAL_STOP_MARKER"
-sync -f "$STATE_ROOT"
-log "fatal_stop_created=true exit=${observer_exit}"
+log "continuous_observer_unexpected_exit=true exit=${observer_exit} railway_restart=true"
 exit "$observer_exit"
