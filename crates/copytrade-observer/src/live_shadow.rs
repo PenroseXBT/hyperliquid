@@ -727,30 +727,54 @@ fn consume_pending_component_fill(
             "fill exceeds attributable pending order quantity: {filled} > {remaining_order_quantity}"
         )));
     }
-    let mut allocations = if overfill <= tolerance {
+    let full_fill = overfill <= tolerance;
+    let mut allocations = if full_fill {
         remaining
     } else {
         proportional_allocations(filled, &remaining)?
     };
-    if overfill > tolerance {
-        canonicalize_allocation_total(&mut allocations, filled)?;
-    }
+    canonicalize_allocation_total(&mut allocations, filled)?;
 
     let mut partition = split_component_quantities(current_positions, side, allocations.clone())?;
-    partition.remaining_quantities = component_remaining
+    if full_fill {
+        return Ok(partition);
+    }
+    let mut remaining_quantities = component_remaining
         .iter()
-        .filter_map(|(component, quantity)| {
+        .map(|(component, quantity)| {
             let consumed = allocations.get(component).copied().unwrap_or_default();
-            let remaining = quantity.abs().checked_sub(consumed)?;
-            (!remaining.is_zero()).then(|| {
-                (
-                    component.clone(),
-                    match side {
-                        Side::Buy => remaining,
-                        Side::Sell => -remaining,
-                    },
-                )
-            })
+            let remaining = quantity
+                .abs()
+                .checked_sub(consumed)
+                .ok_or(LiveShadowError::Arithmetic)?;
+            if remaining < Decimal::ZERO {
+                return Err(LiveShadowError::Core(
+                    "component fill exceeds its attributable remaining quantity".into(),
+                ));
+            }
+            Ok((component.clone(), remaining))
+        })
+        .collect::<Result<BTreeMap<_, _>, LiveShadowError>>()?;
+    remaining_quantities.retain(|_, quantity| !quantity.is_zero());
+    let expected_remaining = remaining_order_quantity
+        .checked_sub(filled)
+        .ok_or(LiveShadowError::Arithmetic)?;
+    if expected_remaining <= Decimal::ZERO || remaining_quantities.is_empty() {
+        return Err(LiveShadowError::Core(
+            "partial fill has no attributable remaining quantity".into(),
+        ));
+    }
+    canonicalize_allocation_total(&mut remaining_quantities, expected_remaining)?;
+    partition.remaining_quantities = remaining_quantities
+        .into_iter()
+        .map(|(component, quantity)| {
+            (
+                component,
+                match side {
+                    Side::Buy => quantity,
+                    Side::Sell => -quantity,
+                },
+            )
         })
         .collect();
     Ok(partition)
@@ -4323,8 +4347,9 @@ impl LiveShadowEngine {
                     portfolio_position_after,
                     rules.size_step,
                 )?;
-                let component_remaining = component_allocation
-                    .total_quantities
+                let mut component_remaining = component_allocation.total_quantities;
+                canonicalize_allocation_total(&mut component_remaining, remaining_order_quantity)?;
+                let component_remaining = component_remaining
                     .into_iter()
                     .map(|(component, quantity)| {
                         (
@@ -7970,14 +7995,17 @@ mod tests {
         .unwrap();
 
         assert_eq!(allocated.len(), 16);
-        for (candidate, position) in &current {
-            assert_eq!(allocated[candidate], position.abs());
-        }
         assert_ne!(
             allocated.values().copied().sum::<Decimal>(),
             Decimal::from(29)
         );
-        let pending = allocated
+        let mut issued = allocated.clone();
+        canonicalize_allocation_total(&mut issued, Decimal::from(29)).unwrap();
+        assert_eq!(issued.values().copied().sum::<Decimal>(), Decimal::from(29));
+        for (candidate, position) in current.iter().take(current.len() - 1) {
+            assert_eq!(issued[candidate], position.abs());
+        }
+        let pending = issued
             .iter()
             .map(|(component, quantity)| (component.clone(), *quantity))
             .collect();
@@ -7990,7 +8018,8 @@ mod tests {
             Decimal::ONE,
         )
         .unwrap();
-        assert_eq!(consumed.total_quantities, allocated);
+        assert_eq!(consumed.total_quantities, issued);
+        assert!(consumed.remaining_quantities.is_empty());
     }
 
     #[test]
@@ -8673,6 +8702,80 @@ mod tests {
         canonicalize_allocation_total(&mut allocations, Decimal::ONE).unwrap();
         assert_eq!(allocations.values().copied().sum::<Decimal>(), Decimal::ONE);
         assert_eq!(allocations["c"], Decimal::new(333_333_333_333_333_334, 18));
+    }
+
+    #[test]
+    fn pending_component_quantity_stays_exact_across_partial_fills() {
+        let total = Decimal::from(24);
+        let first_fill = Decimal::from(7);
+        let final_fill = Decimal::from(17);
+        let current = BTreeMap::from([
+            ("source:a".to_string(), Decimal::from(8)),
+            ("source:b".to_string(), Decimal::from(8)),
+            ("source:c".to_string(), Decimal::from(8)),
+        ]);
+        let mut issued = BTreeMap::from([
+            ("source:a".to_string(), Decimal::from(8)),
+            ("source:b".to_string(), Decimal::from(8)),
+            (
+                "source:c".to_string(),
+                Decimal::from_str_exact("7.999999999999999999999999999").unwrap(),
+            ),
+        ]);
+        assert_eq!(
+            issued.values().copied().sum::<Decimal>(),
+            Decimal::from_str_exact("23.999999999999999999999999999").unwrap()
+        );
+        canonicalize_allocation_total(&mut issued, total).unwrap();
+        assert_eq!(issued.values().copied().sum::<Decimal>(), total);
+        let pending = issued
+            .into_iter()
+            .map(|(component, quantity)| (component, -quantity))
+            .collect::<BTreeMap<_, _>>();
+
+        let first = consume_pending_component_fill(
+            &current,
+            Side::Sell,
+            first_fill,
+            total,
+            &pending,
+            Decimal::ONE,
+        )
+        .unwrap();
+        assert_eq!(
+            first.total_quantities.values().copied().sum::<Decimal>(),
+            first_fill
+        );
+        assert_eq!(
+            pending_component_total(Side::Sell, &first.remaining_quantities).unwrap(),
+            final_fill
+        );
+
+        let current_after_first = current
+            .into_iter()
+            .map(|(component, quantity)| {
+                let consumed = first
+                    .total_quantities
+                    .get(&component)
+                    .copied()
+                    .unwrap_or_default();
+                (component, quantity - consumed)
+            })
+            .collect::<BTreeMap<_, _>>();
+        let second = consume_pending_component_fill(
+            &current_after_first,
+            Side::Sell,
+            final_fill,
+            final_fill,
+            &first.remaining_quantities,
+            Decimal::ONE,
+        )
+        .unwrap();
+        assert_eq!(
+            second.total_quantities.values().copied().sum::<Decimal>(),
+            final_fill
+        );
+        assert!(second.remaining_quantities.is_empty());
     }
 
     #[test]
