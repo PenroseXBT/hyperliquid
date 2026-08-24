@@ -1330,9 +1330,7 @@ impl MfceEngine {
         let Some(candidate) = result.result? else {
             return Ok(false);
         };
-        if candidate.epoch != attempt.candidate_epoch
-            || candidate.trained_through_sample_id != attempt.attempted_through_sample_id
-        {
+        if candidate.epoch != attempt.candidate_epoch {
             return Err(MfceError::InvalidState(
                 "MFCE candidate identity mismatches its durable attempt".into(),
             ));
@@ -3686,6 +3684,52 @@ mod tests {
             80
         );
         assert!(engine.maybe_start_training().unwrap());
+    }
+
+    #[test]
+    fn chronological_holdout_candidate_promotes_with_distinct_training_cutoff() {
+        let samples = (1..=500)
+            .map(|id| {
+                let mut sample =
+                    training_sample(id, "BTC", MfceDirection::Long, ((id - 1) % 100) as i64 - 50);
+                sample.features = features(0);
+                sample
+            })
+            .collect::<Vec<_>>();
+        let candidate = train_candidate(&samples, None, 1)
+            .unwrap()
+            .expect("chronologically calibrated candidate");
+        assert_eq!(candidate.trained_through_sample_id, 400);
+
+        let mut engine = MfceEngine::default();
+        engine.state.samples = samples.into();
+        engine.state.next_sample_id = 502;
+        engine.state.last_retrain_attempt_sample_id = 500;
+        engine.state.pending_training = Some(MfceTrainingAttempt {
+            attempted_through_sample_id: 500,
+            activation_sample_id: 501,
+            candidate_epoch: 1,
+            incumbent_epoch: None,
+        });
+        let (sender, receiver) = std::sync::mpsc::sync_channel(1);
+        sender
+            .send(CompletedTraining {
+                attempted_through_sample_id: 500,
+                result: Ok(Some(candidate)),
+            })
+            .unwrap();
+        engine.training = Some(receiver);
+
+        assert!(engine.poll_training().unwrap());
+        let incumbent = engine.state.incumbent.as_ref().unwrap();
+        assert_eq!(incumbent.epoch, 1);
+        assert_eq!(incumbent.trained_through_sample_id, 400);
+        assert_ne!(incumbent.trained_through_sample_id, 500);
+        let served = engine
+            .predict("BTC", MfceDirection::Long, &features(0))
+            .unwrap();
+        assert_eq!(served.model_epoch, 1);
+        assert!(served.used_model);
     }
 
     #[test]
