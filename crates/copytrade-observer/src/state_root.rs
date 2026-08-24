@@ -14,7 +14,7 @@ const MARKER_TEMP_FILE_NAME: &str = "initialized.tmp";
 const SNAPSHOT_TEMP_FILE_NAME: &str = "unsigned-observer-state.tmp";
 
 pub const UNSIGNED_PERSISTENCE_SCHEMA_DESCRIPTOR: &str = concat!(
-    "copytrade-observer-unsigned-persistence-v10\n",
+    "copytrade-observer-unsigned-persistence-v11\n",
     "lock=.observer-state.lock:exclusive-os-lock:lifetime\n",
     "marker=initialized.json:",
     "InitializationMarker{schema_version:u32,snapshot_schema_version:u32,generation:u64,",
@@ -46,6 +46,7 @@ pub const UNSIGNED_PERSISTENCE_SCHEMA_DESCRIPTOR: &str = concat!(
     "ledger_time_high_watermark:Timestamp,executions:Vec<ShadowActionAccounting>,",
     "equity_buckets:Vec<EquityReturnBucket>,last_bucket:Option<EquityBoundary>,",
     "micro_density:MicroDensityCounters}\n",
+    "durable_time=unix-start-anchor+process-monotonic-elapsed;runtime-anchor-not-persisted\n",
     "ledger_episode=PortfolioEpisode{entry_notional:Decimal,exit_notional:Decimal,",
     "realized_pnl:Decimal,fees:Decimal,funding:Decimal,slippage:Decimal,",
     "attribution_residual:Decimal,net_pnl:Decimal}\n",
@@ -53,7 +54,7 @@ pub const UNSIGNED_PERSISTENCE_SCHEMA_DESCRIPTOR: &str = concat!(
     "exit_notional:Decimal,gross_pnl:Decimal,fees:Decimal,funding:Decimal,slippage:Decimal,",
     "net_pnl:Decimal,gains:Decimal,losses:Decimal}>\n",
     "checksum=sha256(canonical-messagepack((schema_version,generation,identity,payload)))\n",
-    "migration=fresh-v10-immutable-pending-component-quantities:checksum-first\n",
+    "migration=fresh-v11-restart-comparable-durable-time:checksum-first\n",
     "commit=temp-write,file-fsync,atomic-rename,directory-fsync,marker-update,directory-fsync\n",
 );
 
@@ -329,9 +330,9 @@ mod tests {
     }
 
     #[test]
-    fn descriptor_identifies_schema_v10_and_the_mfce_artifact_bounds() {
+    fn descriptor_identifies_current_schema_and_the_mfce_artifact_bounds() {
         assert!(UNSIGNED_PERSISTENCE_SCHEMA_DESCRIPTOR
-            .starts_with("copytrade-observer-unsigned-persistence-v10\n"));
+            .starts_with("copytrade-observer-unsigned-persistence-v11\n"));
         assert!(UNSIGNED_PERSISTENCE_SCHEMA_DESCRIPTOR
             .contains("samples:VecDeque<MfceTrainingSample>:max=4096"));
         assert!(UNSIGNED_PERSISTENCE_SCHEMA_DESCRIPTOR.contains("max_bytes=2097152"));

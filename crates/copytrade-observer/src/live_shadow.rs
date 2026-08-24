@@ -1646,9 +1646,11 @@ pub struct LiveShadowEngine {
     cohort_indicator_records: Vec<CohortIndicatorRecord>,
     mfce: MfceEngine,
     mfce_authorized_assets: BTreeMap<String, Timestamp>,
-    mfce_time_offset: Timestamp,
+    /// Maps process-local monotonic timestamps into one restart-comparable
+    /// durable timeline. The anchor is reconstructed from wall time once at
+    /// process startup and advances only with the process monotonic clock.
+    durable_time_offset: Timestamp,
     mfce_time_high_watermark: Timestamp,
-    ledger_time_offset: Timestamp,
     ledger_time_high_watermark: Timestamp,
     snapshot_generation: Option<u64>,
 }
@@ -1669,7 +1671,7 @@ pub(crate) struct LiveExecutionCheckpoint {
     ledger_time_high_watermark: Timestamp,
 }
 
-pub const UNSIGNED_SNAPSHOT_SCHEMA_VERSION: u32 = 10;
+pub const UNSIGNED_SNAPSHOT_SCHEMA_VERSION: u32 = 11;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -1881,9 +1883,8 @@ impl LiveShadowEngine {
             cohort_indicator_records: Vec::new(),
             mfce: MfceEngine::default(),
             mfce_authorized_assets: BTreeMap::new(),
-            mfce_time_offset: 0,
+            durable_time_offset: 0,
             mfce_time_high_watermark: 0,
-            ledger_time_offset: 0,
             ledger_time_high_watermark: 0,
             snapshot_generation: None,
         })
@@ -2081,10 +2082,11 @@ impl LiveShadowEngine {
         )?;
         let ledger_timestamp = self
             .ledger_time_high_watermark
-            .max(fill.decision_timestamp)
             .checked_add(1)
-            .ok_or(LiveShadowError::Arithmetic)?;
+            .ok_or(LiveShadowError::Arithmetic)?
+            .max(fill.occurred_at);
         self.ledger_time_high_watermark = ledger_timestamp;
+        execution.decision_timestamp_mono = ledger_timestamp;
         self.apply_attributed_execution(
             &fill.asset,
             &execution,
@@ -2141,7 +2143,7 @@ impl LiveShadowEngine {
             root_planned_cloid: pending.root_planned_cloid.clone(),
             parent_planned_cloid: fill.parent_cloid.map(|cloid| cloid.to_string()),
             retry_generation: fill.continuation_generation,
-            decision_timestamp_mono: fill.decision_timestamp,
+            decision_timestamp_mono: ledger_timestamp,
             evaluation_timestamp_mono: ledger_timestamp,
             decision_midpoint: fill.decision_reference_price,
             modeled_ioc_limit: fill.submitted_limit_price,
@@ -2315,8 +2317,9 @@ impl LiveShadowEngine {
     }
 
     /// Restores MFCE state before production event processing. Runtime model
-    /// handles are reconstructed as one pair, and the process-local monotonic
-    /// clock is rebased beyond every persisted transition/sample timestamp.
+    /// handles are reconstructed as one pair. The process clock is anchored
+    /// once for every durable subsystem by `rebase_runtime_time` after the
+    /// complete snapshot has been restored.
     pub fn restore_mfce_persistent_state(
         &mut self,
         state: MfcePersistentState,
@@ -2327,18 +2330,55 @@ impl LiveShadowEngine {
                 "persisted MFCE time high-watermark regressed".into(),
             ));
         }
-        let time_offset = time_high_watermark
-            .checked_add(1)
-            .ok_or(LiveShadowError::Arithmetic)?;
         let replacement = MfceEngine::from_state(state).map_err(|error| {
             LiveShadowError::Core(format!("invalid persisted MFCE state: {error}"))
         })?;
         self.mfce = replacement;
         self.mfce_authorized_assets.clear();
-        self.mfce_time_offset = time_offset;
         self.mfce_time_high_watermark = time_high_watermark;
         self.refresh_desired_books();
         Ok(())
+    }
+
+    /// Establishes one restart-comparable durable timeline from a wall-clock
+    /// sample taken at process startup and the process-local monotonic clock.
+    /// Wall time is never consulted again during this process lifetime.
+    pub fn rebase_runtime_time(
+        &mut self,
+        process_now: Timestamp,
+        unix_now_ms: Timestamp,
+    ) -> Result<(), LiveShadowError> {
+        let offset = unix_now_ms
+            .checked_sub(process_now)
+            .ok_or_else(|| LiveShadowError::Core("runtime time anchor is invalid".into()))?;
+        let durable_now = offset
+            .checked_add(process_now)
+            .ok_or(LiveShadowError::Arithmetic)?;
+        let persisted_high_watermark = self
+            .mfce_time_high_watermark
+            .max(self.ledger_time_high_watermark)
+            .max(self.last_equity_boundary().unwrap_or_default())
+            .max(
+                self.equity_buckets
+                    .iter()
+                    .fold(0, |high, bucket| high.max(bucket.closed_at_mono)),
+            )
+            .max(self.executions.iter().fold(0, |high, execution| {
+                high.max(execution.evaluation_timestamp_mono)
+            }));
+        if durable_now < persisted_high_watermark {
+            return Err(LiveShadowError::Core(
+                "runtime wall-clock anchor precedes durable event time".into(),
+            ));
+        }
+        self.durable_time_offset = offset;
+        Ok(())
+    }
+
+    pub fn durable_timestamp(&self, process_now: Timestamp) -> Result<Timestamp, LiveShadowError> {
+        self.durable_time_offset
+            .checked_add(process_now)
+            .ok_or(LiveShadowError::Arithmetic)
     }
 
     pub fn recompute_after_production_updates(
@@ -3152,10 +3192,7 @@ impl LiveShadowEngine {
                     self.metrics.mfce_retrain_failures.saturating_add(1)
             }
         }
-        let mfce_now = self
-            .mfce_time_offset
-            .checked_add(now)
-            .ok_or(LiveShadowError::Arithmetic)?;
+        let mfce_now = self.durable_timestamp(now)?;
         self.mfce_time_high_watermark = self.mfce_time_high_watermark.max(mfce_now);
         let mut eligibility = SourceEligibilitySummary::default();
         let mut members = Vec::new();
@@ -4612,7 +4649,7 @@ impl LiveShadowEngine {
             .map(|target| target.desired_notional)
             .unwrap_or_default();
         let pending_reduce_only = pending.action.reduce_only;
-        let execution = execute_shadow_ioc(&ShadowExecutionInput {
+        let mut execution = execute_shadow_ioc(&ShadowExecutionInput {
             action: pending.action,
             decision_timestamp_mono: context.decision_book.observed_at_mono,
             decision_market_snapshot: context.decision_book.clone(),
@@ -4630,11 +4667,9 @@ impl LiveShadowEngine {
         if !execution.modeled_filled_quantity.is_zero() {
             self.accrued_funding.remove(&book.asset);
         }
-        let ledger_timestamp = self
-            .ledger_time_offset
-            .checked_add(received_at)
-            .ok_or(LiveShadowError::Arithmetic)?;
+        let ledger_timestamp = self.durable_timestamp(received_at)?;
         self.ledger_time_high_watermark = self.ledger_time_high_watermark.max(ledger_timestamp);
+        execution.decision_timestamp_mono = ledger_timestamp;
         // Consume the immutable per-component allocation carried by the
         // issued action. Current strategy targets decide only what to plan
         // after this action resolves.
@@ -4721,7 +4756,7 @@ impl LiveShadowEngine {
             parent_planned_cloid: context.parent_planned_cloid.clone(),
             retry_generation: execution.action.retry_generation,
             decision_timestamp_mono: execution.decision_timestamp_mono,
-            evaluation_timestamp_mono: received_at,
+            evaluation_timestamp_mono: ledger_timestamp,
             decision_midpoint,
             modeled_ioc_limit: price_plan.limit_price,
             worst_required_depth_price: price_plan.worst_required_depth_price,
@@ -5186,10 +5221,6 @@ impl LiveShadowEngine {
         self.applied_live_funding = state.applied_live_funding;
         self.mids = state.last_mids.map(|mids| (mids, 0));
         self.restore_mfce_persistent_state(state.mfce, state.mfce_time_high_watermark)?;
-        self.ledger_time_offset = state
-            .ledger_time_high_watermark
-            .checked_add(1)
-            .ok_or(LiveShadowError::Arithmetic)?;
         self.ledger_time_high_watermark = state.ledger_time_high_watermark;
         self.executions = state.executions;
         self.equity_buckets = state.equity_buckets;
@@ -5737,7 +5768,8 @@ impl LiveShadowEngine {
     pub fn record_equity_boundary(&mut self, now: Timestamp) -> Result<(), LiveShadowError> {
         self.accrue_funding(now)?;
         let (equity, source_equities) = self.accounting_equities()?;
-        self.record_equity_values(now, equity, source_equities)
+        let durable_now = self.durable_timestamp(now)?;
+        self.record_equity_values(durable_now, equity, source_equities)
     }
 
     fn accounting_equities(&self) -> Result<(Decimal, BTreeMap<String, Decimal>), LiveShadowError> {
@@ -6834,7 +6866,7 @@ mod tests {
         state.next_sample_id = 9;
         engine.mfce.replace_state(state).unwrap();
         engine.mfce_time_high_watermark = engine.mfce.state().time_high_watermark();
-        engine.mfce_time_offset = engine.mfce_time_high_watermark + 1;
+        engine.durable_time_offset = engine.mfce_time_high_watermark + 1;
     }
 
     fn mfce_test_book(
@@ -9906,13 +9938,14 @@ mod tests {
                 .unwrap(),
             0
         );
+        restored.rebase_runtime_time(10, 10_000_000_000).unwrap();
         std::fs::remove_file(state_path).unwrap();
 
         assert_eq!(restored.ledger, expected_ledger);
         assert_eq!(restored.target_ledger, expected_targets);
         assert_eq!(restored.decision_sequence, expected_sequence);
         assert_eq!(restored.ledger.portfolio_open_count(), 1);
-        assert!(restored.ledger_time_offset > engine.ledger_time_high_watermark);
+        assert_eq!(restored.durable_timestamp(10).unwrap(), 10_000_000_000);
         assert_eq!(
             rmp_serde::to_vec(&restored.pending).unwrap(),
             expected_pending
@@ -9952,7 +9985,6 @@ mod tests {
         );
         assert_eq!(restored.mfce.state(), &expected_mfce);
         assert_eq!(restored.mfce_time_high_watermark, expected_mfce_time);
-        assert!(restored.mfce_time_offset > engine.mfce_time_high_watermark);
         assert_eq!(
             rmp_serde::to_vec(&restored.technical_engine).unwrap(),
             expected_technical_state
@@ -10040,6 +10072,89 @@ mod tests {
         std::fs::remove_file(second_path).unwrap();
         assert_eq!(first_bytes, second_bytes);
         assert!(decode_unsigned_snapshot(&second_bytes, &identity).is_ok());
+    }
+
+    #[test]
+    fn durable_state_rebases_across_process_clocks_without_economic_amnesia() {
+        const INTERVAL: u64 = 300_000;
+        let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../config/copytrade.json");
+        let config = CopyTradeConfig::from_path(path).unwrap();
+        let identity = SnapshotIdentity {
+            source_tree_sha256: "source".into(),
+            observer_binary_sha256: "observer".into(),
+            configuration_sha256: "configuration".into(),
+            risk_policy_sha256: "risk".into(),
+        };
+        let state_path = std::env::temp_dir().join(format!(
+            "copytrade-cross-process-time-{}.msgpack",
+            std::process::id()
+        ));
+
+        let mut first =
+            LiveShadowEngine::new(config.clone(), b"time-rebase", "first", 40_000, 80_000).unwrap();
+        seed_positive_mfce_backoff(&mut first, "BTC");
+        first.pending.insert(
+            "BTC".into(),
+            PendingAction {
+                action: PlannedAction {
+                    decision_id: DecisionId([1; 32]),
+                    target_version: TargetVersion(1),
+                    asset: "BTC".into(),
+                    side: Side::Buy,
+                    rounded_notional: Decimal::from(100),
+                    reduce_only: false,
+                    action_ordinal: 0,
+                    retry_generation: 0,
+                    planned_cloid: PlannedCloid([2; 16]),
+                },
+                root_planned_cloid: PlannedCloid([2; 16]).to_string(),
+                remaining_order_quantity: Decimal::ONE,
+                component_remaining: BTreeMap::from([("source:a".into(), Decimal::ONE)]),
+                execution: None,
+            },
+        );
+        first
+            .rebase_runtime_time(1_500_000, 30_000_000_000)
+            .unwrap();
+        first.record_equity_boundary(1_500_000).unwrap();
+        first.record_equity_boundary(1_800_000).unwrap();
+        assert_eq!(first.equity_buckets.len(), 1);
+        let historical_bucket = rmp_serde::to_vec(&first.equity_buckets[0]).unwrap();
+        let open_bucket = rmp_serde::to_vec(&first.last_bucket).unwrap();
+        let mfce_state = first.mfce.state().clone();
+        let pending_state = rmp_serde::to_vec(&first.pending).unwrap();
+        first
+            .persist_unsigned_state(&state_path, &identity)
+            .unwrap();
+
+        let mut second =
+            LiveShadowEngine::new(config, b"time-rebase", "second", 40_000, 80_000).unwrap();
+        second
+            .restore_unsigned_state(&state_path, &identity)
+            .unwrap();
+        second.rebase_runtime_time(10, 30_000_420_000).unwrap();
+        assert_eq!(
+            rmp_serde::to_vec(&second.equity_buckets[0]).unwrap(),
+            historical_bucket
+        );
+        assert_eq!(rmp_serde::to_vec(&second.last_bucket).unwrap(), open_bucket);
+        assert_eq!(second.mfce.state(), &mfce_state);
+        assert_eq!(rmp_serde::to_vec(&second.pending).unwrap(), pending_state);
+        assert_eq!(
+            second.last_equity_boundary().unwrap() / INTERVAL,
+            second.durable_timestamp(10).unwrap() / INTERVAL
+        );
+
+        // The replacement process starts near monotonic zero. Its next
+        // wall-aligned boundary closes the restored open bucket exactly once.
+        second.record_equity_boundary(180_010).unwrap();
+        assert_eq!(second.equity_buckets.len(), 2);
+        assert_eq!(second.equity_buckets[1].opened_at_mono, 30_000_300_000);
+        assert_eq!(second.equity_buckets[1].closed_at_mono, 30_000_600_000);
+        assert_eq!(second.last_equity_boundary(), Some(30_000_600_000));
+        assert_eq!(second.mfce.state(), &mfce_state);
+        assert_eq!(rmp_serde::to_vec(&second.pending).unwrap(), pending_state);
+        std::fs::remove_file(state_path).unwrap();
     }
 
     #[test]

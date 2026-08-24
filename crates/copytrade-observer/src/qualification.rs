@@ -709,10 +709,12 @@ async fn run_qualification_impl<const CONTINUOUS: bool>(
         .as_ref()
         .map(|root| UnsignedStateRoot::acquire(root, &state_identity))
         .transpose()?;
+    let mut restored_state = false;
     if let Some(state_root) = state_root.as_mut() {
         match state_root.startup() {
             StateRootStartup::Restore => {
                 let generation = state_root.restore(&mut engine)?;
+                restored_state = true;
                 evidence.append_log(
                     false,
                     &format!(
@@ -730,6 +732,9 @@ async fn run_qualification_impl<const CONTINUOUS: bool>(
                 )?;
             }
         }
+    }
+    if CONTINUOUS {
+        engine.rebase_runtime_time(start, wall_ms)?;
     }
     let direct_live = if execution_mode == ExecutionMode::Live {
         let settings = live_settings.ok_or("live execution settings are unavailable")?;
@@ -856,7 +861,18 @@ async fn run_qualification_impl<const CONTINUOUS: bool>(
     let mut market_due = 0;
     let mut metadata_due = 0;
     let mut decision_due = 0;
-    let mut profitability_bucket_due = start.checked_add(300_000).ok_or("bucket overflow")?;
+    const EQUITY_BUCKET_INTERVAL_MS: u64 = 300_000;
+    let first_bucket_delay = if CONTINUOUS {
+        let elapsed_in_wall_bucket = wall_ms % EQUITY_BUCKET_INTERVAL_MS;
+        EQUITY_BUCKET_INTERVAL_MS
+            .checked_sub(elapsed_in_wall_bucket)
+            .ok_or("bucket overflow")?
+    } else {
+        EQUITY_BUCKET_INTERVAL_MS
+    };
+    let mut profitability_bucket_due = start
+        .checked_add(first_bucket_delay)
+        .ok_or("bucket overflow")?;
     let mut checkpoint_due = 0;
     let mut counters = Counters::default();
     let mut tasks = JoinSet::new();
@@ -874,9 +890,16 @@ async fn run_qualification_impl<const CONTINUOUS: bool>(
         .transpose()?;
     let mut interrupted = false;
     if options.profitability_gate || CONTINUOUS {
-        engine.record_equity_boundary(start)?;
-        evidence.append_replay_event(start, ReplayPayload::EquityBoundary)?;
-        persist_unsigned_state(&mut engine, &mut state_root)?;
+        let restored_inside_current_wall_bucket = CONTINUOUS
+            && restored_state
+            && engine.last_equity_boundary().is_some_and(|last| {
+                last / EQUITY_BUCKET_INTERVAL_MS == wall_ms / EQUITY_BUCKET_INTERVAL_MS
+            });
+        if !restored_inside_current_wall_bucket {
+            engine.record_equity_boundary(start)?;
+            evidence.append_replay_event(start, ReplayPayload::EquityBoundary)?;
+            persist_unsigned_state(&mut engine, &mut state_root)?;
+        }
     }
     while deadline.is_none_or(|deadline| clock.now_ms() < deadline) {
         let now = clock.now_ms();
@@ -1552,7 +1575,7 @@ async fn run_qualification_impl<const CONTINUOUS: bool>(
                 .append_replay_event(profitability_bucket_due, ReplayPayload::EquityBoundary)?;
             persist_unsigned_state(&mut engine, &mut state_root)?;
             profitability_bucket_due = profitability_bucket_due
-                .checked_add(300_000)
+                .checked_add(EQUITY_BUCKET_INTERVAL_MS)
                 .ok_or("bucket deadline overflow")?;
         }
         if now >= checkpoint_due {
@@ -1597,7 +1620,10 @@ async fn run_qualification_impl<const CONTINUOUS: bool>(
                 })?;
             }
             if CONTINUOUS {
-                engine.compact_runtime_history(now.saturating_sub(30 * 24 * 60 * 60 * 1_000))?;
+                let durable_now = engine.durable_timestamp(now)?;
+                engine.compact_runtime_history(
+                    durable_now.saturating_sub(30 * 24 * 60 * 60 * 1_000),
+                )?;
                 cohort_record_cursor = engine.cohort_indicator_records().len();
                 technical_record_cursor = engine.technical_decision_records().len();
                 persist_unsigned_state(&mut engine, &mut state_root)?;
@@ -1991,12 +2017,20 @@ fn write_continuous_status(
 ) -> Result<(), Box<dyn Error>> {
     let mfce = engine.mfce_report();
     let unresolved_roots = engine.unresolved_actionable_root_count();
+    let durable_start = engine.durable_timestamp(start)?;
+    let durable_now = engine.durable_timestamp(now)?;
     let economics = [
         ("lifetime", 0),
-        ("since_process_start", start),
-        ("last_24h", now.saturating_sub(24 * 60 * 60 * 1_000)),
-        ("last_7d", now.saturating_sub(7 * 24 * 60 * 60 * 1_000)),
-        ("last_30d", now.saturating_sub(30 * 24 * 60 * 60 * 1_000)),
+        ("since_process_start", durable_start),
+        ("last_24h", durable_now.saturating_sub(24 * 60 * 60 * 1_000)),
+        (
+            "last_7d",
+            durable_now.saturating_sub(7 * 24 * 60 * 60 * 1_000),
+        ),
+        (
+            "last_30d",
+            durable_now.saturating_sub(30 * 24 * 60 * 60 * 1_000),
+        ),
     ]
     .into_iter()
     .map(|(horizon, cutoff)| runtime_economic_status(horizon, cutoff, config, engine))
