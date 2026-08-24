@@ -12,7 +12,10 @@ use crate::live_shadow::{
 use crate::profitability::summarize_profitability;
 #[cfg(feature = "research-cli")]
 use crate::profitability::ProfitabilitySummary;
-use crate::public_mainnet::{HyperliquidPublicTransport, PublicTransportPolicy};
+use crate::public_mainnet::{
+    HyperliquidPublicTransport, PublicTransportPolicy, SourceFill, SourceFillRangeResponse,
+    SourceStateResponse,
+};
 use crate::qualification_evidence::{
     load_release_manifest, sha256_file, CheckpointPayload, LatencyEvidence, RunHeader,
 };
@@ -38,7 +41,7 @@ use rust_decimal::prelude::{FromPrimitive, ToPrimitive};
 use rust_decimal::Decimal;
 use serde::Serialize;
 use sha2::{Digest, Sha256};
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::error::Error;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::Ordering;
@@ -48,6 +51,88 @@ use tokio::time::{sleep, Duration};
 
 pub const MINIMUM_QUALIFICATION_SECONDS: u64 = 86_400;
 const MAX_ACTIVE_SOURCE_CANDIDATES: usize = 100;
+const MAX_RECOVERED_SOURCE_FILLS: usize = 32_768;
+
+#[derive(Default)]
+struct HistoryRecovery {
+    snapshots: BTreeMap<String, SourceStateResponse>,
+    ranges: BTreeMap<String, VecDeque<(u64, u64)>>,
+    fills: Vec<SourceFill>,
+    fill_counts: BTreeMap<String, usize>,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum FillRangeProgress {
+    Next,
+    WalletComplete,
+    Restart,
+}
+
+impl HistoryRecovery {
+    fn record_snapshot(&mut self, start: u64, state: SourceStateResponse) -> bool {
+        if state.source_time_ms < start {
+            return false;
+        }
+        let wallet = state.candidate_id.clone();
+        self.ranges.insert(
+            wallet.clone(),
+            VecDeque::from([(start.saturating_sub(1), state.source_time_ms)]),
+        );
+        self.fill_counts.insert(wallet.clone(), 0);
+        self.snapshots.insert(wallet, state);
+        true
+    }
+
+    fn next_range(&self, wallet: &str) -> Option<(u64, u64)> {
+        self.ranges.get(wallet)?.front().copied()
+    }
+
+    fn record_range(
+        &mut self,
+        range: &mut SourceFillRangeResponse,
+    ) -> Result<FillRangeProgress, &'static str> {
+        let ranges = self
+            .ranges
+            .get_mut(&range.wallet)
+            .ok_or("source-fill result has no pending range")?;
+        if ranges.front().copied() != Some((range.start_time_ms, range.end_time_ms)) {
+            return Err("source-fill result does not match pending range");
+        }
+        let total = self.fill_counts.entry(range.wallet.clone()).or_default();
+        if range.raw_count == 2_000 {
+            if range.start_time_ms == range.end_time_ms
+                || total.saturating_add(range.raw_count) >= 10_000
+            {
+                return Ok(FillRangeProgress::Restart);
+            }
+            ranges.pop_front();
+            let midpoint = range.start_time_ms + (range.end_time_ms - range.start_time_ms) / 2;
+            ranges.push_front((midpoint + 1, range.end_time_ms));
+            ranges.push_front((range.start_time_ms, midpoint));
+            return Ok(FillRangeProgress::Next);
+        }
+        ranges.pop_front();
+        if self.fills.len().saturating_add(range.fills.len()) > MAX_RECOVERED_SOURCE_FILLS {
+            return Ok(FillRangeProgress::Restart);
+        }
+        *total = total.saturating_add(range.raw_count);
+        self.fills.append(&mut range.fills);
+        if *total >= 10_000 {
+            Ok(FillRangeProgress::Restart)
+        } else if ranges.is_empty() {
+            Ok(FillRangeProgress::WalletComplete)
+        } else {
+            Ok(FillRangeProgress::Next)
+        }
+    }
+
+    fn cutoff(&self) -> Option<u64> {
+        self.snapshots
+            .values()
+            .map(|state| state.source_time_ms)
+            .min()
+    }
+}
 
 fn select_hot_books(
     urgent: &BTreeSet<String>,
@@ -813,6 +898,16 @@ async fn run_qualification_impl<const CONTINUOUS: bool>(
     } else {
         BTreeSet::new()
     };
+    let mut history_recovery =
+        (streaming_enabled && restored_state && engine.history_complete_through_ms().is_some())
+            .then(HistoryRecovery::default);
+    let mut bootstrap_history_cutoff = None::<u64>;
+    if history_recovery.is_some() {
+        streaming_sources
+            .as_mut()
+            .ok_or("streaming source book unavailable")?
+            .begin_recovery();
+    }
     let mut next_reconciliation_due = start
         .checked_add(transport_policy.streaming.reconciliation_interval_ms)
         .ok_or("streaming reconciliation deadline overflow")?;
@@ -970,7 +1065,8 @@ async fn run_qualification_impl<const CONTINUOUS: bool>(
             &config,
             source_dispatch_plan,
             now,
-            tasks.is_empty()
+            stream_connected
+                && tasks.is_empty()
                 && scheduler_health.pending == 0
                 && scheduler_health.successors == 0
                 && scheduler_health.in_flight == 0,
@@ -980,21 +1076,42 @@ async fn run_qualification_impl<const CONTINUOUS: bool>(
         )?;
         for candidate in &config.candidates {
             let id = candidate.address.to_ascii_lowercase();
-            if source_due[&id] <= now && (!streaming_enabled || market_directory.is_some()) {
+            if source_due[&id] <= now
+                && (!streaming_enabled || market_directory.is_some())
+                && (history_recovery.is_none() || stream_connected)
+            {
                 let tier = candidate_tiers[&id];
                 let interval = match tier {
                     SourceTier::Active => source_dispatch_plan.active_cadence_ms,
                     SourceTier::Inactive => source_dispatch_plan.inactive_cadence_ms,
                 };
-                let source_kind = if streaming_enabled || expanded_source_candidates.contains(&id) {
-                    ReadRequestKind::ExpandedSourceState
-                } else {
-                    ReadRequestKind::SourceState
-                };
+                let recovery_range = history_recovery
+                    .as_ref()
+                    .and_then(|recovery| recovery.next_range(&id));
+                let (source_subject, source_kind) =
+                    if let Some((start_time_ms, end_time_ms)) = recovery_range {
+                        (
+                            RequestSubject::CandidateFillRange {
+                                candidate: id.clone(),
+                                start_time_ms,
+                                end_time_ms,
+                            },
+                            ReadRequestKind::SourceFills,
+                        )
+                    } else {
+                        (
+                            RequestSubject::Candidate(id.clone()),
+                            if streaming_enabled || expanded_source_candidates.contains(&id) {
+                                ReadRequestKind::ExpandedSourceState
+                            } else {
+                                ReadRequestKind::SourceState
+                            },
+                        )
+                    };
                 enqueue(
                     &scheduler,
                     &scheduler_config,
-                    RequestSubject::Candidate(id.clone()),
+                    source_subject,
                     source_kind,
                     // Source cadence is the qualification invariant. Public order-book
                     // enrichment may use only the normal-budget capacity left after it.
@@ -1203,6 +1320,11 @@ async fn run_qualification_impl<const CONTINUOUS: bool>(
                     counters.transport_latency_ms_by_kind.entry(kind).or_default(),
                     clock.now_ms().saturating_sub(started_at),
                 );
+                if let Ok(response) = &result {
+                    counters.total_weight = counters.total_weight.saturating_sub(
+                        u64::from(completed_request.weight.saturating_sub(response.actual_weight)),
+                    );
+                }
                 let outcome = scheduler.finish(dispatch, result);
                 append_freshness_decision(
                     &mut evidence,
@@ -1226,17 +1348,52 @@ async fn run_qualification_impl<const CONTINUOUS: bool>(
                     if let Some(mut response) = transport.take_accepted(&completed_request) {
                         let mut completes_stream_reconciliation = false;
                         let mut completes_coverage_reconciliation = false;
+                        let mut stream_history_cutoff = None;
+                        let mut ingest_response = true;
+                        let mut recovered_states = None;
                         if streaming_enabled {
                             match &mut response.payload {
                                 crate::public_mainnet::PublicPayload::SourceState(state) => {
-                                    let installed = streaming_sources
-                                        .as_mut()
-                                        .ok_or("streaming source book unavailable")?
-                                        .install_baseline(state.clone())
-                                        .map_err(|error| format!("source baseline: {error:?}"))?;
-                                    *state = installed;
-                                    if response.requested_at_mono > reconciliation_started_at {
-                                        reconciliation_remaining.remove(&state.candidate_id);
+                                    bootstrap_history_cutoff = Some(
+                                        bootstrap_history_cutoff.map_or(
+                                            state.source_time_ms,
+                                            |cutoff| cutoff.min(state.source_time_ms),
+                                        ),
+                                    );
+                                    if reconciliation_epoch_active && history_recovery.is_some() {
+                                        ingest_response = false;
+                                        let history_start = engine
+                                            .history_complete_through_ms()
+                                            .ok_or("history recovery has no durable watermark")?;
+                                        if response.requested_at_mono <= reconciliation_started_at
+                                            || !history_recovery
+                                                .as_mut()
+                                                .ok_or("history recovery unavailable")?
+                                                .record_snapshot(history_start, state.clone())
+                                        {
+                                            source_due.insert(
+                                                state.candidate_id.clone(),
+                                                clock.now_ms().checked_add(
+                                                    scheduler_config.retry.maximum_backoff_ms,
+                                                ).ok_or("source history retry overflow")?,
+                                            );
+                                        } else {
+                                            source_due.insert(
+                                                state.candidate_id.clone(),
+                                                clock.now_ms().checked_add(1)
+                                                    .ok_or("source-fill recovery due overflow")?,
+                                            );
+                                        }
+                                    } else {
+                                        let installed = streaming_sources
+                                            .as_mut()
+                                            .ok_or("streaming source book unavailable")?
+                                            .install_baseline(state.clone())
+                                            .map_err(|error| format!("source baseline: {error:?}"))?;
+                                        *state = installed;
+                                        if response.requested_at_mono > reconciliation_started_at {
+                                            reconciliation_remaining.remove(&state.candidate_id);
+                                        }
                                     }
                                     if coverage_gap_started_at.is_some_and(|gap_started_at| {
                                         response.requested_at_mono > gap_started_at
@@ -1250,12 +1407,86 @@ async fn run_qualification_impl<const CONTINUOUS: bool>(
                                     {
                                         reconciliation_epoch_active = false;
                                         completes_stream_reconciliation = true;
+                                        stream_history_cutoff = bootstrap_history_cutoff;
                                     }
                                     if stream_connected
                                         && !coverage_pending_markets.is_empty()
                                         && coverage_reconciliation_remaining.is_empty()
                                     {
                                         completes_coverage_reconciliation = true;
+                                    }
+                                }
+                                crate::public_mainnet::PublicPayload::SourceFills(range) => {
+                                    ingest_response = false;
+                                    let wallet = range.wallet.clone();
+                                    let progress = history_recovery
+                                        .as_mut()
+                                        .ok_or("source fills arrived outside history recovery")?
+                                        .record_range(range)?;
+                                    match progress {
+                                        FillRangeProgress::Next => {
+                                            source_due.insert(
+                                                wallet,
+                                                clock.now_ms().checked_add(1)
+                                                    .ok_or("next fill-range due overflow")?,
+                                            );
+                                        }
+                                        FillRangeProgress::WalletComplete => {
+                                            reconciliation_remaining.remove(&wallet);
+                                        }
+                                        FillRangeProgress::Restart => restart_history_recovery(
+                                            &mut history_recovery,
+                                            &config,
+                                            source_dispatch_plan,
+                                            clock.now_ms().checked_add(
+                                                scheduler_config.retry.maximum_backoff_ms,
+                                            ).ok_or("history recovery retry overflow")?,
+                                            &mut reconciliation_remaining,
+                                            &mut source_due,
+                                        )?,
+                                    }
+                                    if progress != FillRangeProgress::Restart
+                                        && stream_connected
+                                        && reconciliation_remaining.is_empty()
+                                    {
+                                        let history_start = engine
+                                            .history_complete_through_ms()
+                                            .ok_or("history recovery has no durable watermark")?;
+                                        let cutoff = history_recovery
+                                            .as_ref()
+                                            .ok_or("history recovery unavailable")?
+                                            .cutoff()
+                                            .ok_or("history recovery has no ending snapshots")?;
+                                        let recovery = history_recovery
+                                            .as_ref()
+                                            .ok_or("history recovery unavailable")?;
+                                        match streaming_sources
+                                            .as_mut()
+                                            .ok_or("streaming source book unavailable")?
+                                            .recover_and_install(
+                                                history_start,
+                                                recovery.snapshots.clone(),
+                                                recovery.fills.clone(),
+                                            )
+                                        {
+                                            Ok(states) => {
+                                                recovered_states = Some(states);
+                                                history_recovery = None;
+                                                reconciliation_epoch_active = false;
+                                                completes_stream_reconciliation = true;
+                                                stream_history_cutoff = Some(cutoff);
+                                            }
+                                            Err(_) => restart_history_recovery(
+                                                &mut history_recovery,
+                                                &config,
+                                                source_dispatch_plan,
+                                                clock.now_ms().checked_add(
+                                                    scheduler_config.retry.maximum_backoff_ms,
+                                                ).ok_or("history reconciliation retry overflow")?,
+                                                &mut reconciliation_remaining,
+                                                &mut source_due,
+                                            )?,
+                                        }
                                     }
                                 }
                                 crate::public_mainnet::PublicPayload::MarketMetadata(metadata) => {
@@ -1307,11 +1538,37 @@ async fn run_qualification_impl<const CONTINUOUS: bool>(
                             )?;
                         }
                         let executions_before = engine.metrics().shadow_executions;
-                        engine.ingest(response, accepted_at).map_err(|e| e.to_string())?;
+                        if ingest_response {
+                            engine.ingest(response, accepted_at).map_err(|e| e.to_string())?;
+                        }
+                        if let Some(states) = recovered_states {
+                            for state in states {
+                                let subject = state.candidate_id.clone();
+                                let tier = candidate_tiers
+                                    .get(&subject)
+                                    .copied()
+                                    .unwrap_or(SourceTier::Inactive);
+                                engine
+                                    .ingest(
+                                        accepted_stream_response(
+                                            crate::public_mainnet::PublicPayload::SourceState(state),
+                                            subject,
+                                            ReadRequestKind::ExpandedSourceState,
+                                            Some(tier),
+                                            accepted_at,
+                                            config.global_risk.source_snapshot_max_age_ms,
+                                        )?,
+                                        accepted_at,
+                                    )
+                                    .map_err(|error| error.to_string())?;
+                            }
+                        }
                         if completes_stream_reconciliation {
                             engine
                                 .complete_source_stream_reconciliation(
                                     subscribed_trade_markets.clone(),
+                                    stream_history_cutoff
+                                        .ok_or("stream reconciliation has no history cutoff")?,
                                     accepted_at,
                                 )
                                 .map_err(|e| e.to_string())?;
@@ -1379,10 +1636,38 @@ async fn run_qualification_impl<const CONTINUOUS: bool>(
             }, if streaming_enabled => {
                 let event = stream_event.ok_or("public streaming task stopped")?;
                 let observed_at = clock.now_ms();
+                if engine.source_stream_healthy()
+                    && matches!(
+                        &event,
+                        StreamingEvent::Trades(_)
+                            | StreamingEvent::AssetContexts(_)
+                            | StreamingEvent::OrderBook(_)
+                    )
+                {
+                    let wall_now = u64::try_from(
+                        SystemTime::now().duration_since(UNIX_EPOCH)?.as_millis(),
+                    )?;
+                    engine.note_continuous_source_history(
+                        wall_now.saturating_sub(transport_policy.streaming.idle_timeout_ms),
+                    );
+                }
                 match event {
                     StreamingEvent::Connected { .. } => {
                         stream_connected = true;
                         if reconciliation_epoch_active
+                            && reconciliation_remaining.iter().all(|wallet| {
+                                source_due.get(wallet).is_some_and(|due| *due == u64::MAX)
+                            })
+                        {
+                            source_due = phase_staggered_source_due(
+                                &config,
+                                observed_at.checked_add(1)
+                                    .ok_or("stream recovery start overflow")?,
+                                source_dispatch_plan,
+                            )?;
+                        }
+                        if reconciliation_epoch_active
+                            && history_recovery.is_none()
                             && reconciliation_remaining.is_empty()
                             && streaming_sources
                                 .as_ref()
@@ -1392,6 +1677,8 @@ async fn run_qualification_impl<const CONTINUOUS: bool>(
                             engine
                                 .complete_source_stream_reconciliation(
                                     subscribed_trade_markets.clone(),
+                                    bootstrap_history_cutoff
+                                        .ok_or("stream bootstrap has no history cutoff")?,
                                     observed_at,
                                 )
                                 .map_err(|e| e.to_string())?;
@@ -1410,6 +1697,15 @@ async fn run_qualification_impl<const CONTINUOUS: bool>(
                         stream_connected = false;
                         reconciliation_epoch_active = true;
                         reconciliation_started_at = observed_at;
+                        history_recovery = engine
+                            .history_complete_through_ms()
+                            .map(|_| HistoryRecovery::default());
+                        if history_recovery.is_some() {
+                            streaming_sources
+                                .as_mut()
+                                .ok_or("streaming source book unavailable")?
+                                .begin_recovery();
+                        }
                         let affected_markets = if affected_markets.is_empty() {
                             subscribed_trade_markets.clone()
                         } else {
@@ -1428,13 +1724,7 @@ async fn run_qualification_impl<const CONTINUOUS: bool>(
                             .iter()
                             .map(|candidate| candidate.address.to_ascii_lowercase())
                             .collect();
-                        source_due = phase_staggered_source_due(
-                            &config,
-                            observed_at
-                                .checked_add(1)
-                                .ok_or("stream-gap reconciliation start overflow")?,
-                            source_dispatch_plan,
-                        )?;
+                        source_due.values_mut().for_each(|due| *due = u64::MAX);
                     }
                     StreamingEvent::Trades(trades) => {
                         let executions_before = engine.metrics().shadow_executions;
@@ -2784,6 +3074,24 @@ fn phase_staggered_source_due(
         .collect()
 }
 
+fn restart_history_recovery(
+    recovery: &mut Option<HistoryRecovery>,
+    config: &CopyTradeConfig,
+    plan: SourceDispatchPlan,
+    start: Timestamp,
+    remaining: &mut BTreeSet<String>,
+    source_due: &mut BTreeMap<String, Timestamp>,
+) -> Result<(), Box<dyn Error>> {
+    *recovery = Some(HistoryRecovery::default());
+    *remaining = config
+        .candidates
+        .iter()
+        .map(|candidate| candidate.address.to_ascii_lowercase())
+        .collect();
+    *source_due = phase_staggered_source_due(config, start, plan)?;
+    Ok(())
+}
+
 fn reconciliation_pending_count(
     stream_reconciliation: &BTreeSet<String>,
     coverage_reconciliation: &BTreeSet<String>,
@@ -2800,10 +3108,12 @@ fn rearm_unresolved_source_request(
     coverage_reconciliation: &BTreeSet<String>,
     source_due: &mut BTreeMap<String, Timestamp>,
 ) -> Result<bool, Box<dyn Error>> {
-    if !request.kind.is_source_state()
+    if !request.kind.uses_source_polling_budget()
         || matches!(
             outcome,
-            ExecutionOutcome::RetryScheduled | ExecutionOutcome::Superseded
+            ExecutionOutcome::CompletedFresh
+                | ExecutionOutcome::RetryScheduled
+                | ExecutionOutcome::Superseded
         )
     {
         return Ok(false);
@@ -3066,7 +3376,7 @@ fn enqueue<C: Clock>(
     let request = config.api.request(
         RequestKey { subject, kind },
         priority,
-        if kind.is_source_state() {
+        if kind.uses_source_polling_budget() {
             BudgetClass::SourcePolling
         } else {
             BudgetClass::Normal
@@ -3514,6 +3824,45 @@ mod tests {
         (0..count)
             .map(|index| format!("{prefix}{index:03}"))
             .collect()
+    }
+
+    #[test]
+    fn history_recovery_splits_saturated_ranges_before_wallet_completion() {
+        let wallet = "0x1111111111111111111111111111111111111111".to_string();
+        let mut recovery = HistoryRecovery::default();
+        assert!(recovery.record_snapshot(
+            100,
+            SourceStateResponse {
+                candidate_id: wallet.clone(),
+                account_value: Decimal::ONE,
+                source_time_ms: 200,
+                positions: BTreeMap::new(),
+                closed_candles: Vec::new(),
+            },
+        ));
+        let mut range = SourceFillRangeResponse {
+            wallet: wallet.clone(),
+            start_time_ms: 99,
+            end_time_ms: 200,
+            raw_count: 2_000,
+            fills: Vec::new(),
+        };
+        assert!(matches!(
+            recovery.record_range(&mut range).unwrap(),
+            FillRangeProgress::Next
+        ));
+        for expected in [FillRangeProgress::Next, FillRangeProgress::WalletComplete] {
+            let (start_time_ms, end_time_ms) = recovery.next_range(&wallet).unwrap();
+            let mut leaf = SourceFillRangeResponse {
+                wallet: wallet.clone(),
+                start_time_ms,
+                end_time_ms,
+                raw_count: 0,
+                fills: Vec::new(),
+            };
+            assert!(recovery.record_range(&mut leaf).unwrap() == expected);
+        }
+        assert_eq!(recovery.cutoff(), Some(200));
     }
 
     #[test]

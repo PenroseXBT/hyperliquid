@@ -13,6 +13,7 @@
     "endpoint_weights": {
       "source_state": 2,
       "expanded_source_state": 42,
+      "source_fills": 120,
       "market_mids": 2,
       "exchange_metadata": 60,
       "order_book": 2,

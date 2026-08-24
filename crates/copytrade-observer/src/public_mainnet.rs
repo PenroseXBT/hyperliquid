@@ -2,7 +2,7 @@ use crate::ingestion::{
     CandidateAuditSnapshot, CandidateAuditState, DecodeStage, IngestionFailure,
     IngestionFailureClassification,
 };
-use crate::streaming::StreamingPolicy;
+use crate::streaming::{valid_market, StreamingPolicy};
 use copytrade_core::decision::hash_payload_bytes;
 use copytrade_core::scheduler::{
     Clock, ReadFailure, ReadOnlyDataSource, ReadRequestKind, ReadResponse, RequestSubject,
@@ -115,6 +115,26 @@ pub struct SourceStateResponse {
     pub closed_candles: Vec<ClosedCandle>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SourceFill {
+    pub wallet: String,
+    pub coin: String,
+    pub price: Decimal,
+    pub signed_size: Decimal,
+    pub time_ms: u64,
+    pub trade_id: u64,
+    pub hash: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SourceFillRangeResponse {
+    pub wallet: String,
+    pub start_time_ms: u64,
+    pub end_time_ms: u64,
+    pub raw_count: usize,
+    pub fills: Vec<SourceFill>,
+}
+
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct ClearinghouseStateWire {
@@ -144,6 +164,17 @@ struct PositionWire {
     entry_px: Option<String>,
     #[serde(default)]
     unrealized_pnl: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct SourceFillWire {
+    coin: String,
+    px: Decimal,
+    sz: Decimal,
+    side: String,
+    time: u64,
+    tid: u64,
+    hash: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -200,6 +231,7 @@ pub struct CandleResponse {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum PublicPayload {
     SourceState(SourceStateResponse),
+    SourceFills(SourceFillRangeResponse),
     MarketSnapshot(MarketSnapshotResponse),
     MarketMetadata(MarketMetadataResponse),
     OrderBook(OrderBookResponse),
@@ -358,6 +390,7 @@ impl<C: Clock> HyperliquidPublicTransport<C> {
             RequestSubject::Candidate(value)
             | RequestSubject::Follower(value)
             | RequestSubject::Asset(value) => value.as_str(),
+            RequestSubject::CandidateFillRange { candidate, .. } => candidate.as_str(),
             RequestSubject::Market => "market",
         };
         let mut accepted = self
@@ -729,17 +762,17 @@ impl<C: Clock> HyperliquidPublicTransport<C> {
             let hash = hash_payload_bytes(&bytes);
             self.with_candidate_audit(request, &subject, |audit| audit.record_payload(hash));
         }
-        let mut payload =
-            self.parse_payload(request.kind, &subject, &bytes)
-                .map_err(|failure| {
-                    self.metrics
-                        .invalid_responses
-                        .fetch_add(1, Ordering::SeqCst);
-                    if request.kind.is_source_state() {
-                        self.record_candidate_failure(request, &subject, failure);
-                    }
-                    ReadFailure::InvalidResponse
-                })?;
+        let mut payload = self
+            .parse_payload(request, &subject, &bytes)
+            .map_err(|failure| {
+                self.metrics
+                    .invalid_responses
+                    .fetch_add(1, Ordering::SeqCst);
+                if request.kind.is_source_state() {
+                    self.record_candidate_failure(request, &subject, failure);
+                }
+                ReadFailure::InvalidResponse
+            })?;
         match &mut payload {
             PublicPayload::SourceState(state)
                 if request.kind == ReadRequestKind::ExpandedSourceState && expanded_source =>
@@ -882,11 +915,11 @@ impl<C: Clock> HyperliquidPublicTransport<C> {
 
     fn parse_payload(
         &self,
-        kind: ReadRequestKind,
+        request: &ScheduledReadRequest,
         subject: &str,
         bytes: &[u8],
     ) -> Result<PublicPayload, IngestionFailure> {
-        match kind {
+        match request.kind {
             ReadRequestKind::SourceState | ReadRequestKind::ExpandedSourceState => {
                 let assets = self
                     .market_assets
@@ -895,6 +928,28 @@ impl<C: Clock> HyperliquidPublicTransport<C> {
                     .clone();
                 parse_source_state_with_metadata(subject, bytes, &assets)
                     .map(PublicPayload::SourceState)
+            }
+            ReadRequestKind::SourceFills => {
+                let RequestSubject::CandidateFillRange {
+                    candidate,
+                    start_time_ms,
+                    end_time_ms,
+                } = &request.key.subject
+                else {
+                    return Err(IngestionFailure::new(
+                        IngestionFailureClassification::OtherExplicitDecodeFailure,
+                        DecodeStage::NotAttempted,
+                        "source-fill request subject is not a range",
+                    ));
+                };
+                let assets = self
+                    .market_assets
+                    .lock()
+                    .expect("market asset mutex poisoned")
+                    .clone();
+                parse_source_fills(candidate, *start_time_ms, *end_time_ms, bytes, &assets)
+                    .map_err(generic_decode_failure)
+                    .map(PublicPayload::SourceFills)
             }
             ReadRequestKind::MarketMids => parse_mids(bytes)
                 .map(PublicPayload::MarketSnapshot)
@@ -1087,10 +1142,18 @@ impl<C: Clock> ReadOnlyDataSource for HyperliquidPublicTransport<C> {
     ) -> Pin<Box<dyn Future<Output = Result<ReadResponse, ReadFailure>> + Send + '_>> {
         Box::pin(async move {
             let accepted = self.perform(&request).await?;
+            let actual_weight = match &accepted.payload {
+                PublicPayload::SourceFills(range) => {
+                    20 + u32::try_from(range.raw_count / 20)
+                        .map_err(|_| ReadFailure::InvalidResponse)?
+                }
+                _ => request.weight,
+            };
             let response = ReadResponse {
                 received_at: accepted.received_at_mono,
                 valid_until: accepted.valid_until_mono.min(request.expires_at),
                 payload_valid: true,
+                actual_weight,
             };
             self.accepted
                 .lock()
@@ -1125,6 +1188,23 @@ fn modeled_body(request: &ScheduledReadRequest) -> Result<(String, Value), ReadF
         ) => Ok((
             candidate.clone(),
             json!({"type":"clearinghouseState","user":candidate}),
+        )),
+        (
+            ReadRequestKind::SourceFills,
+            RequestSubject::CandidateFillRange {
+                candidate,
+                start_time_ms,
+                end_time_ms,
+            },
+        ) if start_time_ms <= end_time_ms => Ok((
+            candidate.clone(),
+            json!({
+                "type":"userFillsByTime",
+                "user":candidate,
+                "startTime":start_time_ms,
+                "endTime":end_time_ms,
+                "aggregateByTime":false
+            }),
         )),
         (ReadRequestKind::MarketMids, RequestSubject::Market) => {
             Ok(("market".to_string(), json!({"type":"allMids"})))
@@ -1163,6 +1243,74 @@ fn parse_source_state(
     bytes: &[u8],
 ) -> Result<SourceStateResponse, IngestionFailure> {
     parse_source_state_with_metadata(candidate, bytes, &BTreeSet::new())
+}
+
+fn parse_source_fills(
+    candidate: &str,
+    start_time_ms: u64,
+    end_time_ms: u64,
+    bytes: &[u8],
+    market_assets: &BTreeSet<String>,
+) -> Result<SourceFillRangeResponse, PublicReadError> {
+    validate_candidate_address(candidate).map_err(|_| PublicReadError::InvalidSubject)?;
+    if start_time_ms > end_time_ms {
+        return Err(PublicReadError::InvalidPayload);
+    }
+    let rows = serde_json::from_slice::<Vec<SourceFillWire>>(bytes)
+        .map_err(|_| PublicReadError::InvalidPayload)?;
+    if rows.len() > 2_000 {
+        return Err(PublicReadError::InvalidPayload);
+    }
+    let raw_count = rows.len();
+    let wallet = candidate.to_ascii_lowercase();
+    let mut fills = rows
+        .into_iter()
+        .filter_map(|row| {
+            if !market_assets.contains(&row.coin) {
+                return None;
+            }
+            Some((|| {
+                if row.time < start_time_ms || row.time > end_time_ms || !valid_market(&row.coin) {
+                    return Err(PublicReadError::InvalidPayload);
+                }
+                let price = row.px;
+                let size = row.sz;
+                if price <= Decimal::ZERO || size <= Decimal::ZERO {
+                    return Err(PublicReadError::InvalidPayload);
+                }
+                let signed_size = match row.side.as_str() {
+                    "B" => size,
+                    "A" => -size,
+                    _ => return Err(PublicReadError::InvalidPayload),
+                };
+                Ok(SourceFill {
+                    wallet: wallet.clone(),
+                    coin: row.coin,
+                    price,
+                    signed_size,
+                    time_ms: row.time,
+                    trade_id: row.tid,
+                    hash: row.hash,
+                })
+            })())
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    fills.sort_by(|left, right| {
+        (left.time_ms, left.trade_id, &left.hash, &left.coin).cmp(&(
+            right.time_ms,
+            right.trade_id,
+            &right.hash,
+            &right.coin,
+        ))
+    });
+    fills.dedup();
+    Ok(SourceFillRangeResponse {
+        wallet,
+        start_time_ms,
+        end_time_ms,
+        raw_count,
+        fills,
+    })
 }
 
 fn parse_source_state_with_metadata(
@@ -1781,6 +1929,40 @@ mod tests {
             validate_endpoint(&Url::parse("https://api.hyperliquid.xyz/exchange").unwrap())
                 .is_err()
         );
+    }
+
+    #[test]
+    fn source_fill_range_preserves_exchange_identity_time_and_side() {
+        let wallet = "0x1111111111111111111111111111111111111111";
+        let fills = parse_source_fills(
+            wallet,
+            100,
+            200,
+            br#"[{"coin":"BTC","px":"101.5","sz":"2","side":"A","time":150,"tid":7,"hash":"0xabc"}]"#,
+            &BTreeSet::from(["BTC".into()]),
+        )
+        .unwrap();
+        assert_eq!(fills.raw_count, 1);
+        assert_eq!(fills.wallet, wallet);
+        assert_eq!(fills.fills[0].time_ms, 150);
+        assert_eq!(fills.fills[0].trade_id, 7);
+        assert_eq!(fills.fills[0].signed_size, Decimal::from(-2));
+    }
+
+    #[test]
+    fn source_fill_range_counts_but_omits_spot_rows() {
+        let wallet = "0x1111111111111111111111111111111111111111";
+        let fills = parse_source_fills(
+            wallet,
+            100,
+            200,
+            br#"[{"coin":"@335","px":"1","sz":"2","side":"B","time":125,"tid":6,"hash":"0xspot"},{"coin":"BTC","px":"101.5","sz":"2","side":"A","time":150,"tid":7,"hash":"0xperp"}]"#,
+            &BTreeSet::from(["BTC".into()]),
+        )
+        .unwrap();
+        assert_eq!(fills.raw_count, 2);
+        assert_eq!(fills.fills.len(), 1);
+        assert_eq!(fills.fills[0].coin, "BTC");
     }
 
     #[test]

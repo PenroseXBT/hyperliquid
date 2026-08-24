@@ -1631,6 +1631,7 @@ pub struct LiveShadowEngine {
     source_stream_mode: bool,
     source_stream_healthy: bool,
     source_market_coverage: BTreeSet<String>,
+    history_complete_through_ms: Option<u64>,
     mids: Option<(MarketSnapshotResponse, Timestamp)>,
     metadata: Option<MarketMetadataResponse>,
     metadata_received_at: Option<Timestamp>,
@@ -1695,7 +1696,7 @@ pub(crate) struct LiveExecutionCheckpoint {
     ledger_time_high_watermark: Timestamp,
 }
 
-pub const UNSIGNED_SNAPSHOT_SCHEMA_VERSION: u32 = 11;
+pub const UNSIGNED_SNAPSHOT_SCHEMA_VERSION: u32 = 12;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -1725,6 +1726,7 @@ pub struct UnsignedObserverState {
     #[serde(default)]
     applied_live_funding: BTreeSet<FundingEventId>,
     last_mids: Option<MarketSnapshotResponse>,
+    history_complete_through_ms: Option<u64>,
     mfce: MfcePersistentState,
     mfce_time_high_watermark: Timestamp,
     ledger_time_high_watermark: Timestamp,
@@ -1868,6 +1870,7 @@ impl LiveShadowEngine {
             source_stream_mode: false,
             source_stream_healthy: false,
             source_market_coverage: BTreeSet::new(),
+            history_complete_through_ms: None,
             mids: None,
             metadata: None,
             metadata_received_at: None,
@@ -2570,6 +2573,10 @@ impl LiveShadowEngine {
                     self.construct_next_decision(response.received_at_mono)?;
                 }
             }
+            // HD1 range recovery is applied by StreamingSourceBook before an
+            // authoritative ending snapshot is admitted here. Historical
+            // fills never enter the actionable decision path directly.
+            PublicPayload::SourceFills(_) => {}
             PublicPayload::MarketSnapshot(mids) => {
                 self.mids = Some((mids, response.received_at_mono))
             }
@@ -2698,6 +2705,7 @@ impl LiveShadowEngine {
     pub fn complete_source_stream_reconciliation(
         &mut self,
         covered_markets: BTreeSet<String>,
+        history_complete_through_ms: u64,
         now: Timestamp,
     ) -> Result<(), LiveShadowError> {
         if !self.source_stream_mode {
@@ -2714,10 +2722,19 @@ impl LiveShadowEngine {
                 "source stream reconciliation completed before every baseline".into(),
             ));
         }
+        if self
+            .history_complete_through_ms
+            .is_some_and(|current| history_complete_through_ms < current)
+        {
+            return Err(LiveShadowError::Core(
+                "source history completeness watermark regressed".into(),
+            ));
+        }
         // Stream health and explicit market coverage, rather than the age of
         // an inactive wallet's last fill/baseline, authorize source
         // transitions after reconciliation.
         self.source_market_coverage = covered_markets;
+        self.history_complete_through_ms = Some(history_complete_through_ms);
         let valid_until = Timestamp::MAX;
         let mut assets = self.mfce.tracked_assets().cloned().collect::<BTreeSet<_>>();
         for candidate in &self.config.candidates {
@@ -2800,9 +2817,19 @@ impl LiveShadowEngine {
         !self.source_stream_mode || self.source_stream_healthy
     }
 
-    #[cfg(test)]
-    fn set_source_stream_healthy_for_test(&mut self, healthy: bool) {
-        self.source_stream_healthy = healthy;
+    pub fn history_complete_through_ms(&self) -> Option<u64> {
+        self.history_complete_through_ms
+    }
+
+    pub fn note_continuous_source_history(&mut self, complete_through_ms: u64) {
+        if self.source_stream_mode && self.source_stream_healthy {
+            self.history_complete_through_ms = Some(
+                self.history_complete_through_ms
+                    .map_or(complete_through_ms, |current| {
+                        current.max(complete_through_ms)
+                    }),
+            );
+        }
     }
 
     fn fresh_source(
@@ -5125,6 +5152,7 @@ impl LiveShadowEngine {
             accrued_funding: self.accrued_funding.clone(),
             applied_live_funding: self.applied_live_funding.clone(),
             last_mids: self.mids.as_ref().map(|(mids, _)| mids.clone()),
+            history_complete_through_ms: self.history_complete_through_ms,
             mfce: self.mfce.state().clone(),
             mfce_time_high_watermark: self.mfce_time_high_watermark,
             ledger_time_high_watermark: self.ledger_time_high_watermark,
@@ -5245,6 +5273,7 @@ impl LiveShadowEngine {
         self.accrued_funding = state.accrued_funding;
         self.applied_live_funding = state.applied_live_funding;
         self.mids = state.last_mids.map(|mids| (mids, 0));
+        self.history_complete_through_ms = state.history_complete_through_ms;
         self.restore_mfce_persistent_state(state.mfce, state.mfce_time_high_watermark)?;
         self.ledger_time_high_watermark = state.ledger_time_high_watermark;
         self.executions = state.executions;
@@ -6438,7 +6467,8 @@ mod tests {
     #[test]
     fn stream_continuity_replaces_wallet_age_and_gaps_fail_closed() {
         let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
-        let config = CopyTradeConfig::from_path(root.join("config/copytrade.json")).unwrap();
+        let mut config = CopyTradeConfig::from_path(root.join("config/copytrade.json")).unwrap();
+        config.candidates.truncate(1);
         let candidate = config.candidates[0].address.to_ascii_lowercase();
         let mut engine =
             LiveShadowEngine::new(config, b"stream-freshness", "run", 40_000, 80_000).unwrap();
@@ -6466,9 +6496,17 @@ mod tests {
             .unwrap();
 
         assert_eq!(engine.active_source_count(1), 0);
-        engine.set_source_stream_healthy_for_test(true);
+        engine
+            .complete_source_stream_reconciliation(BTreeSet::from(["BTC".into()]), 100, 2)
+            .unwrap();
         assert!(engine.source_is_fresh(&candidate, 10_000_000));
-        engine.set_source_stream_healthy_for_test(false);
+        engine.note_continuous_source_history(110);
+        assert_eq!(engine.history_complete_through_ms(), Some(110));
+        engine
+            .mark_source_stream_gap(&BTreeSet::from(["BTC".into()]), 3)
+            .unwrap();
+        engine.note_continuous_source_history(120);
+        assert_eq!(engine.history_complete_through_ms(), Some(110));
         assert!(!engine.source_is_fresh(&candidate, 2));
     }
 
@@ -6591,7 +6629,7 @@ mod tests {
             )
             .unwrap();
         engine
-            .complete_source_stream_reconciliation(BTreeSet::from(["BTC".into()]), 1_003)
+            .complete_source_stream_reconciliation(BTreeSet::from(["BTC".into()]), 1_003, 1_003)
             .unwrap();
 
         assert_eq!(
@@ -6717,7 +6755,7 @@ mod tests {
             .unwrap();
 
         engine
-            .complete_source_stream_reconciliation(BTreeSet::new(), 1_001)
+            .complete_source_stream_reconciliation(BTreeSet::new(), 1_001, 1_001)
             .unwrap();
         assert_eq!(engine.source_market_coverage_count(), 0);
         assert_eq!(engine.mfce_report().observed_transitions, 0);
@@ -6819,6 +6857,7 @@ mod tests {
         engine
             .complete_source_stream_reconciliation(
                 BTreeSet::from(["BTC".into(), "ETH".into()]),
+                1_001,
                 1_001,
             )
             .unwrap();

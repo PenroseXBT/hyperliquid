@@ -19,6 +19,7 @@ pub type CandidateId = String;
 pub enum ReadRequestKind {
     SourceState,
     ExpandedSourceState,
+    SourceFills,
     MarketMids,
     ExchangeMetadata,
     OrderBook,
@@ -27,9 +28,10 @@ pub enum ReadRequestKind {
 }
 
 impl ReadRequestKind {
-    pub const REQUIRED: [Self; 7] = [
+    pub const REQUIRED: [Self; 8] = [
         Self::SourceState,
         Self::ExpandedSourceState,
+        Self::SourceFills,
         Self::MarketMids,
         Self::ExchangeMetadata,
         Self::OrderBook,
@@ -43,6 +45,10 @@ impl ReadRequestKind {
 
     pub fn is_source_state(self) -> bool {
         matches!(self, Self::SourceState | Self::ExpandedSourceState)
+    }
+
+    pub fn uses_source_polling_budget(self) -> bool {
+        self.is_source_state() || self == Self::SourceFills
     }
 
     fn is_replaceable_refresh(self) -> bool {
@@ -62,6 +68,11 @@ impl ReadRequestKind {
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum RequestSubject {
     Candidate(CandidateId),
+    CandidateFillRange {
+        candidate: CandidateId,
+        start_time_ms: Timestamp,
+        end_time_ms: Timestamp,
+    },
     Follower(String),
     Asset(String),
     Market,
@@ -222,7 +233,7 @@ impl ReadApiPolicy {
                 key.kind
             )));
         }
-        if key.kind.is_source_state() != (budget_class == BudgetClass::SourcePolling) {
+        if key.kind.uses_source_polling_budget() != (budget_class == BudgetClass::SourcePolling) {
             return Err(PolicyError(
                 "source_state requires the source polling budget class".to_string(),
             ));
@@ -233,9 +244,10 @@ impl ReadApiPolicy {
             .ok_or_else(|| PolicyError(format!("missing endpoint weight for {:?}", key.kind)))?;
         let candidate_id = match &key.subject {
             RequestSubject::Candidate(candidate) => Some(candidate.clone()),
+            RequestSubject::CandidateFillRange { candidate, .. } => Some(candidate.clone()),
             RequestSubject::Follower(_) | RequestSubject::Asset(_) | RequestSubject::Market => None,
         };
-        if key.kind.is_source_state() != source_tier.is_some() {
+        if key.kind.uses_source_polling_budget() != source_tier.is_some() {
             return Err(PolicyError(
                 "source_state requires exactly one source tier".to_string(),
             ));
@@ -474,6 +486,42 @@ impl WeightedTokenBucket {
         token_weight.min(capacity_weight.saturating_sub(self.normal_consumed_in_window))
     }
 
+    fn refund(&mut self, class: BudgetClass, weight: u32, now_ms: Timestamp) {
+        self.refill(now_ms);
+        let units = u128::from(weight).saturating_mul(u128::from(self.window_ms));
+        self.total_units = self
+            .total_units
+            .saturating_add(units)
+            .min(self.total_capacity_units);
+        self.total_consumed_in_window = self.total_consumed_in_window.saturating_sub(weight);
+        if class != BudgetClass::Critical {
+            self.normal_units = self
+                .normal_units
+                .saturating_add(units)
+                .min(self.normal_capacity_units);
+            self.normal_consumed_in_window = self.normal_consumed_in_window.saturating_sub(weight);
+        }
+        match class {
+            BudgetClass::SourcePolling => {
+                self.source_units = self
+                    .source_units
+                    .saturating_add(units)
+                    .min(self.source_capacity_units);
+                self.source_consumed_in_window =
+                    self.source_consumed_in_window.saturating_sub(weight);
+            }
+            BudgetClass::Normal => {
+                self.enrichment_units = self
+                    .enrichment_units
+                    .saturating_add(units)
+                    .min(self.enrichment_capacity_units);
+                self.enrichment_consumed_in_window =
+                    self.enrichment_consumed_in_window.saturating_sub(weight);
+            }
+            BudgetClass::Critical => {}
+        }
+    }
+
     fn refill(&mut self, now_ms: Timestamp) {
         let elapsed = now_ms.saturating_sub(self.last_refill_ms);
         if elapsed == 0 {
@@ -601,6 +649,9 @@ pub struct ReadResponse {
     pub received_at: Timestamp,
     pub valid_until: Timestamp,
     pub payload_valid: bool,
+    /// Provider weight actually incurred after a response-sized endpoint was
+    /// decoded. Requests reserve their policy maximum before dispatch.
+    pub actual_weight: u32,
 }
 
 pub trait ReadOnlyDataSource: Send + Sync {
@@ -860,13 +911,30 @@ impl<C: Clock> RequestScheduler<C> {
         result: Result<ReadResponse, ReadFailure>,
     ) -> ExecutionOutcome {
         let request = dispatch.request.clone();
+        let actual_weight = result
+            .as_ref()
+            .ok()
+            .map_or(request.weight, |response| response.actual_weight);
+        let weight_valid = actual_weight > 0 && actual_weight <= request.weight;
+        if weight_valid && actual_weight < request.weight {
+            self.budget
+                .lock()
+                .expect("scheduler budget mutex poisoned")
+                .refund(
+                    request.budget_class,
+                    request.weight - actual_weight,
+                    self.clock.now_ms(),
+                );
+        }
         if dispatch.release() {
             return ExecutionOutcome::Superseded;
         }
         let now_ms = self.clock.now_ms();
         match result {
             Ok(response) => {
-                if response.payload_valid
+                if !weight_valid {
+                    ExecutionOutcome::InvalidResponse
+                } else if response.payload_valid
                     && response.received_at >= request.created_at
                     && response.received_at <= response.valid_until
                     && now_ms <= response.valid_until
@@ -930,16 +998,17 @@ impl<C: Clock> RequestScheduler<C> {
             || request.expires_at <= request.created_at
             || (request.budget_class == BudgetClass::Critical
                 && !request.kind.permits_reserved_budget())
-            || (request.kind.is_source_state()
+            || (request.kind.uses_source_polling_budget()
                 != (request.budget_class == BudgetClass::SourcePolling))
             || request.candidate_id
                 != match &request.key.subject {
                     RequestSubject::Candidate(candidate) => Some(candidate.clone()),
+                    RequestSubject::CandidateFillRange { candidate, .. } => Some(candidate.clone()),
                     RequestSubject::Follower(_)
                     | RequestSubject::Asset(_)
                     | RequestSubject::Market => None,
                 }
-            || request.kind.is_source_state() != request.source_tier.is_some()
+            || request.kind.uses_source_polling_budget() != request.source_tier.is_some()
         {
             return Some(ScheduleOutcome::RejectedInvalid);
         }
@@ -1405,6 +1474,33 @@ mod tests {
     }
 
     #[test]
+    fn response_sized_weight_refunds_only_the_unused_reservation() {
+        let mut policy = policy(900, 120, 1, 10);
+        policy
+            .endpoint_weights
+            .insert(ReadRequestKind::SourceState, 120);
+        let scheduler =
+            RequestScheduler::new(ManualClock::new(0), policy.clone(), retry_policy()).unwrap();
+        scheduler.schedule(request(&policy, 1, 0, 1_000));
+        let dispatch = scheduler.begin_next().unwrap();
+        assert_eq!(
+            scheduler.finish(
+                dispatch,
+                Ok(ReadResponse {
+                    received_at: 0,
+                    valid_until: 1_000,
+                    payload_valid: true,
+                    actual_weight: 20,
+                }),
+            ),
+            ExecutionOutcome::CompletedFresh
+        );
+        let health = scheduler.health();
+        assert_eq!(health.available_total_weight, 880);
+        assert_eq!(health.available_normal_weight, 760);
+    }
+
+    #[test]
     fn queue_deduplicates_supersedes_and_stays_bounded() {
         let policy = policy(1_200, 360, 2, 2);
         let clock = ManualClock::new(10);
@@ -1590,11 +1686,13 @@ mod tests {
                 received_at: 0,
                 valid_until: 1_000,
                 payload_valid: true,
+                actual_weight: 1,
             }),
             Ok(ReadResponse {
                 received_at: 0,
                 valid_until: 1_000,
                 payload_valid: false,
+                actual_weight: 1,
             }),
             Err(ReadFailure::Permanent),
         ]
@@ -1753,6 +1851,7 @@ mod tests {
                 }
             }
             while let Some(dispatch) = scheduler.begin_next() {
+                let actual_weight = dispatch.request().weight;
                 assert_eq!(
                     scheduler.finish(
                         dispatch,
@@ -1760,6 +1859,7 @@ mod tests {
                             received_at: now,
                             valid_until: 60_000,
                             payload_valid: true,
+                            actual_weight,
                         })
                     ),
                     ExecutionOutcome::CompletedFresh

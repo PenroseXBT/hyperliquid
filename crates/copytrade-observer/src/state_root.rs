@@ -14,7 +14,7 @@ const MARKER_TEMP_FILE_NAME: &str = "initialized.tmp";
 const SNAPSHOT_TEMP_FILE_NAME: &str = "unsigned-observer-state.tmp";
 
 pub const UNSIGNED_PERSISTENCE_SCHEMA_DESCRIPTOR: &str = concat!(
-    "copytrade-observer-unsigned-persistence-v11\n",
+    "copytrade-observer-unsigned-persistence-v12\n",
     "lock=.observer-state.lock:exclusive-os-lock:lifetime\n",
     "marker=initialized.json:",
     "InitializationMarker{schema_version:u32,snapshot_schema_version:u32,generation:u64,",
@@ -35,6 +35,7 @@ pub const UNSIGNED_PERSISTENCE_SCHEMA_DESCRIPTOR: &str = concat!(
     "component_remaining:BTreeMap<String,Decimal>}>,",
     "continuations:BTreeMap<String,ContinuationIntent>,",
     "accrued_funding:BTreeMap<String,Decimal>,last_mids:Option<MarketSnapshotResponse>,",
+    "history_complete_through_ms:Option<u64>,",
     "mfce:MfcePersistentState{schema_version:u32,source_epoch:u64,",
     "next_transition_id:u64,next_sample_id:u64,last_retrain_attempt_sample_id:u64,",
     "assets:BTreeMap<String,MfceAssetState>:max=512,",
@@ -54,7 +55,7 @@ pub const UNSIGNED_PERSISTENCE_SCHEMA_DESCRIPTOR: &str = concat!(
     "exit_notional:Decimal,gross_pnl:Decimal,fees:Decimal,funding:Decimal,slippage:Decimal,",
     "net_pnl:Decimal,gains:Decimal,losses:Decimal}>\n",
     "checksum=sha256(canonical-messagepack((schema_version,generation,identity,payload)))\n",
-    "migration=fresh-v11-restart-comparable-durable-time:checksum-first\n",
+    "migration=fresh-v12-history-completeness-watermark:checksum-first\n",
     "commit=temp-write,file-fsync,atomic-rename,directory-fsync,marker-update,directory-fsync\n",
 );
 
@@ -332,7 +333,7 @@ mod tests {
     #[test]
     fn descriptor_identifies_current_schema_and_the_mfce_artifact_bounds() {
         assert!(UNSIGNED_PERSISTENCE_SCHEMA_DESCRIPTOR
-            .starts_with("copytrade-observer-unsigned-persistence-v11\n"));
+            .starts_with("copytrade-observer-unsigned-persistence-v12\n"));
         assert!(UNSIGNED_PERSISTENCE_SCHEMA_DESCRIPTOR
             .contains("samples:VecDeque<MfceTrainingSample>:max=4096"));
         assert!(UNSIGNED_PERSISTENCE_SCHEMA_DESCRIPTOR.contains("max_bytes=2097152"));

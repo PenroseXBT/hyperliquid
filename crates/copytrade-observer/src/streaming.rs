@@ -7,7 +7,8 @@
 
 use crate::public_mainnet::{
     BookLevel, MarketAssetContext, MarketMetadataAsset, MarketMetadataResponse,
-    MarketSnapshotResponse, OrderBookResponse, SourceAssetPosition, SourceStateResponse,
+    MarketSnapshotResponse, OrderBookResponse, SourceAssetPosition, SourceFill,
+    SourceStateResponse,
 };
 use futures_util::{SinkExt, StreamExt};
 use rust_decimal::Decimal;
@@ -124,20 +125,30 @@ pub struct PublicTrade {
 }
 
 impl PublicTrade {
-    fn identity(&self) -> TradeIdentity {
-        TradeIdentity {
-            time_ms: self.time_ms,
-            coin: self.coin.clone(),
-            trade_id: self.trade_id,
-        }
+    fn source_fills(&self, tracked: &BTreeSet<String>) -> Vec<SourceFill> {
+        [(&self.buyer, self.size), (&self.seller, -self.size)]
+            .into_iter()
+            .filter(|(wallet, _)| tracked.contains(*wallet))
+            .map(|(wallet, signed_size)| SourceFill {
+                wallet: wallet.clone(),
+                coin: self.coin.clone(),
+                price: self.price,
+                signed_size,
+                time_ms: self.time_ms,
+                trade_id: self.trade_id,
+                hash: self.hash.clone(),
+            })
+            .collect()
     }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
-struct TradeIdentity {
+struct FillIdentity {
+    wallet: String,
     time_ms: u64,
     coin: String,
     trade_id: u64,
+    hash: String,
 }
 
 #[derive(Debug, Clone)]
@@ -710,9 +721,10 @@ pub fn parse_asset_contexts(
 pub struct StreamingSourceBook {
     tracked: BTreeSet<String>,
     states: BTreeMap<String, SourceStateResponse>,
-    buffered: VecDeque<PublicTrade>,
-    dedup_order: VecDeque<TradeIdentity>,
-    dedup: BTreeSet<TradeIdentity>,
+    buffered: VecDeque<SourceFill>,
+    dedup_order: VecDeque<FillIdentity>,
+    dedup: BTreeSet<FillIdentity>,
+    recovering: bool,
 }
 
 impl StreamingSourceBook {
@@ -733,6 +745,7 @@ impl StreamingSourceBook {
             buffered: VecDeque::new(),
             dedup_order: VecDeque::new(),
             dedup: BTreeSet::new(),
+            recovering: false,
         })
     }
 
@@ -746,9 +759,9 @@ impl StreamingSourceBook {
         }
         baseline.candidate_id = wallet.clone();
         let baseline_time_ms = baseline.source_time_ms;
-        for trade in &self.buffered {
-            if trade.time_ms > baseline_time_ms {
-                apply_trade_to_wallet(&mut baseline, trade, &wallet)?;
+        for fill in self.buffered.iter().filter(|fill| fill.wallet == wallet) {
+            if fill.time_ms > baseline_time_ms {
+                apply_fill_to_wallet(&mut baseline, fill)?;
             }
         }
         self.states.insert(wallet, baseline.clone());
@@ -759,12 +772,111 @@ impl StreamingSourceBook {
         &mut self,
         trade: PublicTrade,
     ) -> Result<Vec<SourceStateResponse>, StreamingError> {
-        if !self.tracked.contains(&trade.buyer) && !self.tracked.contains(&trade.seller) {
-            return Ok(Vec::new());
+        let mut changed = Vec::new();
+        if trade.buyer == trade.seller {
+            return Ok(changed);
         }
-        let identity = trade.identity();
+        for fill in trade.source_fills(&self.tracked) {
+            if !self.accept_fill(fill.clone()) {
+                continue;
+            }
+            if !self.recovering {
+                if let Some(state) = self.states.get_mut(&fill.wallet) {
+                    if fill.time_ms >= state.source_time_ms {
+                        apply_fill_to_wallet(state, &fill)?;
+                        changed.push(state.clone());
+                    }
+                }
+            }
+        }
+        Ok(changed)
+    }
+
+    pub fn begin_recovery(&mut self) {
+        self.recovering = true;
+        // The hydrated state already contains every pre-gap buffered fill.
+        // Keep their identities for overlap dedupe, but retain only fills
+        // observed after this recovery began for ordered replay.
+        self.buffered.clear();
+    }
+
+    pub fn recover_and_install(
+        &mut self,
+        history_start_ms: u64,
+        authoritative: BTreeMap<String, SourceStateResponse>,
+        mut recovered: Vec<SourceFill>,
+    ) -> Result<Vec<SourceStateResponse>, StreamingError> {
+        recovered.sort_by(fill_order);
+        let buffered_ids = self
+            .buffered
+            .iter()
+            .map(owned_fill_identity)
+            .collect::<BTreeSet<_>>();
+        for (wallet, ending) in &authoritative {
+            let mut fills = self
+                .buffered
+                .iter()
+                .chain(&recovered)
+                .filter(|fill| fill.wallet == *wallet && fill.time_ms <= ending.source_time_ms)
+                .cloned()
+                .collect::<Vec<_>>();
+            fills.sort_by(fill_order);
+            if fills.windows(2).any(|pair| {
+                fill_identity(&pair[0]) == fill_identity(&pair[1]) && pair[0] != pair[1]
+            }) {
+                return Err(StreamingError::InvalidPayload);
+            }
+            fills.dedup_by(|left, right| fill_identity(left) == fill_identity(right));
+            let existing = self.states.get(wallet).cloned();
+            let mut replay = match &existing {
+                Some(state) => state.clone(),
+                None => reverse_recovery_baseline(ending, history_start_ms, &fills)?,
+            };
+            for fill in &fills {
+                let identity = owned_fill_identity(fill);
+                if existing.is_none()
+                    || buffered_ids.contains(&identity)
+                    || (fill.time_ms > history_start_ms && !self.dedup.contains(&identity))
+                {
+                    apply_fill_to_wallet(&mut replay, fill)?;
+                }
+            }
+            if position_sizes(&replay) != position_sizes(ending) {
+                return Err(StreamingError::InvalidPayload);
+            }
+        }
+        for fill in &recovered {
+            self.remember_fill(fill);
+        }
+        self.states = authoritative;
+        let mut trailing = self.buffered.iter().cloned().collect::<Vec<_>>();
+        trailing.sort_by(fill_order);
+        for fill in trailing {
+            if let Some(state) = self.states.get_mut(&fill.wallet) {
+                if fill.time_ms > state.source_time_ms {
+                    apply_fill_to_wallet(state, &fill)?;
+                }
+            }
+        }
+        self.recovering = false;
+        Ok(self.states.values().cloned().collect())
+    }
+
+    fn accept_fill(&mut self, fill: SourceFill) -> bool {
+        if !self.remember_fill(&fill) {
+            return false;
+        }
+        self.buffered.push_back(fill);
+        while self.buffered.len() > MAX_BUFFERED_TRADES {
+            self.buffered.pop_front();
+        }
+        true
+    }
+
+    fn remember_fill(&mut self, fill: &SourceFill) -> bool {
+        let identity = owned_fill_identity(fill);
         if !self.dedup.insert(identity.clone()) {
-            return Ok(Vec::new());
+            return false;
         }
         self.dedup_order.push_back(identity);
         while self.dedup_order.len() > MAX_DEDUP_TRADES {
@@ -772,24 +884,7 @@ impl StreamingSourceBook {
                 self.dedup.remove(&expired);
             }
         }
-        if trade.buyer == trade.seller {
-            return Ok(Vec::new());
-        }
-        self.buffered.push_back(trade.clone());
-        while self.buffered.len() > MAX_BUFFERED_TRADES {
-            self.buffered.pop_front();
-        }
-        let mut changed = Vec::new();
-        for wallet in [&trade.buyer, &trade.seller] {
-            if let Some(state) = self.states.get_mut(wallet) {
-                if trade.time_ms >= state.source_time_ms
-                    && apply_trade_to_wallet(state, &trade, wallet)?
-                {
-                    changed.push(state.clone());
-                }
-            }
-        }
-        Ok(changed)
+        true
     }
 
     pub fn all_hydrated(&self) -> bool {
@@ -808,19 +903,15 @@ impl StreamingSourceBook {
     }
 }
 
-fn apply_trade_to_wallet(
+fn apply_fill_to_wallet(
     state: &mut SourceStateResponse,
-    trade: &PublicTrade,
-    wallet: &str,
+    fill: &SourceFill,
 ) -> Result<bool, StreamingError> {
-    let delta = if trade.buyer == wallet {
-        trade.size
-    } else if trade.seller == wallet {
-        -trade.size
-    } else {
+    if state.candidate_id != fill.wallet {
         return Ok(false);
-    };
-    let previous = state.positions.get(&trade.coin).cloned();
+    }
+    let delta = fill.signed_size;
+    let previous = state.positions.get(&fill.coin).cloned();
     let old_size = previous
         .as_ref()
         .map_or(Decimal::ZERO, |position| position.signed_size);
@@ -828,17 +919,17 @@ fn apply_trade_to_wallet(
         .checked_add(delta)
         .ok_or(StreamingError::InvalidPayload)?;
     if new_size == Decimal::ZERO {
-        state.positions.remove(&trade.coin);
+        state.positions.remove(&fill.coin);
     } else {
         let entry_price =
-            next_entry_price(previous.as_ref(), old_size, new_size, delta, trade.price)?;
+            next_entry_price(previous.as_ref(), old_size, new_size, delta, fill.price)?;
         let signed_notional = new_size
-            .checked_mul(trade.price)
+            .checked_mul(fill.price)
             .ok_or(StreamingError::InvalidPayload)?;
         state.positions.insert(
-            trade.coin.clone(),
+            fill.coin.clone(),
             SourceAssetPosition {
-                asset: trade.coin.clone(),
+                asset: fill.coin.clone(),
                 signed_size: new_size,
                 signed_notional,
                 entry_price,
@@ -846,8 +937,88 @@ fn apply_trade_to_wallet(
             },
         );
     }
-    state.source_time_ms = state.source_time_ms.max(trade.time_ms);
+    state.source_time_ms = state.source_time_ms.max(fill.time_ms);
     Ok(true)
+}
+
+fn fill_order(left: &SourceFill, right: &SourceFill) -> std::cmp::Ordering {
+    (
+        left.time_ms,
+        left.trade_id,
+        &left.hash,
+        &left.coin,
+        &left.wallet,
+    )
+        .cmp(&(
+            right.time_ms,
+            right.trade_id,
+            &right.hash,
+            &right.coin,
+            &right.wallet,
+        ))
+}
+
+fn fill_identity(fill: &SourceFill) -> (&str, u64, &str, u64, &str) {
+    (
+        &fill.wallet,
+        fill.time_ms,
+        &fill.coin,
+        fill.trade_id,
+        &fill.hash,
+    )
+}
+
+fn owned_fill_identity(fill: &SourceFill) -> FillIdentity {
+    FillIdentity {
+        wallet: fill.wallet.clone(),
+        time_ms: fill.time_ms,
+        coin: fill.coin.clone(),
+        trade_id: fill.trade_id,
+        hash: fill.hash.clone(),
+    }
+}
+
+fn position_sizes(state: &SourceStateResponse) -> BTreeMap<String, Decimal> {
+    state
+        .positions
+        .iter()
+        .map(|(asset, position)| (asset.clone(), position.signed_size))
+        .collect()
+}
+
+fn reverse_recovery_baseline(
+    ending: &SourceStateResponse,
+    history_start_ms: u64,
+    fills: &[SourceFill],
+) -> Result<SourceStateResponse, StreamingError> {
+    let mut baseline = ending.clone();
+    baseline.source_time_ms = history_start_ms.saturating_sub(1);
+    for fill in fills.iter().rev() {
+        let current = baseline
+            .positions
+            .get(&fill.coin)
+            .map_or(Decimal::ZERO, |position| position.signed_size);
+        let previous = current
+            .checked_sub(fill.signed_size)
+            .ok_or(StreamingError::InvalidPayload)?;
+        if previous == Decimal::ZERO {
+            baseline.positions.remove(&fill.coin);
+        } else {
+            baseline.positions.insert(
+                fill.coin.clone(),
+                SourceAssetPosition {
+                    asset: fill.coin.clone(),
+                    signed_size: previous,
+                    signed_notional: previous
+                        .checked_mul(fill.price)
+                        .ok_or(StreamingError::InvalidPayload)?,
+                    entry_price: Some(fill.price),
+                    unrealized_pnl: None,
+                },
+            );
+        }
+    }
+    Ok(baseline)
 }
 
 fn next_entry_price(
@@ -1030,6 +1201,67 @@ mod tests {
             changed.positions["xyz:XYZ100"].signed_notional,
             Decimal::from(20)
         );
+    }
+
+    #[test]
+    fn recovered_fill_replays_non_actionably_then_installs_authoritative_state() {
+        let candidate = wallet('a');
+        let mut book = StreamingSourceBook::new([candidate.clone()]).unwrap();
+        book.install_baseline(baseline(candidate.clone(), 100))
+            .unwrap();
+        book.begin_recovery();
+
+        let mut live_after_cutoff = trade(103, 3);
+        live_after_cutoff.seller = wallet('c');
+        assert!(book.apply_trade(live_after_cutoff).unwrap().is_empty());
+
+        let recovered = SourceFill {
+            wallet: candidate.clone(),
+            coin: "xyz:XYZ100".into(),
+            price: Decimal::from(10),
+            signed_size: Decimal::from(2),
+            time_ms: 101,
+            trade_id: 1,
+            hash: "recovered-1".into(),
+        };
+        let mut recovered_same_millisecond = recovered.clone();
+        recovered_same_millisecond.signed_size = Decimal::ONE;
+        recovered_same_millisecond.trade_id = 2;
+        recovered_same_millisecond.hash = "recovered-2".into();
+        let mut ending = baseline(candidate.clone(), 102);
+        ending.positions.insert(
+            "xyz:XYZ100".into(),
+            SourceAssetPosition {
+                asset: "xyz:XYZ100".into(),
+                signed_size: Decimal::from(3),
+                signed_notional: Decimal::from(30),
+                entry_price: Some(Decimal::from(10)),
+                unrealized_pnl: None,
+            },
+        );
+
+        let states = book
+            .recover_and_install(
+                100,
+                BTreeMap::from([(candidate.clone(), ending)]),
+                vec![recovered.clone(), recovered_same_millisecond],
+            )
+            .unwrap();
+        assert_eq!(
+            states[0].positions["xyz:XYZ100"].signed_size,
+            Decimal::from(5)
+        );
+        let duplicate = PublicTrade {
+            coin: recovered.coin,
+            price: recovered.price,
+            size: recovered.signed_size,
+            buyer: candidate,
+            seller: wallet('c'),
+            time_ms: recovered.time_ms,
+            trade_id: recovered.trade_id,
+            hash: recovered.hash,
+        };
+        assert!(book.apply_trade(duplicate).unwrap().is_empty());
     }
 
     #[test]
