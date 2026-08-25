@@ -61,11 +61,12 @@ struct HistoryRecovery {
     fill_counts: BTreeMap<String, usize>,
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum FillRangeProgress {
     Next,
     WalletComplete,
     Restart,
+    Stale,
 }
 
 impl HistoryRecovery {
@@ -87,42 +88,38 @@ impl HistoryRecovery {
         self.ranges.get(wallet)?.front().copied()
     }
 
-    fn record_range(
-        &mut self,
-        range: &mut SourceFillRangeResponse,
-    ) -> Result<FillRangeProgress, &'static str> {
-        let ranges = self
-            .ranges
-            .get_mut(&range.wallet)
-            .ok_or("source-fill result has no pending range")?;
+    fn record_range(&mut self, range: &mut SourceFillRangeResponse) -> FillRangeProgress {
+        let Some(ranges) = self.ranges.get_mut(&range.wallet) else {
+            return FillRangeProgress::Stale;
+        };
         if ranges.front().copied() != Some((range.start_time_ms, range.end_time_ms)) {
-            return Err("source-fill result does not match pending range");
+            return FillRangeProgress::Stale;
         }
         let total = self.fill_counts.entry(range.wallet.clone()).or_default();
         if range.raw_count == 2_000 {
             if range.start_time_ms == range.end_time_ms
                 || total.saturating_add(range.raw_count) >= 10_000
             {
-                return Ok(FillRangeProgress::Restart);
+                return FillRangeProgress::Restart;
             }
             ranges.pop_front();
             let midpoint = range.start_time_ms + (range.end_time_ms - range.start_time_ms) / 2;
             ranges.push_front((midpoint + 1, range.end_time_ms));
             ranges.push_front((range.start_time_ms, midpoint));
-            return Ok(FillRangeProgress::Next);
+            return FillRangeProgress::Next;
         }
         ranges.pop_front();
         if self.fills.len().saturating_add(range.fills.len()) > MAX_RECOVERED_SOURCE_FILLS {
-            return Ok(FillRangeProgress::Restart);
+            return FillRangeProgress::Restart;
         }
         *total = total.saturating_add(range.raw_count);
         self.fills.append(&mut range.fills);
         if *total >= 10_000 {
-            Ok(FillRangeProgress::Restart)
+            FillRangeProgress::Restart
         } else if ranges.is_empty() {
-            Ok(FillRangeProgress::WalletComplete)
+            FillRangeProgress::WalletComplete
         } else {
-            Ok(FillRangeProgress::Next)
+            FillRangeProgress::Next
         }
     }
 
@@ -131,6 +128,17 @@ impl HistoryRecovery {
             .values()
             .map(|state| state.source_time_ms)
             .min()
+    }
+
+    fn completed_wallet(&self, wallet: &str) -> Option<(SourceStateResponse, Vec<SourceFill>)> {
+        let ending = self.snapshots.get(wallet)?.clone();
+        let fills = self
+            .fills
+            .iter()
+            .filter(|fill| fill.wallet == wallet)
+            .cloned()
+            .collect();
+        Some((ending, fills))
     }
 }
 
@@ -1421,8 +1429,9 @@ async fn run_qualification_impl<const CONTINUOUS: bool>(
                                     let wallet = range.wallet.clone();
                                     let progress = history_recovery
                                         .as_mut()
-                                        .ok_or("source fills arrived outside history recovery")?
-                                        .record_range(range)?;
+                                        .map_or(FillRangeProgress::Stale, |recovery| {
+                                            recovery.record_range(range)
+                                        });
                                     match progress {
                                         FillRangeProgress::Next => {
                                             source_due.insert(
@@ -1432,7 +1441,43 @@ async fn run_qualification_impl<const CONTINUOUS: bool>(
                                             );
                                         }
                                         FillRangeProgress::WalletComplete => {
-                                            reconciliation_remaining.remove(&wallet);
+                                            let history_start = engine
+                                                .history_complete_through_ms()
+                                                .ok_or("history recovery has no durable watermark")?;
+                                            let (ending, fills) = history_recovery
+                                                .as_ref()
+                                                .and_then(|recovery| {
+                                                    recovery.completed_wallet(&wallet)
+                                                })
+                                                .ok_or("completed wallet recovery is unavailable")?;
+                                            match streaming_sources
+                                                .as_mut()
+                                                .ok_or("streaming source book unavailable")?
+                                                .recover_wallet_and_install(
+                                                    history_start,
+                                                    ending,
+                                                    fills,
+                                                )
+                                            {
+                                                Ok(state) => {
+                                                    recovered_states = Some(vec![state]);
+                                                    reconciliation_remaining.remove(&wallet);
+                                                }
+                                                Err(_) => restart_history_recovery(
+                                                    &mut history_recovery,
+                                                    &config,
+                                                    source_dispatch_plan,
+                                                    clock.now_ms().checked_add(
+                                                        scheduler_config
+                                                            .retry
+                                                            .maximum_backoff_ms,
+                                                    ).ok_or(
+                                                        "history reconciliation retry overflow",
+                                                    )?,
+                                                    &mut reconciliation_remaining,
+                                                    &mut source_due,
+                                                )?,
+                                            }
                                         }
                                         FillRangeProgress::Restart => restart_history_recovery(
                                             &mut history_recovery,
@@ -1444,48 +1489,40 @@ async fn run_qualification_impl<const CONTINUOUS: bool>(
                                             &mut reconciliation_remaining,
                                             &mut source_due,
                                         )?,
+                                        FillRangeProgress::Stale => {
+                                            if history_recovery.is_some()
+                                                && reconciliation_remaining.contains(&wallet)
+                                            {
+                                                source_due.insert(
+                                                    wallet,
+                                                    clock.now_ms().checked_add(1).ok_or(
+                                                        "stale fill-range recovery due overflow",
+                                                    )?,
+                                                );
+                                            }
+                                        }
                                     }
-                                    if progress != FillRangeProgress::Restart
+                                    if !matches!(
+                                        progress,
+                                        FillRangeProgress::Restart | FillRangeProgress::Stale
+                                    )
                                         && stream_connected
                                         && reconciliation_remaining.is_empty()
                                     {
-                                        let history_start = engine
-                                            .history_complete_through_ms()
-                                            .ok_or("history recovery has no durable watermark")?;
                                         let cutoff = history_recovery
                                             .as_ref()
                                             .ok_or("history recovery unavailable")?
                                             .cutoff()
                                             .ok_or("history recovery has no ending snapshots")?;
-                                        let recovery = history_recovery
-                                            .as_ref()
-                                            .ok_or("history recovery unavailable")?;
-                                        match streaming_sources
+                                        if streaming_sources
                                             .as_mut()
                                             .ok_or("streaming source book unavailable")?
-                                            .recover_and_install(
-                                                history_start,
-                                                recovery.snapshots.clone(),
-                                                recovery.fills.clone(),
-                                            )
+                                            .recovery_complete()
                                         {
-                                            Ok(states) => {
-                                                recovered_states = Some(states);
-                                                history_recovery = None;
-                                                reconciliation_epoch_active = false;
-                                                completes_stream_reconciliation = true;
-                                                stream_history_cutoff = Some(cutoff);
-                                            }
-                                            Err(_) => restart_history_recovery(
-                                                &mut history_recovery,
-                                                &config,
-                                                source_dispatch_plan,
-                                                clock.now_ms().checked_add(
-                                                    scheduler_config.retry.maximum_backoff_ms,
-                                                ).ok_or("history reconciliation retry overflow")?,
-                                                &mut reconciliation_remaining,
-                                                &mut source_due,
-                                            )?,
+                                            history_recovery = None;
+                                            reconciliation_epoch_active = false;
+                                            completes_stream_reconciliation = true;
+                                            stream_history_cutoff = Some(cutoff);
                                         }
                                     }
                                 }
@@ -1544,6 +1581,7 @@ async fn run_qualification_impl<const CONTINUOUS: bool>(
                         if let Some(states) = recovered_states {
                             for state in states {
                                 let subject = state.candidate_id.clone();
+                                let source_time_ms = state.source_time_ms;
                                 let tier = candidate_tiers
                                     .get(&subject)
                                     .copied()
@@ -1552,12 +1590,19 @@ async fn run_qualification_impl<const CONTINUOUS: bool>(
                                     .ingest(
                                         accepted_stream_response(
                                             crate::public_mainnet::PublicPayload::SourceState(state),
-                                            subject,
+                                            subject.clone(),
                                             ReadRequestKind::ExpandedSourceState,
                                             Some(tier),
                                             accepted_at,
                                             config.global_risk.source_snapshot_max_age_ms,
                                         )?,
+                                        accepted_at,
+                                    )
+                                    .map_err(|error| error.to_string())?;
+                                engine
+                                    .admit_reconciled_source_wallet(
+                                        &subject,
+                                        source_time_ms,
                                         accepted_at,
                                     )
                                     .map_err(|error| error.to_string())?;
@@ -1654,6 +1699,17 @@ async fn run_qualification_impl<const CONTINUOUS: bool>(
                 match event {
                     StreamingEvent::Connected { .. } => {
                         stream_connected = true;
+                        // A reconnected public market stream is current even
+                        // while tracked-wallet history is still repairing.
+                        // Wallet readiness, not global history completion,
+                        // controls which source contributions are actionable.
+                        coverage_ready_markets = subscribed_trade_markets.clone();
+                        engine
+                            .replace_source_market_coverage(
+                                coverage_ready_markets.clone(),
+                                observed_at,
+                            )
+                            .map_err(|error| error.to_string())?;
                         if reconciliation_epoch_active
                             && reconciliation_remaining.iter().all(|wallet| {
                                 source_due.get(wallet).is_some_and(|due| *due == u64::MAX)
@@ -1842,6 +1898,9 @@ async fn run_qualification_impl<const CONTINUOUS: bool>(
                 break;
             }
             _ = sleep(Duration::from_millis(25)) => {}
+        }
+        if engine.service_mfce_training() {
+            persist_unsigned_state(&mut engine, &mut state_root)?;
         }
         let now = clock.now_ms();
         if now >= decision_due
@@ -3848,7 +3907,7 @@ mod tests {
             fills: Vec::new(),
         };
         assert!(matches!(
-            recovery.record_range(&mut range).unwrap(),
+            recovery.record_range(&mut range),
             FillRangeProgress::Next
         ));
         for expected in [FillRangeProgress::Next, FillRangeProgress::WalletComplete] {
@@ -3860,9 +3919,64 @@ mod tests {
                 raw_count: 0,
                 fills: Vec::new(),
             };
-            assert!(recovery.record_range(&mut leaf).unwrap() == expected);
+            assert!(recovery.record_range(&mut leaf) == expected);
         }
         assert_eq!(recovery.cutoff(), Some(200));
+    }
+
+    #[test]
+    fn stale_or_superseded_fill_ranges_do_not_mutate_current_recovery() {
+        let wallet = "0x1111111111111111111111111111111111111111".to_string();
+        let mut recovery = HistoryRecovery::default();
+        let state = |source_time_ms| SourceStateResponse {
+            candidate_id: wallet.clone(),
+            account_value: Decimal::ONE,
+            source_time_ms,
+            positions: BTreeMap::new(),
+            closed_candles: Vec::new(),
+        };
+        assert!(recovery.record_snapshot(100, state(200)));
+        let mut unknown = SourceFillRangeResponse {
+            wallet: "0x2222222222222222222222222222222222222222".into(),
+            start_time_ms: 99,
+            end_time_ms: 200,
+            raw_count: 0,
+            fills: Vec::new(),
+        };
+        assert_eq!(
+            recovery.record_range(&mut unknown),
+            FillRangeProgress::Stale
+        );
+        let mut superseded = SourceFillRangeResponse {
+            wallet: wallet.clone(),
+            start_time_ms: 99,
+            end_time_ms: 200,
+            raw_count: 0,
+            fills: Vec::new(),
+        };
+
+        assert!(recovery.record_snapshot(150, state(250)));
+        assert_eq!(
+            recovery.record_range(&mut superseded),
+            FillRangeProgress::Stale
+        );
+        assert_eq!(recovery.next_range(&wallet), Some((149, 250)));
+
+        let mut current = SourceFillRangeResponse {
+            wallet: wallet.clone(),
+            start_time_ms: 149,
+            end_time_ms: 250,
+            raw_count: 0,
+            fills: Vec::new(),
+        };
+        assert_eq!(
+            recovery.record_range(&mut current),
+            FillRangeProgress::WalletComplete
+        );
+        assert_eq!(
+            recovery.record_range(&mut current),
+            FillRangeProgress::Stale
+        );
     }
 
     #[test]

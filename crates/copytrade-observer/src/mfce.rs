@@ -1304,12 +1304,9 @@ impl MfceEngine {
         let Some(receiver) = self.training.as_ref() else {
             return Ok(false);
         };
-        let attempt = self.state.pending_training.as_ref().ok_or_else(|| {
+        self.state.pending_training.as_ref().ok_or_else(|| {
             MfceError::InvalidState("runtime MFCE worker has no durable attempt".into())
         })?;
-        if self.state.next_sample_id.saturating_sub(1) < attempt.activation_sample_id {
-            return Ok(false);
-        }
         let result = match receiver.try_recv() {
             Ok(result) => result,
             Err(TryRecvError::Empty) => return Ok(false),
@@ -1442,14 +1439,22 @@ impl MfceEngine {
                 used_model: false,
             });
         }
-        let (base_quantiles, used_model) = match &self.models {
-            Some(models) => {
-                let values = features.as_f64()?;
-                let prediction = models.predict_one(&values).map_err(model_error)?;
-                (Some((prediction.q10, prediction.q50)), true)
-            }
-            None => (None, false),
-        };
+        let incumbent_is_eligible = self.state.incumbent.as_ref().is_some_and(|model| {
+            model
+                .trained_through_sample_id
+                .checked_add(model.validation.validation_samples)
+                .and_then(|sample| sample.checked_add(1))
+                .is_some_and(|activation_from| self.state.next_sample_id >= activation_from)
+        });
+        let (base_quantiles, used_model) =
+            match self.models.as_ref().filter(|_| incumbent_is_eligible) {
+                Some(models) => {
+                    let values = features.as_f64()?;
+                    let prediction = models.predict_one(&values).map_err(model_error)?;
+                    (Some((prediction.q10, prediction.q50)), true)
+                }
+                None => (None, false),
+            };
         let conditional = compose_conditional_quantiles(
             self.state.samples.iter(),
             asset,
@@ -1476,7 +1481,12 @@ impl MfceEngine {
                 robust_scale.max(5.0) * 0.25
             };
         Ok(MfcePrediction {
-            model_epoch: self.state.incumbent.as_ref().map_or(0, |model| model.epoch),
+            model_epoch: self
+                .state
+                .incumbent
+                .as_ref()
+                .filter(|_| incumbent_is_eligible)
+                .map_or(0, |model| model.epoch),
             q10_gross_bps: decimal(conditional.q10)?,
             q50_gross_bps: decimal(conditional.q50)?,
             uncertainty_bps: decimal(uncertainty.max(0.0))?,
@@ -3703,7 +3713,7 @@ mod tests {
 
         let mut engine = MfceEngine::default();
         engine.state.samples = samples.into();
-        engine.state.next_sample_id = 502;
+        engine.state.next_sample_id = 501;
         engine.state.last_retrain_attempt_sample_id = 500;
         engine.state.pending_training = Some(MfceTrainingAttempt {
             attempted_through_sample_id: 500,

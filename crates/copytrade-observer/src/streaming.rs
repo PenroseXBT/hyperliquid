@@ -724,7 +724,7 @@ pub struct StreamingSourceBook {
     buffered: VecDeque<SourceFill>,
     dedup_order: VecDeque<FillIdentity>,
     dedup: BTreeSet<FillIdentity>,
-    recovering: bool,
+    recovering_wallets: BTreeSet<String>,
 }
 
 impl StreamingSourceBook {
@@ -745,7 +745,7 @@ impl StreamingSourceBook {
             buffered: VecDeque::new(),
             dedup_order: VecDeque::new(),
             dedup: BTreeSet::new(),
-            recovering: false,
+            recovering_wallets: BTreeSet::new(),
         })
     }
 
@@ -780,7 +780,7 @@ impl StreamingSourceBook {
             if !self.accept_fill(fill.clone()) {
                 continue;
             }
-            if !self.recovering {
+            if !self.recovering_wallets.contains(&fill.wallet) {
                 if let Some(state) = self.states.get_mut(&fill.wallet) {
                     if fill.time_ms >= state.source_time_ms {
                         apply_fill_to_wallet(state, &fill)?;
@@ -793,73 +793,84 @@ impl StreamingSourceBook {
     }
 
     pub fn begin_recovery(&mut self) {
-        self.recovering = true;
+        self.recovering_wallets = self.tracked.clone();
         // The hydrated state already contains every pre-gap buffered fill.
         // Keep their identities for overlap dedupe, but retain only fills
         // observed after this recovery began for ordered replay.
         self.buffered.clear();
     }
 
-    pub fn recover_and_install(
+    pub fn recover_wallet_and_install(
         &mut self,
         history_start_ms: u64,
-        authoritative: BTreeMap<String, SourceStateResponse>,
+        mut ending: SourceStateResponse,
         mut recovered: Vec<SourceFill>,
-    ) -> Result<Vec<SourceStateResponse>, StreamingError> {
+    ) -> Result<SourceStateResponse, StreamingError> {
+        let wallet = ending.candidate_id.to_ascii_lowercase();
+        if !self.recovering_wallets.contains(&wallet) {
+            return Err(StreamingError::InvalidPayload);
+        }
+        ending.candidate_id = wallet.clone();
         recovered.sort_by(fill_order);
         let buffered_ids = self
             .buffered
             .iter()
+            .filter(|fill| fill.wallet == wallet)
             .map(owned_fill_identity)
             .collect::<BTreeSet<_>>();
-        for (wallet, ending) in &authoritative {
-            let mut fills = self
-                .buffered
-                .iter()
-                .chain(&recovered)
-                .filter(|fill| fill.wallet == *wallet && fill.time_ms <= ending.source_time_ms)
-                .cloned()
-                .collect::<Vec<_>>();
-            fills.sort_by(fill_order);
-            if fills.windows(2).any(|pair| {
-                fill_identity(&pair[0]) == fill_identity(&pair[1]) && pair[0] != pair[1]
-            }) {
-                return Err(StreamingError::InvalidPayload);
+        let mut fills = self
+            .buffered
+            .iter()
+            .chain(&recovered)
+            .filter(|fill| fill.wallet == wallet && fill.time_ms <= ending.source_time_ms)
+            .cloned()
+            .collect::<Vec<_>>();
+        fills.sort_by(fill_order);
+        if fills
+            .windows(2)
+            .any(|pair| fill_identity(&pair[0]) == fill_identity(&pair[1]) && pair[0] != pair[1])
+        {
+            return Err(StreamingError::InvalidPayload);
+        }
+        fills.dedup_by(|left, right| fill_identity(left) == fill_identity(right));
+        let existing = self.states.get(&wallet).cloned();
+        let mut replay = match &existing {
+            Some(state) => state.clone(),
+            None => reverse_recovery_baseline(&ending, history_start_ms, &fills)?,
+        };
+        for fill in &fills {
+            let identity = owned_fill_identity(fill);
+            if existing.is_none()
+                || buffered_ids.contains(&identity)
+                || (fill.time_ms > history_start_ms && !self.dedup.contains(&identity))
+            {
+                apply_fill_to_wallet(&mut replay, fill)?;
             }
-            fills.dedup_by(|left, right| fill_identity(left) == fill_identity(right));
-            let existing = self.states.get(wallet).cloned();
-            let mut replay = match &existing {
-                Some(state) => state.clone(),
-                None => reverse_recovery_baseline(ending, history_start_ms, &fills)?,
-            };
-            for fill in &fills {
-                let identity = owned_fill_identity(fill);
-                if existing.is_none()
-                    || buffered_ids.contains(&identity)
-                    || (fill.time_ms > history_start_ms && !self.dedup.contains(&identity))
-                {
-                    apply_fill_to_wallet(&mut replay, fill)?;
-                }
-            }
-            if position_sizes(&replay) != position_sizes(ending) {
-                return Err(StreamingError::InvalidPayload);
-            }
+        }
+        if position_sizes(&replay) != position_sizes(&ending) {
+            return Err(StreamingError::InvalidPayload);
         }
         for fill in &recovered {
             self.remember_fill(fill);
         }
-        self.states = authoritative;
-        let mut trailing = self.buffered.iter().cloned().collect::<Vec<_>>();
+        let mut current = ending;
+        let mut trailing = self
+            .buffered
+            .iter()
+            .filter(|fill| fill.wallet == wallet && fill.time_ms > current.source_time_ms)
+            .cloned()
+            .collect::<Vec<_>>();
         trailing.sort_by(fill_order);
         for fill in trailing {
-            if let Some(state) = self.states.get_mut(&fill.wallet) {
-                if fill.time_ms > state.source_time_ms {
-                    apply_fill_to_wallet(state, &fill)?;
-                }
-            }
+            apply_fill_to_wallet(&mut current, &fill)?;
         }
-        self.recovering = false;
-        Ok(self.states.values().cloned().collect())
+        self.states.insert(wallet.clone(), current.clone());
+        self.recovering_wallets.remove(&wallet);
+        Ok(current)
+    }
+
+    pub fn recovery_complete(&self) -> bool {
+        self.recovering_wallets.is_empty()
     }
 
     fn accept_fill(&mut self, fill: SourceFill) -> bool {
@@ -1206,8 +1217,11 @@ mod tests {
     #[test]
     fn recovered_fill_replays_non_actionably_then_installs_authoritative_state() {
         let candidate = wallet('a');
-        let mut book = StreamingSourceBook::new([candidate.clone()]).unwrap();
+        let unresolved = wallet('b');
+        let mut book = StreamingSourceBook::new([candidate.clone(), unresolved.clone()]).unwrap();
         book.install_baseline(baseline(candidate.clone(), 100))
+            .unwrap();
+        book.install_baseline(baseline(unresolved.clone(), 100))
             .unwrap();
         book.begin_recovery();
 
@@ -1241,16 +1255,25 @@ mod tests {
         );
 
         let states = book
-            .recover_and_install(
+            .recover_wallet_and_install(
                 100,
-                BTreeMap::from([(candidate.clone(), ending)]),
+                ending,
                 vec![recovered.clone(), recovered_same_millisecond],
             )
             .unwrap();
-        assert_eq!(
-            states[0].positions["xyz:XYZ100"].signed_size,
-            Decimal::from(5)
-        );
+        assert_eq!(states.positions["xyz:XYZ100"].signed_size, Decimal::from(5));
+        assert!(!book.recovery_complete());
+        let mut candidate_live = trade(104, 4);
+        candidate_live.seller = wallet('c');
+        assert_eq!(book.apply_trade(candidate_live).unwrap().len(), 1);
+        let mut unresolved_live = trade(104, 5);
+        unresolved_live.buyer = unresolved.clone();
+        unresolved_live.seller = wallet('c');
+        assert!(book.apply_trade(unresolved_live).unwrap().is_empty());
+
+        book.recover_wallet_and_install(100, baseline(unresolved, 102), Vec::new())
+            .unwrap();
+        assert!(book.recovery_complete());
         let duplicate = PublicTrade {
             coin: recovered.coin,
             price: recovered.price,

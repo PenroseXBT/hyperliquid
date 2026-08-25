@@ -1630,6 +1630,7 @@ pub struct LiveShadowEngine {
     inactive_freshness_ms: u64,
     source_stream_mode: bool,
     source_stream_healthy: bool,
+    source_wallet_ready: BTreeSet<String>,
     source_market_coverage: BTreeSet<String>,
     history_complete_through_ms: Option<u64>,
     mids: Option<(MarketSnapshotResponse, Timestamp)>,
@@ -1869,6 +1870,7 @@ impl LiveShadowEngine {
             inactive_freshness_ms,
             source_stream_mode: false,
             source_stream_healthy: false,
+            source_wallet_ready: BTreeSet::new(),
             source_market_coverage: BTreeSet::new(),
             history_complete_through_ms: None,
             mids: None,
@@ -2508,6 +2510,7 @@ impl LiveShadowEngine {
                 // Retain the raw snapshot while omitting its unusable economic
                 // contribution; never let one wallet stop the daemon.
                 let exposures = normalized_source_exposures(&state).unwrap_or_default();
+                let bootstrap_snapshot = self.source_store.latest(&candidate_id).is_none();
                 let authorized_assets =
                     if let Some(previous) = self.source_exposure_book.get(&candidate_id) {
                         previous
@@ -2545,7 +2548,10 @@ impl LiveShadowEngine {
                 {
                     SnapshotAcceptance::Accepted => {
                         self.source_exposure_book
-                            .accept(candidate_id, exposure_state);
+                            .accept(candidate_id.clone(), exposure_state);
+                        if self.source_stream_mode && bootstrap_snapshot {
+                            self.source_wallet_ready.insert(candidate_id);
+                        }
                         for asset in authorized_assets {
                             self.mfce_authorized_assets
                                 .entry(asset)
@@ -2647,6 +2653,45 @@ impl LiveShadowEngine {
             .count()
     }
 
+    /// Restores post-gap eligibility only after the caller has replayed the
+    /// missing range and proven this exact ending state against its
+    /// authoritative snapshot. Ordinary snapshot ingestion cannot take this
+    /// shortcut for an already-known wallet.
+    pub fn admit_reconciled_source_wallet(
+        &mut self,
+        candidate: &str,
+        source_time_ms: u64,
+        now: Timestamp,
+    ) -> Result<(), LiveShadowError> {
+        let candidate = candidate.to_ascii_lowercase();
+        if !self.source_stream_mode {
+            return Err(LiveShadowError::Core(
+                "source wallet recovery admitted outside stream mode".into(),
+            ));
+        }
+        let snapshot = self.source_store.latest(&candidate).ok_or_else(|| {
+            LiveShadowError::Core("reconciled source wallet has no accepted snapshot".into())
+        })?;
+        if snapshot.payload.source_time_ms != source_time_ms {
+            return Err(LiveShadowError::Core(
+                "reconciled source wallet snapshot does not match replay ending state".into(),
+            ));
+        }
+        self.source_wallet_ready.insert(candidate);
+        let mut assets = snapshot
+            .payload
+            .positions
+            .keys()
+            .cloned()
+            .collect::<BTreeSet<_>>();
+        assets.extend(self.mfce.tracked_assets().cloned());
+        for asset in assets {
+            self.mfce_authorized_assets.insert(asset, Timestamp::MAX);
+        }
+        self.construct_next_decision(now)?;
+        Ok(())
+    }
+
     pub fn assets_requiring_books(&self, now: Timestamp) -> BTreeSet<String> {
         let _ = now;
         self.desired_books.clone()
@@ -2697,7 +2742,8 @@ impl LiveShadowEngine {
         }
         self.source_market_coverage
             .retain(|market| !affected_markets.contains(market));
-        self.source_stream_healthy = !self.source_market_coverage.is_empty();
+        self.source_wallet_ready.clear();
+        self.source_stream_healthy = false;
         self.construct_next_decision(now)?;
         Ok(())
     }
@@ -2714,9 +2760,9 @@ impl LiveShadowEngine {
             ));
         }
         if self.config.candidates.iter().any(|candidate| {
-            self.source_store
-                .latest(&candidate.address.to_ascii_lowercase())
-                .is_none()
+            let wallet = candidate.address.to_ascii_lowercase();
+            self.source_store.latest(&wallet).is_none()
+                || !self.source_wallet_ready.contains(&wallet)
         }) {
             return Err(LiveShadowError::Core(
                 "source stream reconciliation completed before every baseline".into(),
@@ -2839,7 +2885,8 @@ impl LiveShadowEngine {
     ) -> Option<&SourceSnapshot<SourceStateResponse>> {
         if self.source_stream_mode {
             return self
-                .source_stream_healthy
+                .source_wallet_ready
+                .contains(candidate)
                 .then(|| self.source_store.latest(candidate))
                 .flatten();
         }
@@ -3214,6 +3261,51 @@ impl LiveShadowEngine {
         Ok(())
     }
 
+    /// Services the one durable MFCE training attempt independently of source
+    /// sample arrival. Promotion installs a validated incumbent immediately;
+    /// the model's chronological activation floor still governs first use.
+    pub fn service_mfce_training(&mut self) -> bool {
+        let before = (
+            self.mfce.state().pending_training.clone(),
+            self.mfce
+                .state()
+                .incumbent
+                .as_ref()
+                .map(|model| model.epoch),
+        );
+        match self.mfce.maybe_start_training() {
+            Ok(true) => {
+                self.metrics.mfce_retrain_attempts =
+                    self.metrics.mfce_retrain_attempts.saturating_add(1)
+            }
+            Ok(false) => {}
+            Err(_) => {
+                self.metrics.mfce_retrain_failures =
+                    self.metrics.mfce_retrain_failures.saturating_add(1)
+            }
+        }
+        match self.mfce.poll_training() {
+            Ok(true) => {
+                self.metrics.mfce_model_promotions =
+                    self.metrics.mfce_model_promotions.saturating_add(1)
+            }
+            Ok(false) => {}
+            Err(_) => {
+                self.metrics.mfce_retrain_failures =
+                    self.metrics.mfce_retrain_failures.saturating_add(1)
+            }
+        }
+        before
+            != (
+                self.mfce.state().pending_training.clone(),
+                self.mfce
+                    .state()
+                    .incumbent
+                    .as_ref()
+                    .map(|model| model.epoch),
+            )
+    }
+
     pub fn construct_next_decision(
         &mut self,
         now: Timestamp,
@@ -3232,17 +3324,6 @@ impl LiveShadowEngine {
             .metadata_received_at
             .zip(self.metadata_valid_until)
             .is_some_and(|(received_at, valid_until)| received_at <= now && now <= valid_until);
-        match self.mfce.poll_training() {
-            Ok(true) => {
-                self.metrics.mfce_model_promotions =
-                    self.metrics.mfce_model_promotions.saturating_add(1)
-            }
-            Ok(false) => {}
-            Err(_) => {
-                self.metrics.mfce_retrain_failures =
-                    self.metrics.mfce_retrain_failures.saturating_add(1)
-            }
-        }
         let mfce_now = self.durable_timestamp(now)?;
         self.mfce_time_high_watermark = self.mfce_time_high_watermark.max(mfce_now);
         let mut eligibility = SourceEligibilitySummary::default();
@@ -3252,21 +3333,6 @@ impl LiveShadowEngine {
         let mut existing_wallet_consensus = BTreeMap::new();
         let mut fresh_source_states = Vec::new();
         let mut source_received_at = BTreeMap::new();
-        // MFCE raw lifecycles are durable, while source snapshots are
-        // intentionally ephemeral. After restart, do not manufacture a flat
-        // transition/label from missing pre-hydration sources. Normal target
-        // construction may still fail-safe toward flat until every enabled
-        // configured source has supplied an authoritative post-start state.
-        let mfce_sources_hydrated = self
-            .config
-            .candidates
-            .iter()
-            .filter(|candidate| candidate.enabled)
-            .all(|candidate| {
-                self.source_exposure_book
-                    .get(&candidate.address.to_ascii_lowercase())
-                    .is_some()
-            });
         for candidate in &self.config.candidates {
             let id = candidate.address.to_ascii_lowercase();
             if !candidate.enabled {
@@ -3507,15 +3573,11 @@ impl LiveShadowEngine {
             .ok_or(LiveShadowError::Arithmetic)?;
         let total_tail_budget = remaining_mfce_tail_budget(&self.config, deployment)?;
         let source_capacity = available_gross;
+        let has_usable_source = !members.is_empty();
         let mut allocation_candidates = Vec::new();
         let mut target_contexts = BTreeMap::new();
         for (asset, inputs) in &mut consensus_inputs {
-            if !mfce_sources_hydrated {
-                inputs.clear();
-                source_contributions
-                    .entry(asset.clone())
-                    .or_default()
-                    .clear();
+            if !has_usable_source {
                 continue;
             }
             let source_inputs = inputs
@@ -3732,8 +3794,8 @@ impl LiveShadowEngine {
                 }
             }
         }
-        let mut allocation_replacement_assets = BTreeSet::new();
-        if mfce_sources_hydrated {
+        let allocation_replacement_assets;
+        {
             allocation_replacement_assets = allocation_candidates
                 .iter()
                 .map(|candidate| candidate.asset.clone())
@@ -3841,17 +3903,6 @@ impl LiveShadowEngine {
             }
             self.mfce.finish_source_observation_cycle();
             self.mfce_authorized_assets.clear();
-        }
-        match self.mfce.maybe_start_training() {
-            Ok(true) => {
-                self.metrics.mfce_retrain_attempts =
-                    self.metrics.mfce_retrain_attempts.saturating_add(1)
-            }
-            Ok(false) => {}
-            Err(_) => {
-                self.metrics.mfce_retrain_failures =
-                    self.metrics.mfce_retrain_failures.saturating_add(1)
-            }
         }
         let in_flight_pending_assets = self
             .pending
@@ -6495,7 +6546,7 @@ mod tests {
             )
             .unwrap();
 
-        assert_eq!(engine.active_source_count(1), 0);
+        assert_eq!(engine.active_source_count(1), 1);
         engine
             .complete_source_stream_reconciliation(BTreeSet::from(["BTC".into()]), 100, 2)
             .unwrap();
@@ -6508,6 +6559,31 @@ mod tests {
         engine.note_continuous_source_history(120);
         assert_eq!(engine.history_complete_through_ms(), Some(110));
         assert!(!engine.source_is_fresh(&candidate, 2));
+        engine
+            .ingest(
+                AcceptedPublicResponse {
+                    request_kind: ReadRequestKind::ExpandedSourceState,
+                    source_tier: Some(SourceTier::Inactive),
+                    subject: candidate.clone(),
+                    requested_at_mono: 4,
+                    received_at_mono: 4,
+                    valid_until_mono: 80_004,
+                    payload: PublicPayload::SourceState(SourceStateResponse {
+                        candidate_id: candidate.clone(),
+                        account_value: Decimal::from(1_000),
+                        source_time_ms: 2,
+                        positions: BTreeMap::new(),
+                        closed_candles: Vec::new(),
+                    }),
+                },
+                4,
+            )
+            .unwrap();
+        assert!(!engine.source_is_fresh(&candidate, 4));
+        engine
+            .admit_reconciled_source_wallet(&candidate, 2, 4)
+            .unwrap();
+        assert!(engine.source_is_fresh(&candidate, 4));
     }
 
     #[test]
@@ -6865,9 +6941,12 @@ mod tests {
         engine
             .mark_source_stream_gap(&BTreeSet::from(["BTC".into()]), 1_002)
             .unwrap();
-        assert!(engine.source_stream_healthy());
+        assert!(!engine.source_stream_healthy());
         assert_eq!(engine.source_market_coverage_count(), 1);
-        assert_eq!(engine.mfce.previous_source_exposure("BTC"), Decimal::ZERO);
+        assert_eq!(
+            engine.mfce.previous_source_exposure("BTC"),
+            Decimal::new(1, 1)
+        );
         assert_eq!(
             engine.mfce.previous_source_exposure("ETH"),
             Decimal::new(2, 1)
