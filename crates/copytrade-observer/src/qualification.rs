@@ -1544,9 +1544,15 @@ async fn run_qualification_impl<const CONTINUOUS: bool>(
                                             .await
                                             .map_err(|error| {
                                                 format!("trade subscriptions: {error:?}")
-                                            })?;
+                                        })?;
                                         subscribed_trade_markets = markets;
-                                        coverage_ready_markets.clear();
+                                        coverage_ready_markets = subscribed_trade_markets.clone();
+                                        engine
+                                            .replace_source_market_coverage(
+                                                coverage_ready_markets.clone(),
+                                                clock.now_ms(),
+                                            )
+                                            .map_err(|error| error.to_string())?;
                                         coverage_pending_markets.clear();
                                         coverage_reconciliation_remaining.clear();
                                         coverage_gap_started_at = None;
