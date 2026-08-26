@@ -46,7 +46,7 @@ const MFCE_BOOTSTRAP_UNCERTAINTY_BPS: Decimal = Decimal::from_parts(100, 0, 0, f
 // The lower bound is the production admission floor; the upper bound separates
 // bounded exploration from exploit allocation. Uncertainty remains additive so
 // a noisier forecast must clear a still-higher gross-return threshold.
-const MFCE_MINIMUM_FRICTION_MULTIPLE: Decimal = Decimal::from_parts(3, 0, 0, false, 0);
+const MFCE_MINIMUM_FRICTION_MULTIPLE: Decimal = Decimal::from_parts(4, 0, 0, false, 0);
 const MFCE_EXPLOIT_FRICTION_MULTIPLE: Decimal = Decimal::from_parts(5, 0, 0, false, 0);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
@@ -3049,7 +3049,7 @@ mod tests {
     }
 
     #[test]
-    fn policy_requires_three_times_friction_and_exploits_at_five_times() {
+    fn policy_requires_four_times_friction_and_exploits_at_five_times() {
         let evaluate = |q50_gross_bps| {
             evaluate_allocation_policy(&MfceAllocationInput {
                 prediction: MfcePrediction {
@@ -3071,14 +3071,14 @@ mod tests {
             .unwrap()
         };
 
-        let below_floor = evaluate(69);
-        assert_eq!(below_floor.required_median_bps, Decimal::from(70));
+        let below_floor = evaluate(89);
+        assert_eq!(below_floor.required_median_bps, Decimal::from(90));
         assert_eq!(below_floor.policy_state, MfcePolicyState::Reject);
         assert_eq!(
             below_floor.reason,
             Some(MfceRejectionReason::MedianBelowFrictionAndUncertainty)
         );
-        assert_eq!(evaluate(70).policy_state, MfcePolicyState::Explore);
+        assert_eq!(evaluate(90).policy_state, MfcePolicyState::Explore);
         assert_eq!(evaluate(109).policy_state, MfcePolicyState::Explore);
         assert_eq!(evaluate(110).policy_state, MfcePolicyState::Exploit);
     }
@@ -3167,7 +3167,7 @@ mod tests {
         let tail = evaluate_allocation_policy(&MfceAllocationInput {
             prediction: MfcePrediction {
                 q10_gross_bps: Decimal::from(-120),
-                q50_gross_bps: Decimal::from(80),
+                q50_gross_bps: Decimal::from(90),
                 ..base
             },
             friction_bps: Decimal::from(20),

@@ -7210,7 +7210,7 @@ mod tests {
             .friction_bps
             .checked_add(high_fee.friction_bps)
             .and_then(|sum| sum.checked_div(Decimal::from(2)))
-            .and_then(|midpoint| midpoint.checked_mul(Decimal::from(3)))
+            .and_then(|midpoint| midpoint.checked_mul(Decimal::from(4)))
             .unwrap();
         let gross_prediction = crate::mfce::MfcePrediction {
             model_epoch: 7,
