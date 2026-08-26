@@ -42,6 +42,12 @@ const MFCE_SCORE_EPSILON_BPS: Decimal = Decimal::ONE;
 const MFCE_BOOTSTRAP_Q10_BPS: Decimal = Decimal::from_parts(100, 0, 0, true, 0);
 const MFCE_BOOTSTRAP_Q50_BPS: Decimal = Decimal::ZERO;
 const MFCE_BOOTSTRAP_UNCERTAINTY_BPS: Decimal = Decimal::from_parts(100, 0, 0, false, 0);
+// Require a materially wider gross move than the estimated round-trip cost.
+// The lower bound is the production admission floor; the upper bound separates
+// bounded exploration from exploit allocation. Uncertainty remains additive so
+// a noisier forecast must clear a still-higher gross-return threshold.
+const MFCE_MINIMUM_FRICTION_MULTIPLE: Decimal = Decimal::from_parts(3, 0, 0, false, 0);
+const MFCE_EXPLOIT_FRICTION_MULTIPLE: Decimal = Decimal::from_parts(5, 0, 0, false, 0);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -1795,7 +1801,13 @@ fn evaluate_distribution(input: &MfceAllocationInput) -> Result<MfceAllocationDe
     }
     let required_median_bps = input
         .friction_bps
-        .checked_add(input.prediction.uncertainty_bps)
+        .checked_mul(MFCE_MINIMUM_FRICTION_MULTIPLE)
+        .and_then(|value| value.checked_add(input.prediction.uncertainty_bps))
+        .ok_or(MfceError::Arithmetic)?;
+    let exploit_median_bps = input
+        .friction_bps
+        .checked_mul(MFCE_EXPLOIT_FRICTION_MULTIPLE)
+        .and_then(|value| value.checked_add(input.prediction.uncertainty_bps))
         .ok_or(MfceError::Arithmetic)?;
     let net_q50_bps = input
         .prediction
@@ -1834,7 +1846,12 @@ fn evaluate_distribution(input: &MfceAllocationInput) -> Result<MfceAllocationDe
             MfcePolicyState::Reject,
             Some(MfceRejectionReason::StrongNegativeExpectancy),
         )
-    } else if conservative_edge_bps <= Decimal::ZERO {
+    } else if input.prediction.q50_gross_bps < required_median_bps {
+        (
+            MfcePolicyState::Reject,
+            Some(MfceRejectionReason::MedianBelowFrictionAndUncertainty),
+        )
+    } else if input.prediction.q50_gross_bps < exploit_median_bps {
         (MfcePolicyState::Explore, None)
     } else {
         (MfcePolicyState::Exploit, None)
@@ -3032,11 +3049,46 @@ mod tests {
     }
 
     #[test]
+    fn policy_requires_three_times_friction_and_exploits_at_five_times() {
+        let evaluate = |q50_gross_bps| {
+            evaluate_allocation_policy(&MfceAllocationInput {
+                prediction: MfcePrediction {
+                    model_epoch: 1,
+                    q10_gross_bps: Decimal::from(-20),
+                    q50_gross_bps: Decimal::from(q50_gross_bps),
+                    uncertainty_bps: Decimal::from(10),
+                    pooled_sample_count: 64,
+                    direction_sample_count: 32,
+                    asset_direction_sample_count: 8,
+                    used_model: true,
+                },
+                friction_bps: Decimal::from(20),
+                copytrade_conviction: Decimal::ONE,
+                current_position_notional: Decimal::ZERO,
+                proposed_position_notional: Decimal::from(100),
+                remaining_tail_loss_budget_usd: Decimal::from(1_000),
+            })
+            .unwrap()
+        };
+
+        let below_floor = evaluate(69);
+        assert_eq!(below_floor.required_median_bps, Decimal::from(70));
+        assert_eq!(below_floor.policy_state, MfcePolicyState::Reject);
+        assert_eq!(
+            below_floor.reason,
+            Some(MfceRejectionReason::MedianBelowFrictionAndUncertainty)
+        );
+        assert_eq!(evaluate(70).policy_state, MfcePolicyState::Explore);
+        assert_eq!(evaluate(109).policy_state, MfcePolicyState::Explore);
+        assert_eq!(evaluate(110).policy_state, MfcePolicyState::Exploit);
+    }
+
+    #[test]
     fn policy_separates_exploit_explore_economic_reject_and_hard_tail_reject() {
         let base = MfcePrediction {
             model_epoch: 1,
             q10_gross_bps: Decimal::from(-21),
-            q50_gross_bps: Decimal::from(72),
+            q50_gross_bps: Decimal::from(92),
             uncertainty_bps: Decimal::from(10),
             pooled_sample_count: 64,
             direction_sample_count: 32,
@@ -3053,13 +3105,13 @@ mod tests {
         })
         .unwrap();
         assert_eq!(exploit.policy_state, MfcePolicyState::Exploit);
-        assert_eq!(exploit.conservative_edge_bps, Decimal::from(48));
+        assert_eq!(exploit.conservative_edge_bps, Decimal::from(68));
         assert!(exploit.allocation_fraction > Decimal::from_parts(7, 0, 0, false, 1));
 
         let explore = evaluate_allocation_policy(&MfceAllocationInput {
             prediction: MfcePrediction {
                 q10_gross_bps: Decimal::from(-30),
-                q50_gross_bps: Decimal::from(36),
+                q50_gross_bps: Decimal::from(100),
                 uncertainty_bps: Decimal::from(24),
                 ..base.clone()
             },
@@ -3071,7 +3123,7 @@ mod tests {
         })
         .unwrap();
         assert_eq!(explore.policy_state, MfcePolicyState::Explore);
-        assert_eq!(explore.conservative_edge_bps, Decimal::from(-5));
+        assert_eq!(explore.conservative_edge_bps, Decimal::from(59));
         assert!(explore.allocation_fraction <= MFCE_EXPLORE_POOL_FRACTION);
         assert!(explore.allocation_fraction > Decimal::from_parts(2, 0, 0, false, 1));
 
@@ -3106,7 +3158,11 @@ mod tests {
             remaining_tail_loss_budget_usd: Decimal::from(1_000),
         })
         .unwrap();
-        assert_eq!(zero_edge.policy_state, MfcePolicyState::Explore);
+        assert_eq!(zero_edge.policy_state, MfcePolicyState::Reject);
+        assert_eq!(
+            zero_edge.reason,
+            Some(MfceRejectionReason::MedianBelowFrictionAndUncertainty)
+        );
 
         let tail = evaluate_allocation_policy(&MfceAllocationInput {
             prediction: MfcePrediction {
@@ -3163,7 +3219,7 @@ mod tests {
     #[test]
     fn cross_sectional_allocation_is_order_independent_and_favors_score() {
         let strong = allocation_candidate("BTC", 1, 10, 120, 10, 10, 1_000);
-        let weak = allocation_candidate("ETH", 2, 10, 50, 10, 20, 1_000);
+        let weak = allocation_candidate("ETH", 2, 10, 80, 10, 20, 1_000);
         let forward = allocate_cross_sectional(
             &[strong.clone(), weak.clone()],
             Decimal::from(1_000),
@@ -3253,7 +3309,10 @@ mod tests {
     fn cold_start_explore_can_borrow_idle_gross_but_remains_cross_sectionally_bounded() {
         let candidates = (0..30)
             .map(|index| {
-                allocation_candidate(&format!("A{index:02}"), index + 1, -40, 30, 10, 25, 100)
+                let mut candidate =
+                    allocation_candidate(&format!("A{index:02}"), index + 1, -40, 30, 10, 25, 100);
+                candidate.input.prediction.used_model = false;
+                candidate
             })
             .collect::<Vec<_>>();
         let decisions =
@@ -3284,7 +3343,7 @@ mod tests {
     #[test]
     fn exploit_has_first_claim_and_explore_uses_only_idle_notional_capacity() {
         let exploit = allocation_candidate("PROVEN", 1, -90, 100, 10, 10, 1_000);
-        let explore = allocation_candidate("UNKNOWN", 2, -40, 30, 10, 25, 100);
+        let explore = allocation_candidate("UNKNOWN", 2, -40, 65, 10, 25, 100);
         let decisions = allocate_cross_sectional(
             &[exploit, explore],
             Decimal::from(100),
@@ -3302,7 +3361,7 @@ mod tests {
 
     #[test]
     fn a_single_uncertain_explore_state_is_limited_below_the_pool_ceiling() {
-        let candidate = allocation_candidate("MEME", 1, -1_000, 11, 10, 100, 1_000);
+        let candidate = allocation_candidate("MEME", 1, -1_000, 140, 10, 100, 1_000);
         let decisions =
             allocate_cross_sectional(&[candidate], Decimal::from(1_000), Decimal::from(1_000))
                 .unwrap();
@@ -3316,7 +3375,7 @@ mod tests {
     #[test]
     fn explore_pool_cannot_crowd_out_exploit_and_tail_budget_stays_global() {
         let exploit = allocation_candidate("BTC", 1, -90, 100, 10, 10, 1_000);
-        let explore = allocation_candidate("ETH", 2, -90, 30, 10, 25, 1_000);
+        let explore = allocation_candidate("ETH", 2, -90, 65, 10, 25, 1_000);
         let decisions =
             allocate_cross_sectional(&[exploit, explore], Decimal::from(1_000), Decimal::from(15))
                 .unwrap();
