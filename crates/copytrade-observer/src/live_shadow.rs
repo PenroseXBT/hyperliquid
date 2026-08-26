@@ -1012,6 +1012,10 @@ fn canonicalize_allocation_total(
         ));
     }
     allocations.insert(anchor, anchor_allocation);
+    // Exact-zero residuals carry no attribution. Retaining one produces a
+    // pending action that the shared live/shadow restore invariant correctly
+    // rejects even though all material quantity is fully attributable.
+    allocations.retain(|_, quantity| !quantity.is_zero());
     Ok(())
 }
 
@@ -5269,16 +5273,24 @@ impl LiveShadowEngine {
     ) -> Result<u64, LiveShadowError> {
         let bytes = std::fs::read(path).map_err(core)?;
         let envelope = decode_unsigned_snapshot(&bytes, expected_identity)?;
-        let state = envelope.payload;
+        let mut state = envelope.payload;
         state.ledger.validate_integrity().map_err(core)?;
         state.target_ledger.validate_integrity().map_err(core)?;
         state.mfce.validate().map_err(mfce_error)?;
-        for pending in state.pending.values() {
+        for pending in state.pending.values_mut() {
             if pending.remaining_order_quantity <= Decimal::ZERO {
                 return Err(LiveShadowError::Core(
                     "pending action has invalid remaining order quantity".into(),
                 ));
             }
+            // Schema-v12 snapshots may contain a zero residual emitted by the
+            // former stable-anchor canonicalizer. The envelope checksum is
+            // verified before this normalization; dropping an exact zero is
+            // semantics-preserving and leaves every material attribution and
+            // order quantity unchanged.
+            pending
+                .component_remaining
+                .retain(|_, quantity| !quantity.is_zero());
             pending_component_total(pending.action.side, &pending.component_remaining)?;
         }
         if state.mfce_time_high_watermark < state.mfce.time_high_watermark() {
@@ -8823,6 +8835,20 @@ mod tests {
     }
 
     #[test]
+    fn source_allocation_drops_an_exact_zero_anchor_residual() {
+        let expected = Decimal::new(148, 1);
+        let mut allocations = BTreeMap::from([
+            ("source:a".to_string(), expected),
+            ("source:b".to_string(), Decimal::ONE),
+        ]);
+        canonicalize_allocation_total(&mut allocations, expected).unwrap();
+        assert_eq!(
+            allocations,
+            BTreeMap::from([("source:a".to_string(), expected)])
+        );
+    }
+
+    #[test]
     fn pending_component_quantity_stays_exact_across_partial_fills() {
         let total = Decimal::from(24);
         let first_fill = Decimal::from(7);
@@ -10293,6 +10319,78 @@ mod tests {
         std::fs::remove_file(second_path).unwrap();
         assert_eq!(first_bytes, second_bytes);
         assert!(decode_unsigned_snapshot(&second_bytes, &identity).is_ok());
+    }
+
+    #[test]
+    fn unsigned_snapshot_restore_drops_only_legacy_zero_pending_components() {
+        let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../config/copytrade.json");
+        let config = CopyTradeConfig::from_path(path).unwrap();
+        let identity = SnapshotIdentity {
+            source_tree_sha256: "source".into(),
+            observer_binary_sha256: "observer".into(),
+            configuration_sha256: "configuration".into(),
+            risk_policy_sha256: "risk".into(),
+        };
+        let state_path = std::env::temp_dir().join(format!(
+            "copytrade-zero-pending-component-{}.msgpack",
+            std::process::id()
+        ));
+        let quantity = Decimal::new(148, 1);
+        let mut first =
+            LiveShadowEngine::new(config.clone(), b"zero-pending", "first", 40_000, 80_000)
+                .unwrap();
+        first.pending.insert(
+            "NEAR".into(),
+            PendingAction {
+                action: PlannedAction {
+                    decision_id: DecisionId([1; 32]),
+                    target_version: TargetVersion(1),
+                    asset: "NEAR".into(),
+                    side: Side::Sell,
+                    rounded_notional: Decimal::from(28),
+                    reduce_only: true,
+                    action_ordinal: 0,
+                    retry_generation: 0,
+                    planned_cloid: PlannedCloid([2; 16]),
+                },
+                root_planned_cloid: PlannedCloid([2; 16]).to_string(),
+                remaining_order_quantity: quantity,
+                component_remaining: BTreeMap::from([
+                    ("source:a".into(), -quantity),
+                    ("source:b".into(), Decimal::ZERO),
+                ]),
+                execution: None,
+            },
+        );
+        first
+            .persist_unsigned_state(&state_path, &identity)
+            .unwrap();
+        let encoded = std::fs::read(&state_path).unwrap();
+        assert_eq!(
+            decode_unsigned_snapshot(&encoded, &identity)
+                .unwrap()
+                .payload
+                .pending["NEAR"]
+                .component_remaining
+                .len(),
+            2
+        );
+
+        let mut restored =
+            LiveShadowEngine::new(config, b"zero-pending", "restored", 40_000, 80_000).unwrap();
+        restored
+            .restore_unsigned_state(&state_path, &identity)
+            .unwrap();
+        std::fs::remove_file(state_path).unwrap();
+        assert_eq!(
+            restored.pending["NEAR"].component_remaining,
+            BTreeMap::from([("source:a".to_string(), -quantity)])
+        );
+        assert_eq!(
+            pending_component_total(Side::Sell, &restored.pending["NEAR"].component_remaining)
+                .unwrap(),
+            quantity
+        );
     }
 
     #[test]
