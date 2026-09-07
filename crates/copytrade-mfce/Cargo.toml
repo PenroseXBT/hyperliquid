@@ -1,9 +1,0 @@
-[package]
-name = "copytrade-mfce"
-version = "0.1.0"
-edition = "2021"
-publish = false
-
-[dependencies]
-lightgbm3 = { version = "=1.0.10", default-features = false }
-serde_json = "1.0.113"

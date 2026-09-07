@@ -1,8 +1,4 @@
-*
-!Dockerfile.railway
-!railway.toml
-!THIRD_PARTY_NOTICES.md
-!scripts/
-!scripts/run_su6_railway.sh
-!railway-frozen/
-!railway-frozen/**
+CANDIDATE.json
+CUTOVER.md
+package-files.sha256
+source-files.sha256

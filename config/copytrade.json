@@ -73,7 +73,8 @@
     "min_order_usd": 10.0,
     "max_order_usd": 2500.0,
     "latency_timeout_ms": 200,
-    "order_rate_limit_per_sec": 5.0
+    "order_rate_limit_per_sec": 5.0,
+    "fee_multiplier": 4.0
   },
   "performance": {
     "target_sharpe": 15.0,
