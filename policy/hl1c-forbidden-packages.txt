@@ -1,4 +1,0 @@
-# Packages forbidden from the lean live-capable daemon. Signing is supplied by
-# copytrade-signer; the generic SDK and dotenv configuration remain excluded.
-hyperliquid_rust_sdk
-dotenv

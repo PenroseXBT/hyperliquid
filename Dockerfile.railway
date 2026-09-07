@@ -10,7 +10,8 @@ RUN apt-get update \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
-COPY --chmod=0555 railway-frozen/copytrade-observer /app/bin/copytrade-observer
+COPY --chmod=0555 railway-frozen/engine /app/bin/engine
+COPY --chmod=0444 railway-frozen/engine.sha256 /app/bin/engine.sha256
 COPY --chmod=0555 scripts/run_su6_railway.sh /app/bin/run_su6_railway.sh
 COPY --chmod=0444 railway-frozen/copytrade.json /app/config/copytrade.json
 COPY --chmod=0444 railway-frozen/very-profitable-layer.json /app/config/very-profitable-layer.json
@@ -18,9 +19,10 @@ COPY --chmod=0444 railway-frozen/read-api-policy.json /app/policy/read-api-polic
 COPY --chmod=0444 railway-frozen/public-mainnet-transport.json /app/policy/public-mainnet-transport.json
 COPY --chmod=0444 THIRD_PARTY_NOTICES.md /app/THIRD_PARTY_NOTICES.md
 
-# Fail the image build if the frozen observer cannot load on the exact runtime
-# base (for example, because a Linux C++ runtime dependency leaked in).
-RUN /app/bin/copytrade-observer \
+# Verify the embedded frozen artifact before any container can start trading.
+RUN sha256sum --check /app/bin/engine.sha256 \
+    && sha256sum /app/bin/engine \
+    && /app/bin/engine \
         --config /app/config/copytrade.json \
         --very-profitable-layer /app/config/very-profitable-layer.json \
         --print-persistence-schema-hash \

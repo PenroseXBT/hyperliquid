@@ -10,9 +10,9 @@ mkdir -p target/production-release
 cargo fmt --all -- --check
 cargo check --locked --workspace
 cargo test --locked --workspace 2>&1 | tee target/production-release/test-report.txt
-bash scripts/check_hl1c_isolation.sh 2>&1 \
+bash scripts/check_engine_boundary.sh 2>&1 \
   | tee target/production-release/isolation-report.txt
 git diff --check
-cargo build --locked --release -p copytrade-observer
-shasum -a 256 target/release/copytrade-observer \
-  > target/production-release/copytrade-observer.sha256
+cargo build --locked --release -p engine
+shasum -a 256 target/release/engine \
+  > target/production-release/engine.sha256

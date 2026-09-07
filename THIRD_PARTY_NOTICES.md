@@ -1,6 +1,6 @@
 # Third-party notices
 
-The MFCE observer binary statically incorporates the following native software
+The engine binary statically incorporates the following native software
 through `lightgbm3` 1.0.10 and `lightgbm3-sys` 1.0.8. The exact Rust package
 archives and checksums are recorded in `Cargo.lock`.
 
