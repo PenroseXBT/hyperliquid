@@ -41,6 +41,20 @@ fn production_fatal_exit_requires_an_explicit_operator_restart() {
     assert!(!wrapper.contains("railway_restart=true"));
 }
 
+#[test]
+fn production_uses_single_canonical_system_v1_root() {
+    let wrapper = include_str!("../../../scripts/run_su6_railway.sh");
+    assert!(wrapper.contains("SU6_DATA_ROOT:-/data/system-v1"));
+    assert!(!wrapper.contains("SU6_DATA_ROOT_NAME"));
+    assert!(!wrapper.contains("RAILWAY_VOLUME_MOUNT_PATH"));
+    assert!(!wrapper.contains("su6-continuous"));
+    // V1 starts clean: no copy or migration of a prior root.
+    assert!(!wrapper.contains("cp "));
+    assert!(!wrapper.contains("rsync"));
+    let watch = include_str!("../../../scripts/live_watch.sh");
+    assert!(watch.contains("SU6_DATA_ROOT:-/data/system-v1"));
+}
+
 struct Launcher(PathBuf);
 
 impl Launcher {
@@ -81,8 +95,7 @@ impl Launcher {
     fn run(&self) -> Output {
         Command::new("bash")
             .arg(self.0.join("launcher.sh"))
-            .env("RAILWAY_VOLUME_MOUNT_PATH", self.0.join("volume"))
-            .env("SU6_DATA_ROOT_NAME", "live")
+            .env("SU6_DATA_ROOT", self.0.join("volume/live"))
             .env("SYNC_CALLS", self.0.join("sync-calls"))
             .env(
                 "PATH",

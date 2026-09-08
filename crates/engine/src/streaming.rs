@@ -674,11 +674,7 @@ impl MarketDirectory {
         }
         let mut by_dex = BTreeMap::<String, Vec<MarketMetadataAsset>>::new();
         for asset in &metadata.universe {
-            let dex = asset
-                .name
-                .split_once(':')
-                .map_or("", |(dex, _)| dex)
-                .to_string();
+            let dex = crate::hip3::dex_for_market(&asset.name).to_string();
             by_dex.entry(dex).or_default().push(asset.clone());
         }
         Ok(Self { by_dex })
@@ -724,7 +720,7 @@ impl MarketDirectory {
 pub fn parse_asset_contexts(
     data: &Value,
     directory: &MarketDirectory,
-    live_taker_fee_bps: Option<Decimal>,
+    fees: &StreamFeeSnapshot,
 ) -> Result<(MarketSnapshotResponse, MarketMetadataResponse), StreamingError> {
     let raw_ctxs = data.get("ctxs").ok_or(StreamingError::InvalidPayload)?;
     let mut ctxs = BTreeMap::<String, &Value>::new();
@@ -785,9 +781,20 @@ pub fn parse_asset_contexts(
         MarketMetadataResponse {
             universe,
             contexts,
-            live_taker_fee_bps,
+            live_taker_fee_bps: fees.live_taker_fee_bps,
+            dex_fee_scales: fees.dex_fee_scales.clone(),
+            user_fee_state: fees.user_fee_state,
         },
     ))
+}
+
+/// Cached account/DEX fee inputs carried on the streaming market refresh path
+/// (no hot-path requests; refreshed with market metadata).
+#[derive(Debug, Clone, Default)]
+pub struct StreamFeeSnapshot {
+    pub live_taker_fee_bps: Option<Decimal>,
+    pub dex_fee_scales: BTreeMap<String, Decimal>,
+    pub user_fee_state: Option<crate::hip3_fees::UserPerpFeeState>,
 }
 
 pub struct StreamingSourceBook {
@@ -1364,22 +1371,34 @@ mod tests {
                 MarketMetadataAsset {
                     name: "BTC".into(),
                     size_decimals: 5,
+                    growth_mode: false,
                 },
                 MarketMetadataAsset {
                     name: "xyz:XYZ100".into(),
                     size_decimals: 2,
+                    growth_mode: false,
                 },
             ],
             contexts: BTreeMap::new(),
             live_taker_fee_bps: Some(Decimal::new(35, 2)),
+            dex_fee_scales: BTreeMap::new(),
+            user_fee_state: None,
         };
         let directory = MarketDirectory::from_metadata(&metadata).unwrap();
         let data = json!({"ctxs":[
             ["",[{"markPx":"100","midPx":"101","funding":"0.0001"}]],
             ["xyz",[{"markPx":"10","midPx":null,"funding":"-0.0002"}]]
         ]});
-        let (mids, contexts) =
-            parse_asset_contexts(&data, &directory, metadata.live_taker_fee_bps).unwrap();
+        let (mids, contexts) = parse_asset_contexts(
+            &data,
+            &directory,
+            &StreamFeeSnapshot {
+                live_taker_fee_bps: metadata.live_taker_fee_bps,
+                dex_fee_scales: metadata.dex_fee_scales.clone(),
+                user_fee_state: metadata.user_fee_state,
+            },
+        )
+        .unwrap();
         assert_eq!(mids.mids["BTC"], Decimal::from(101));
         assert_eq!(mids.mids["xyz:XYZ100"], Decimal::from(10));
         assert_eq!(
@@ -1397,6 +1416,7 @@ mod tests {
                     .map(|index| MarketMetadataAsset {
                         name: format!("M{index:03}"),
                         size_decimals: 2,
+                        growth_mode: false,
                     })
                     .collect(),
             )]),
@@ -1429,6 +1449,7 @@ mod tests {
                     .map(|index| MarketMetadataAsset {
                         name: format!("M{index:03}"),
                         size_decimals: 2,
+                        growth_mode: false,
                     })
                     .collect(),
             )]),

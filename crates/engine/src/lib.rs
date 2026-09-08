@@ -6,6 +6,8 @@ pub mod execution;
 pub mod ingestion;
 pub use ::mfce::{delayed as mfce_delayed, lifecycle as mfce};
 pub mod domain;
+pub mod hip3;
+pub mod hip3_fees;
 pub mod learning;
 #[cfg(test)]
 #[path = "../tests/support/profitability.rs"]

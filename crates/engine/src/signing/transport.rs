@@ -5,7 +5,6 @@ use rust_decimal::Decimal;
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::str::FromStr;
-use std::sync::{Arc, Mutex};
 
 const EXCHANGE_URL: &str = "https://api.hyperliquid.xyz/exchange";
 const INFO_URL: &str = "https://api.hyperliquid.xyz/info";
@@ -99,6 +98,13 @@ pub struct ExchangePositionSnapshot {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ExchangeEquitySnapshot {
+    pub equity: Decimal,
+    pub observed_at_ms: u64,
+    pub source_hash: PayloadHash,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ExchangeOpenOrder {
     pub cloid: Option<PlannedCloid>,
     pub exchange_order_id: String,
@@ -168,10 +174,6 @@ impl std::error::Error for ReconciliationError {}
 
 #[async_trait]
 pub trait AuthenticatedExchangeTransport: Send + Sync {
-    fn install_perp_dex_order(&self, _order: Vec<String>) -> Result<(), ReconciliationError> {
-        Ok(())
-    }
-
     async fn submit_ioc(
         &self,
         request: SignedIocRequest,
@@ -186,19 +188,110 @@ pub trait AuthenticatedExchangeTransport: Send + Sync {
 
     async fn read_positions(&self) -> Result<ExchangePositionSnapshot, ReconciliationError>;
 
+    async fn read_equity(&self) -> Result<ExchangeEquitySnapshot, ReconciliationError>;
+
     async fn read_open_orders(&self) -> Result<ExchangeOpenOrdersSnapshot, ReconciliationError>;
 
     async fn read_funding(
         &self,
         cursor: FundingCursor,
     ) -> Result<FundingBatch, ReconciliationError>;
+
+    /// DEX-scoped position snapshot (`""` = default perp DEX). Defaults to
+    /// the aggregated view so existing test transports keep compiling;
+    /// the mainnet transport overrides with a `dex`-qualified query.
+    async fn read_positions_for_dex(
+        &self,
+        dex: &str,
+    ) -> Result<ExchangePositionSnapshot, ReconciliationError> {
+        if dex.is_empty() {
+            self.read_positions().await
+        } else {
+            Ok(ExchangePositionSnapshot {
+                positions: BTreeMap::new(),
+                account_equity: Decimal::ZERO,
+                observed_at_ms: 0,
+                source_hash: crate::domain::decision::PayloadHash([0; 32]),
+            })
+        }
+    }
+
+    /// DEX-scoped open-order snapshot. Same defaulting rule as positions.
+    async fn read_open_orders_for_dex(
+        &self,
+        dex: &str,
+    ) -> Result<ExchangeOpenOrdersSnapshot, ReconciliationError> {
+        if dex.is_empty() {
+            self.read_open_orders().await
+        } else {
+            Ok(ExchangeOpenOrdersSnapshot {
+                orders: Vec::new(),
+                source_hash: crate::domain::decision::PayloadHash([0; 32]),
+            })
+        }
+    }
+
+    /// DEXes this transport will reconcile. `[""]` preserves native-only
+    /// behavior unless the signer is told about active builder DEXes.
+    fn reconciled_dexes(&self) -> Vec<String> {
+        vec![String::new()]
+    }
+}
+
+/// Merge per-DEX position snapshots. Wire keys are canonical (`GOLD` vs
+/// `xyz:GOLD` vs `foo:GOLD`) so venues never collide; a hard collision with
+/// conflicting quantities is an integrity error.
+pub fn merge_position_snapshots(
+    snapshots: Vec<ExchangePositionSnapshot>,
+) -> Result<ExchangePositionSnapshot, ReconciliationError> {
+    let mut positions = BTreeMap::new();
+    let mut equity = Decimal::ZERO;
+    let mut observed_at_ms = 0;
+    let mut source_hash = crate::domain::decision::PayloadHash([0; 32]);
+    for snapshot in snapshots {
+        for (asset, quantity) in snapshot.positions {
+            if let Some(prior) = positions.insert(asset.clone(), quantity) {
+                if prior != quantity {
+                    return Err(ReconciliationError::InvalidResponse(
+                        "per-DEX position collision".into(),
+                    ));
+                }
+            }
+        }
+        equity = equity
+            .checked_add(snapshot.account_equity)
+            .ok_or(ReconciliationError::Arithmetic)?;
+        observed_at_ms = observed_at_ms.max(snapshot.observed_at_ms);
+        source_hash = snapshot.source_hash;
+    }
+    Ok(ExchangePositionSnapshot {
+        positions,
+        account_equity: equity,
+        observed_at_ms,
+        source_hash,
+    })
+}
+
+/// Merge per-DEX open-order snapshots (CLOID uniqueness enforced downstream).
+pub fn merge_open_order_snapshots(
+    snapshots: Vec<ExchangeOpenOrdersSnapshot>,
+) -> ExchangeOpenOrdersSnapshot {
+    let mut orders = Vec::new();
+    let mut source_hash = crate::domain::decision::PayloadHash([0; 32]);
+    for snapshot in snapshots {
+        orders.extend(snapshot.orders);
+        source_hash = snapshot.source_hash;
+    }
+    ExchangeOpenOrdersSnapshot {
+        orders,
+        source_hash,
+    }
 }
 
 #[derive(Clone)]
 pub struct HyperliquidMainnetTransport {
     client: reqwest::Client,
     execution_account: String,
-    perp_dex_order: Arc<Mutex<Vec<String>>>,
 }
 
 impl HyperliquidMainnetTransport {
@@ -217,7 +310,6 @@ impl HyperliquidMainnetTransport {
         Ok(Self {
             client,
             execution_account: execution_account.to_ascii_lowercase(),
-            perp_dex_order: Arc::new(Mutex::new(vec![String::new()])),
         })
     }
 
@@ -273,50 +365,6 @@ impl HyperliquidMainnetTransport {
             .map_err(|error| ReconciliationError::InvalidResponse(error.to_string()))?;
         Ok((decoded, hash))
     }
-
-    fn builder_dexes(&self) -> Result<Vec<String>, ReconciliationError> {
-        let order = self
-            .perp_dex_order
-            .lock()
-            .map_err(|_| ReconciliationError::Transport("perp DEX mutex poisoned".into()))?;
-        Ok(order
-            .iter()
-            .filter(|dex| !dex.is_empty())
-            .cloned()
-            .collect())
-    }
-
-    async fn read_clearinghouse_state(
-        &self,
-        dex: &str,
-    ) -> Result<(ClearinghouseStateWire, PayloadHash), ReconciliationError> {
-        let mut body = serde_json::json!({
-            "type":"clearinghouseState",
-            "user":self.execution_account,
-        });
-        if !dex.is_empty() {
-            body.as_object_mut()
-                .expect("constructed object")
-                .insert("dex".into(), serde_json::json!(dex));
-        }
-        self.info(body).await
-    }
-
-    async fn read_open_orders_for_dex(
-        &self,
-        dex: &str,
-    ) -> Result<(Vec<OpenOrderWire>, PayloadHash), ReconciliationError> {
-        let mut body = serde_json::json!({
-            "type":"frontendOpenOrders",
-            "user":self.execution_account,
-        });
-        if !dex.is_empty() {
-            body.as_object_mut()
-                .expect("constructed object")
-                .insert("dex".into(), serde_json::json!(dex));
-        }
-        self.info(body).await
-    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -339,15 +387,6 @@ impl UserRoleWire {
 
 #[async_trait]
 impl AuthenticatedExchangeTransport for HyperliquidMainnetTransport {
-    fn install_perp_dex_order(&self, order: Vec<String>) -> Result<(), ReconciliationError> {
-        validate_perp_dex_order(&order)?;
-        *self
-            .perp_dex_order
-            .lock()
-            .map_err(|_| ReconciliationError::Transport("perp DEX mutex poisoned".into()))? = order;
-        Ok(())
-    }
-
     async fn submit_ioc(
         &self,
         request: SignedIocRequest,
@@ -432,87 +471,139 @@ impl AuthenticatedExchangeTransport for HyperliquidMainnetTransport {
     }
 
     async fn read_positions(&self) -> Result<ExchangePositionSnapshot, ReconciliationError> {
-        let mut states = vec![(String::new(), self.read_clearinghouse_state("").await?)];
-        for dex in self.builder_dexes()? {
-            states.push((dex.clone(), self.read_clearinghouse_state(&dex).await?));
+        self.read_positions_for_dex("").await
+    }
+
+    async fn read_positions_for_dex(
+        &self,
+        dex: &str,
+    ) -> Result<ExchangePositionSnapshot, ReconciliationError> {
+        let mut body = serde_json::json!({
+            "type":"clearinghouseState",
+            "user":self.execution_account,
+        });
+        if !dex.is_empty() {
+            body.as_object_mut()
+                .expect("constructed object")
+                .insert("dex".into(), serde_json::json!(dex));
         }
+        let (wire, source_hash): (ClearinghouseStateWire, _) = self.info(body).await?;
         let mut positions = BTreeMap::new();
-        let mut account_equity = Decimal::ZERO;
-        let mut observed_at_ms = u64::MAX;
-        let mut hashes = Vec::with_capacity(states.len());
-        for (dex, (wire, source_hash)) in states {
-            hashes.push(source_hash);
-            account_equity = account_equity
-                .checked_add(parse_decimal(&wire.margin_summary.account_value)?)
-                .ok_or(ReconciliationError::Arithmetic)?;
-            observed_at_ms = observed_at_ms.min(wire.time);
-            for position in wire.asset_positions {
-                let quantity = parse_signed_decimal(&position.position.szi)?;
-                if !quantity.is_zero() {
-                    positions.insert(prefixed_asset(&dex, position.position.coin), quantity);
+        for position in wire.asset_positions {
+            let quantity = parse_signed_decimal(&position.position.szi)?;
+            if !quantity.is_zero() {
+                // Builder-DEX clearinghouse rows carry bare coin names;
+                // re-qualify to canonical wire form so venues never collide.
+                let coin = position.position.coin;
+                let canonical = if dex.is_empty() || coin.contains(':') {
+                    coin
+                } else {
+                    format!("{dex}:{coin}")
+                };
+                if positions.insert(canonical.clone(), quantity).is_some() {
+                    return Err(ReconciliationError::InvalidResponse(
+                        "duplicate position asset in DEX snapshot".into(),
+                    ));
                 }
             }
         }
         Ok(ExchangePositionSnapshot {
             positions,
-            account_equity,
-            observed_at_ms,
-            source_hash: combine_payload_hashes("clearinghouseState", &hashes),
+            account_equity: parse_decimal(&wire.margin_summary.account_value)?,
+            observed_at_ms: wire.time,
+            source_hash,
+        })
+    }
+
+    async fn read_equity(&self) -> Result<ExchangeEquitySnapshot, ReconciliationError> {
+        let (wire, source_hash): (ClearinghouseStateWire, _) = self
+            .info(serde_json::json!({
+                "type":"clearinghouseState",
+                "user":self.execution_account,
+            }))
+            .await?;
+        let equity = parse_decimal(&wire.margin_summary.account_value)?;
+        Ok(ExchangeEquitySnapshot {
+            equity,
+            observed_at_ms: wire.time,
+            source_hash,
         })
     }
 
     async fn read_open_orders(&self) -> Result<ExchangeOpenOrdersSnapshot, ReconciliationError> {
-        let mut pages = vec![(String::new(), self.read_open_orders_for_dex("").await?)];
-        for dex in self.builder_dexes()? {
-            pages.push((dex.clone(), self.read_open_orders_for_dex(&dex).await?));
+        self.read_open_orders_for_dex("").await
+    }
+
+    async fn read_open_orders_for_dex(
+        &self,
+        dex: &str,
+    ) -> Result<ExchangeOpenOrdersSnapshot, ReconciliationError> {
+        // DEX-scoped reconciliation must prove the SAME dex. A failed
+        // `frontendOpenOrders(user, dex="xyz")` is UNKNOWN for xyz and must
+        // never be converted into EMPTY by reading the native response and
+        // filtering for an "xyz:" prefix (which would false-negative when the
+        // native response is healthy but xyz is unresolved).
+        let mut body = serde_json::json!({
+            "type":"frontendOpenOrders",
+            "user":self.execution_account,
+        });
+        if !dex.is_empty() {
+            body.as_object_mut()
+                .expect("constructed object")
+                .insert("dex".into(), serde_json::json!(dex));
         }
-        let mut orders = Vec::new();
-        let mut identities = std::collections::BTreeSet::new();
-        let mut hashes = Vec::with_capacity(pages.len());
-        for (dex, (wire, source_hash)) in pages {
-            hashes.push(source_hash);
-            for order in wire {
-                let original_quantity = parse_decimal(&order.orig_sz)?;
-                let remaining_quantity = parse_decimal(&order.sz)?;
-                if remaining_quantity > original_quantity {
-                    return Err(ReconciliationError::InvalidResponse(
-                        "open order remaining quantity exceeds original quantity".into(),
-                    ));
-                }
-                let is_buy = match order.side.as_str() {
-                    "B" => true,
-                    "A" => false,
-                    _ => {
-                        return Err(ReconciliationError::InvalidResponse(
-                            "unknown open order side".into(),
-                        ))
-                    }
-                };
-                let order = ExchangeOpenOrder {
-                    cloid: order.cloid.as_deref().map(parse_cloid).transpose()?,
-                    exchange_order_id: order.oid.to_string(),
-                    asset: prefixed_asset(&dex, order.coin),
-                    is_buy,
-                    limit_price: parse_decimal(&order.limit_px)?,
-                    original_quantity,
-                    remaining_quantity,
-                    reduce_only: order.reduce_only,
-                    order_type: order.order_type,
-                    is_trigger: order.is_trigger,
-                    is_position_tpsl: order.is_position_tpsl,
-                };
-                let key = (order.asset.clone(), order.exchange_order_id.clone());
-                if !identities.insert(key) {
-                    return Err(ReconciliationError::InvalidResponse(
-                        "duplicate open order identity across DEX scopes".into(),
-                    ));
-                }
-                orders.push(order);
+        // No cross-DEX/native fallback: any transport, HTTP, or decode
+        // failure propagates and the caller's reconciliation barrier fails
+        // closed as it already does for unresolved exchange truth.
+        let (wire, source_hash): (Vec<OpenOrderWire>, PayloadHash) = self.info(body).await?;
+        let mut orders = Vec::with_capacity(wire.len());
+        for order in wire {
+            let original_quantity = parse_decimal(&order.orig_sz)?;
+            let remaining_quantity = parse_decimal(&order.sz)?;
+            if remaining_quantity > original_quantity {
+                return Err(ReconciliationError::InvalidResponse(
+                    "open order remaining quantity exceeds original quantity".into(),
+                ));
             }
+            let is_buy = match order.side.as_str() {
+                "B" => true,
+                "A" => false,
+                _ => {
+                    return Err(ReconciliationError::InvalidResponse(
+                        "unknown open order side".into(),
+                    ))
+                }
+            };
+            let canonical = if dex.is_empty() || order.coin.contains(':') {
+                order.coin.clone()
+            } else {
+                format!("{dex}:{}", order.coin)
+            };
+            // Venue separation: `GOLD`, `xyz:GOLD`, `foo:GOLD` never alias.
+            if dex.is_empty() {
+                if canonical.contains(':') {
+                    continue;
+                }
+            } else if !canonical.starts_with(&format!("{dex}:")) {
+                continue;
+            }
+            orders.push(ExchangeOpenOrder {
+                cloid: order.cloid.as_deref().map(parse_cloid).transpose()?,
+                exchange_order_id: order.oid.to_string(),
+                asset: canonical,
+                is_buy,
+                limit_price: parse_decimal(&order.limit_px)?,
+                original_quantity,
+                remaining_quantity,
+                reduce_only: order.reduce_only,
+                order_type: order.order_type,
+                is_trigger: order.is_trigger,
+                is_position_tpsl: order.is_position_tpsl,
+            });
         }
         Ok(ExchangeOpenOrdersSnapshot {
             orders,
-            source_hash: combine_payload_hashes("frontendOpenOrders", &hashes),
+            source_hash,
         })
     }
 
@@ -562,42 +653,6 @@ fn validate_decimal(value: Decimal) -> Result<(), String> {
     } else {
         Ok(())
     }
-}
-
-fn validate_perp_dex_order(order: &[String]) -> Result<(), ReconciliationError> {
-    if order.is_empty()
-        || order.first().is_none_or(|dex| !dex.is_empty())
-        || order.iter().any(|dex| {
-            dex.len() > 32
-                || (!dex.is_empty()
-                    && !dex
-                        .bytes()
-                        .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit()))
-        })
-        || order
-            .iter()
-            .collect::<std::collections::BTreeSet<_>>()
-            .len()
-            != order.len()
-    {
-        return Err(ReconciliationError::InvalidResponse(
-            "invalid production DEX order".into(),
-        ));
-    }
-    Ok(())
-}
-
-fn prefixed_asset(dex: &str, coin: String) -> String {
-    if dex.is_empty() || coin.contains(':') {
-        coin
-    } else {
-        format!("{dex}:{coin}")
-    }
-}
-
-fn combine_payload_hashes(kind: &str, hashes: &[PayloadHash]) -> PayloadHash {
-    let payload = serde_json::to_vec(&(kind, hashes)).expect("payload hash input serializes");
-    hash_payload_bytes(&payload)
 }
 
 fn parse_decimal(value: &str) -> Result<Decimal, ReconciliationError> {
@@ -1157,29 +1212,47 @@ mod tests {
     }
 
     #[test]
-    fn builder_scoped_account_rows_use_prefixed_asset_identity() {
-        assert_eq!(prefixed_asset("", "BTC".into()), "BTC");
-        assert_eq!(prefixed_asset("xyz", "AMD".into()), "xyz:AMD");
-        assert_eq!(prefixed_asset("xyz", "xyz:AMD".into()), "xyz:AMD");
-    }
-
-    #[test]
-    fn malformed_production_dex_order_is_rejected() {
-        for order in [
-            vec![],
-            vec!["xyz".to_string()],
-            vec![String::new(), "xyz".into(), "xyz".into()],
-            vec![String::new(), "XYZ".into()],
-            vec![String::new(), "bad-dex".into()],
-        ] {
-            assert!(validate_perp_dex_order(&order).is_err());
-        }
-        assert!(validate_perp_dex_order(&[String::new(), "xyz".into()]).is_ok());
-    }
-
-    #[test]
     fn typed_trait_surface_has_no_generic_request_operation() {
         fn accepts_transport<T: AuthenticatedExchangeTransport>() {}
         accepts_transport::<HyperliquidMainnetTransport>();
+    }
+
+    #[test]
+    fn per_dex_snapshots_merge_without_same_symbol_collision() {
+        use std::str::FromStr;
+        let native = ExchangePositionSnapshot {
+            positions: BTreeMap::from([("GOLD".into(), Decimal::from_str("1.5").unwrap())]),
+            account_equity: Decimal::from(100),
+            observed_at_ms: 10,
+            source_hash: crate::domain::decision::PayloadHash([0; 32]),
+        };
+        let xyz = ExchangePositionSnapshot {
+            positions: BTreeMap::from([
+                ("xyz:GOLD".into(), Decimal::from_str("2.0").unwrap()),
+                ("xyz:NVDA".into(), Decimal::from_str("3.0").unwrap()),
+            ]),
+            account_equity: Decimal::from(40),
+            observed_at_ms: 11,
+            source_hash: crate::domain::decision::PayloadHash([1; 32]),
+        };
+        let foo = ExchangePositionSnapshot {
+            positions: BTreeMap::from([("foo:GOLD".into(), Decimal::from_str("-1.0").unwrap())]),
+            account_equity: Decimal::from(20),
+            observed_at_ms: 12,
+            source_hash: crate::domain::decision::PayloadHash([2; 32]),
+        };
+        let merged = merge_position_snapshots(vec![native, xyz, foo]).unwrap();
+        assert_eq!(merged.positions.len(), 4);
+        assert_eq!(merged.positions["GOLD"], Decimal::from_str("1.5").unwrap());
+        assert_eq!(
+            merged.positions["xyz:GOLD"],
+            Decimal::from_str("2.0").unwrap()
+        );
+        assert_eq!(
+            merged.positions["foo:GOLD"],
+            Decimal::from_str("-1.0").unwrap()
+        );
+        assert_eq!(merged.account_equity, Decimal::from(160));
+        assert_eq!(merged.observed_at_ms, 12);
     }
 }

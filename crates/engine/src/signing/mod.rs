@@ -613,6 +613,15 @@ impl ApiWalletSecret {
         Ok(Self { wallet })
     }
 
+    #[cfg(test)]
+    pub fn sign_ioc_for_test(
+        &self,
+        intent: &production::AuthorizedExecutionIntent,
+        nonce: u64,
+    ) -> Result<transport::SignedIocRequest, SignerError> {
+        self.sign_ioc(intent, nonce)
+    }
+
     pub async fn load_from_file(path: &Path) -> Result<Self, SignerError> {
         validate_secret_file(path)?;
         let bytes = tokio::fs::read(path)

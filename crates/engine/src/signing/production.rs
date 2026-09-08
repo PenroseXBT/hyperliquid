@@ -20,7 +20,7 @@ use crate::signing::{
     SubmissionState,
 };
 use rust_decimal::Decimal;
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use tokio::sync::Mutex;
 
@@ -287,6 +287,9 @@ pub struct ProductionSigner<T: AuthenticatedExchangeTransport> {
     deployed_risk_policy_hash: RiskPolicyHash,
     deployed_configuration_hash: ConfigHash,
     release_manifest_hash: [u8; 32],
+    /// Builder DEXes with open exposure / pending lifecycle. `""` (native)
+    /// is always reconciled; HIP-3 DEXes are added as they become active.
+    active_dexes: Mutex<BTreeSet<String>>,
 }
 
 impl<T: AuthenticatedExchangeTransport> ProductionSigner<T> {
@@ -313,7 +316,86 @@ impl<T: AuthenticatedExchangeTransport> ProductionSigner<T> {
             deployed_risk_policy_hash,
             deployed_configuration_hash,
             release_manifest_hash,
+            active_dexes: Mutex::new(BTreeSet::new()),
         })
+    }
+
+    /// Declare builder DEXes with open exposure / pending lifecycle /
+    /// recent execution. Reconciliation aggregates the native DEX plus
+    /// every active HIP-3 DEX so a successful HIP-3 order never becomes
+    /// an unknown exchange root after restart.
+    pub async fn set_active_dexes(&self, dexes: BTreeSet<String>) {
+        let mut active = self.active_dexes.lock().await;
+        *active = dexes
+            .into_iter()
+            .filter(|dex| !dex.is_empty() && dex != crate::hip3::EXCLUDED_HIP3_DEX)
+            .collect();
+    }
+
+    async fn reconciled_dex_list(&self) -> Vec<String> {
+        let mut dexes = vec![String::new()];
+        let active = self.active_dexes.lock().await;
+        let mut extra: Vec<String> = active.iter().cloned().collect();
+        extra.sort();
+        dexes.extend(extra);
+        dexes
+    }
+
+    async fn read_aggregated_positions(
+        &self,
+    ) -> Result<crate::signing::transport::ExchangePositionSnapshot, SignerError> {
+        let mut snapshots = Vec::new();
+        for dex in self.reconciled_dex_list().await {
+            let snapshot = self
+                .transport
+                .read_positions_for_dex(&dex)
+                .await
+                .map_err(|error| SignerError::Reconciliation(error.to_string()))?;
+            snapshots.push(snapshot);
+        }
+        crate::signing::transport::merge_position_snapshots(snapshots)
+            .map_err(|error| SignerError::Reconciliation(error.to_string()))
+    }
+
+    async fn read_aggregated_open_orders(
+        &self,
+    ) -> Result<crate::signing::transport::ExchangeOpenOrdersSnapshot, SignerError> {
+        let mut snapshots = Vec::new();
+        for dex in self.reconciled_dex_list().await {
+            let snapshot = self
+                .transport
+                .read_open_orders_for_dex(&dex)
+                .await
+                .map_err(|error| SignerError::Reconciliation(error.to_string()))?;
+            snapshots.push(snapshot);
+        }
+        Ok(crate::signing::transport::merge_open_order_snapshots(
+            snapshots,
+        ))
+    }
+
+    /// Refresh active DEXes from durable registry intents plus live-state
+    /// positions before a reconciliation barrier.
+    pub async fn refresh_active_dexes_from_registry_and_positions(
+        &self,
+        positions: &BTreeMap<String, Decimal>,
+    ) {
+        let registry = self.registry.lock().await;
+        let mut dexes = BTreeSet::new();
+        for (_, intent, _) in registry.entries() {
+            let dex = crate::hip3::dex_for_market(&intent.asset);
+            if !dex.is_empty() {
+                dexes.insert(dex.to_string());
+            }
+        }
+        drop(registry);
+        for asset in positions.keys() {
+            let dex = crate::hip3::dex_for_market(asset);
+            if !dex.is_empty() {
+                dexes.insert(dex.to_string());
+            }
+        }
+        self.set_active_dexes(dexes).await;
     }
 
     pub async fn reconcile_startup(
@@ -418,16 +500,12 @@ impl<T: AuthenticatedExchangeTransport> ProductionSigner<T> {
         // Order resolution is bracketed by a fresh open-order and account
         // snapshot. If an order changes while this barrier runs, one of these
         // exact comparisons fails and the next recovery pass closes the gap.
-        let open_orders = self
-            .transport
-            .read_open_orders()
-            .await
-            .map_err(|error| SignerError::Reconciliation(error.to_string()))?;
-        let positions = self
-            .transport
-            .read_positions()
-            .await
-            .map_err(|error| SignerError::Reconciliation(error.to_string()))?;
+        // Both snapshots aggregate the native DEX plus every active HIP-3 DEX
+        // so builder-perp exposure reconciles exactly like native perps.
+        self.refresh_active_dexes_from_registry_and_positions(&live_state.positions())
+            .await;
+        let open_orders = self.read_aggregated_open_orders().await?;
+        let positions = self.read_aggregated_positions().await?;
         *self.exchange_snapshot.lock().await = Some(positions.clone());
         // The clearinghouse response used for positions also carries account
         // equity. Keep the risk snapshot atomic: a second request can observe a
@@ -456,12 +534,6 @@ impl<T: AuthenticatedExchangeTransport> ProductionSigner<T> {
 
     pub async fn exchange_snapshot(&self) -> Option<ExchangePositionSnapshot> {
         self.exchange_snapshot.lock().await.clone()
-    }
-
-    pub fn install_perp_dex_order(&self, order: Vec<String>) -> Result<(), SignerError> {
-        self.transport
-            .install_perp_dex_order(order)
-            .map_err(|error| SignerError::Reconciliation(error.to_string()))
     }
 
     /// The incremental cursor is not proof that a durable submitted action was
@@ -773,16 +845,10 @@ impl<T: AuthenticatedExchangeTransport> ProductionSigner<T> {
 
         // Rebuild committed exposure from current exchange state immediately
         // before authorization. The core projector remains the sole risk formula.
-        let positions = self
-            .transport
-            .read_positions()
-            .await
-            .map_err(|error| SignerError::Reconciliation(error.to_string()))?;
-        let open_orders = self
-            .transport
-            .read_open_orders()
-            .await
-            .map_err(|error| SignerError::Reconciliation(error.to_string()))?;
+        // Reads aggregate native + active HIP-3 DEXes so builder-perp risk is
+        // exact at the signing barrier.
+        let positions = self.read_aggregated_positions().await?;
+        let open_orders = self.read_aggregated_open_orders().await?;
         context.projection_input.current_equity = positions.account_equity;
         context.projection_input.filled_positions =
             positions_to_notional(&positions, &context.projection_input)?;
@@ -1365,12 +1431,96 @@ mod tests {
             }
             Ok(snapshot)
         }
+        async fn read_equity(
+            &self,
+        ) -> Result<
+            crate::signing::transport::ExchangeEquitySnapshot,
+            crate::signing::transport::ReconciliationError,
+        > {
+            FlatAccount.read_equity().await
+        }
         async fn read_open_orders(
             &self,
         ) -> Result<ExchangeOpenOrdersSnapshot, crate::signing::transport::ReconciliationError>
         {
             FlatAccount.read_open_orders().await
         }
+    }
+
+    #[tokio::test]
+    async fn hip3_ioc_uses_authoritative_asset_id_and_reconciles_per_dex() {
+        use crate::signing::transport::{merge_open_order_snapshots, merge_position_snapshots};
+        // Signing serializes the authoritative HIP-3 asset ID (dex order
+        // ["", "xyz"] => xyz:NVDA = 110_000) while preserving CLOID.
+        let (_, mut intent) = context_and_intent();
+        intent.asset = "xyz:NVDA".into();
+        intent.asset_index = 110_000;
+        intent.quantity = Decimal::new(1, 1);
+        let mut market_rules = intent.authorization.projection_input.market_rules.clone();
+        market_rules.insert(
+            "xyz:NVDA".into(),
+            crate::domain::portfolio_risk::MarketRules {
+                mark_price: Decimal::from(100),
+                price_tick: Decimal::ONE,
+                size_step: Decimal::new(1, 2),
+            },
+        );
+        intent.authorization.projection_input.market_rules = market_rules.clone();
+        intent.authorization.projection_input.filled_positions = BTreeMap::new();
+        intent.authorization.projection_input.unconstrained_targets =
+            BTreeMap::from([("xyz:NVDA".into(), Decimal::from(10))]);
+        intent.authorization.projection_input.current_equity = Decimal::from(100);
+        let projection = crate::domain::portfolio_risk::project_and_validate_portfolio(
+            &intent.authorization.projection_input,
+        )
+        .unwrap();
+        intent.projected_portfolio_hash =
+            crate::domain::decision::derive_projection_hash(&projection).unwrap();
+        let intent = intent.seal().unwrap();
+        let wallet = ApiWalletSecret::from_private_key(&format!("{:064x}", 1)).unwrap();
+        // Direct signing check: wire asset == authoritative HIP-3 ID.
+        let request = {
+            let signer = ProductionSigner::new(
+                FlatAccount,
+                ApiWalletSecret::from_private_key(&format!("{:064x}", 1)).unwrap(),
+                SubmissionRegistry::default(),
+                &std::env::temp_dir().join(format!(
+                    "hip3-sign-{}-{}",
+                    std::process::id(),
+                    intent.planned_cloid.to_hex()
+                )),
+                100,
+                intent.risk_policy_hash,
+                intent.configuration_hash,
+                intent.release_manifest_hash,
+            )
+            .unwrap();
+            let _ = signer;
+            wallet
+                .sign_ioc_for_test(&intent, 101)
+                .expect("hip3 signing must serialize")
+        };
+        assert_eq!(request.asset_index, 110_000);
+        assert_eq!(request.cloid, intent.planned_cloid);
+        // Per-DEX aggregation keeps GOLD / xyz:GOLD / foo:GOLD distinct.
+        let native = ExchangePositionSnapshot {
+            positions: BTreeMap::from([("GOLD".into(), Decimal::ONE)]),
+            account_equity: Decimal::from(100),
+            observed_at_ms: 1,
+            source_hash: crate::domain::decision::PayloadHash([0; 32]),
+        };
+        let xyz = ExchangePositionSnapshot {
+            positions: BTreeMap::from([("xyz:GOLD".into(), Decimal::from(2))]),
+            account_equity: Decimal::from(10),
+            observed_at_ms: 2,
+            source_hash: crate::domain::decision::PayloadHash([0; 32]),
+        };
+        let merged = merge_position_snapshots(vec![native, xyz]).unwrap();
+        assert_eq!(merged.positions.len(), 2);
+        assert_eq!(merged.account_equity, Decimal::from(110));
+        let empty = merge_open_order_snapshots(vec![]);
+        assert!(empty.orders.is_empty());
+        let _ = wallet.address_hex();
     }
 
     #[tokio::test]
@@ -1464,6 +1614,18 @@ mod tests {
             Ok(ExchangePositionSnapshot {
                 positions: BTreeMap::new(),
                 account_equity: Decimal::from(100),
+                observed_at_ms: 100,
+                source_hash: crate::domain::decision::PayloadHash([0; 32]),
+            })
+        }
+        async fn read_equity(
+            &self,
+        ) -> Result<
+            crate::signing::transport::ExchangeEquitySnapshot,
+            crate::signing::transport::ReconciliationError,
+        > {
+            Ok(crate::signing::transport::ExchangeEquitySnapshot {
+                equity: Decimal::from(100),
                 observed_at_ms: 100,
                 source_hash: crate::domain::decision::PayloadHash([0; 32]),
             })
@@ -1686,5 +1848,234 @@ mod tests {
             validate_authorized_intent(&intent, &context, &registry),
             Err(AuthorizationFailure::BelowExchangeMinimum)
         );
+    }
+
+    /// DEX-scoped reconciliation must never downgrade UNKNOWN to EMPTY via a
+    /// native fallback. A failing `xyz` read is UNKNOWN even when native is
+    /// healthy (empty or populated).
+    #[derive(Clone)]
+    struct DexScopedMock {
+        orders: std::collections::BTreeMap<String, Result<Vec<ExchangeOpenOrder>, String>>,
+        positions: std::collections::BTreeMap<String, Result<BTreeMap<String, Decimal>, String>>,
+    }
+
+    fn mock_order(asset: &str) -> ExchangeOpenOrder {
+        ExchangeOpenOrder {
+            cloid: None,
+            exchange_order_id: "1".into(),
+            asset: asset.into(),
+            is_buy: true,
+            limit_price: Decimal::from(100),
+            original_quantity: Decimal::ONE,
+            remaining_quantity: Decimal::ONE,
+            reduce_only: false,
+            order_type: "Limit".into(),
+            is_trigger: false,
+            is_position_tpsl: false,
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl AuthenticatedExchangeTransport for DexScopedMock {
+        async fn submit_ioc(
+            &self,
+            _: crate::signing::transport::SignedIocRequest,
+        ) -> Result<SubmissionResponse, SubmissionTransportError> {
+            unreachable!()
+        }
+        async fn lookup_order(
+            &self,
+            _: PlannedCloid,
+        ) -> Result<OrderObservation, crate::signing::transport::ReconciliationError> {
+            unreachable!()
+        }
+        async fn read_fills(
+            &self,
+            _: FillCursor,
+        ) -> Result<UserFillBatch, crate::signing::transport::ReconciliationError> {
+            unreachable!()
+        }
+        async fn read_positions(
+            &self,
+        ) -> Result<ExchangePositionSnapshot, crate::signing::transport::ReconciliationError>
+        {
+            self.read_positions_for_dex("").await
+        }
+        async fn read_positions_for_dex(
+            &self,
+            dex: &str,
+        ) -> Result<ExchangePositionSnapshot, crate::signing::transport::ReconciliationError>
+        {
+            match self.positions.get(dex) {
+                Some(Ok(positions)) => Ok(ExchangePositionSnapshot {
+                    positions: positions.clone(),
+                    account_equity: Decimal::from(100),
+                    observed_at_ms: 1,
+                    source_hash: crate::domain::decision::PayloadHash([0; 32]),
+                }),
+                Some(Err(_)) => Err(crate::signing::transport::ReconciliationError::Transport(
+                    format!("dex {dex} positions UNKNOWN"),
+                )),
+                None => Ok(ExchangePositionSnapshot {
+                    positions: BTreeMap::new(),
+                    account_equity: Decimal::from(100),
+                    observed_at_ms: 1,
+                    source_hash: crate::domain::decision::PayloadHash([0; 32]),
+                }),
+            }
+        }
+        async fn read_equity(
+            &self,
+        ) -> Result<
+            crate::signing::transport::ExchangeEquitySnapshot,
+            crate::signing::transport::ReconciliationError,
+        > {
+            unreachable!()
+        }
+        async fn read_open_orders(
+            &self,
+        ) -> Result<ExchangeOpenOrdersSnapshot, crate::signing::transport::ReconciliationError>
+        {
+            self.read_open_orders_for_dex("").await
+        }
+        async fn read_open_orders_for_dex(
+            &self,
+            dex: &str,
+        ) -> Result<ExchangeOpenOrdersSnapshot, crate::signing::transport::ReconciliationError>
+        {
+            match self.orders.get(dex) {
+                Some(Ok(orders)) => Ok(ExchangeOpenOrdersSnapshot {
+                    orders: orders.clone(),
+                    source_hash: crate::domain::decision::PayloadHash([0; 32]),
+                }),
+                Some(Err(_)) => Err(crate::signing::transport::ReconciliationError::Transport(
+                    format!("dex {dex} orders UNKNOWN"),
+                )),
+                None => Ok(ExchangeOpenOrdersSnapshot {
+                    orders: Vec::new(),
+                    source_hash: crate::domain::decision::PayloadHash([0; 32]),
+                }),
+            }
+        }
+        async fn read_funding(
+            &self,
+            _: FundingCursor,
+        ) -> Result<FundingBatch, crate::signing::transport::ReconciliationError> {
+            unreachable!()
+        }
+    }
+
+    async fn aggregated_orders(
+        mock: DexScopedMock,
+        active: BTreeSet<String>,
+    ) -> Result<ExchangeOpenOrdersSnapshot, SignerError> {
+        let path = std::env::temp_dir().join(format!(
+            "dex-unknown-{}-{}.json",
+            std::process::id(),
+            active.len()
+        ));
+        let (_, intent) = context_and_intent();
+        let signer = ProductionSigner::new(
+            mock,
+            ApiWalletSecret::from_private_key(&format!("{:064x}", 1)).unwrap(),
+            SubmissionRegistry::default(),
+            &path,
+            100,
+            intent.risk_policy_hash,
+            intent.configuration_hash,
+            intent.release_manifest_hash,
+        )
+        .unwrap();
+        signer.set_active_dexes(active).await;
+        signer.read_aggregated_open_orders().await
+    }
+
+    async fn aggregated_positions(
+        mock: DexScopedMock,
+        active: BTreeSet<String>,
+    ) -> Result<ExchangePositionSnapshot, SignerError> {
+        let path = std::env::temp_dir().join(format!(
+            "dex-pos-unknown-{}-{}.json",
+            std::process::id(),
+            active.len()
+        ));
+        let (_, intent) = context_and_intent();
+        let signer = ProductionSigner::new(
+            mock,
+            ApiWalletSecret::from_private_key(&format!("{:064x}", 1)).unwrap(),
+            SubmissionRegistry::default(),
+            &path,
+            100,
+            intent.risk_policy_hash,
+            intent.configuration_hash,
+            intent.release_manifest_hash,
+        )
+        .unwrap();
+        signer.set_active_dexes(active).await;
+        signer.read_aggregated_positions().await
+    }
+
+    #[tokio::test]
+    async fn dex_scoped_reconciliation_never_downgrades_unknown_to_empty() {
+        // DEX success: xyz order visible.
+        let mock = DexScopedMock {
+            orders: BTreeMap::from([("xyz".into(), Ok(vec![mock_order("xyz:NVDA")]))]),
+            positions: BTreeMap::new(),
+        };
+        let snapshot = aggregated_orders(mock, BTreeSet::from(["xyz".into()]))
+            .await
+            .unwrap();
+        assert_eq!(snapshot.orders.len(), 1);
+        assert_eq!(snapshot.orders[0].asset, "xyz:NVDA");
+
+        // DEX empty success: known-empty xyz state.
+        let mock = DexScopedMock {
+            orders: BTreeMap::from([("xyz".into(), Ok(Vec::new()))]),
+            positions: BTreeMap::new(),
+        };
+        let snapshot = aggregated_orders(mock, BTreeSet::from(["xyz".into()]))
+            .await
+            .unwrap();
+        assert!(snapshot.orders.is_empty());
+
+        // DEX failure + native empty => UNKNOWN (not xyz empty).
+        let mock = DexScopedMock {
+            orders: BTreeMap::from([
+                ("xyz".into(), Err("boom".into())),
+                ("".into(), Ok(Vec::new())),
+            ]),
+            positions: BTreeMap::new(),
+        };
+        assert!(aggregated_orders(mock, BTreeSet::from(["xyz".into()]))
+            .await
+            .is_err());
+
+        // DEX failure + native populated => UNKNOWN (never xyz empty, never
+        // alias the BTC order into xyz).
+        let mock = DexScopedMock {
+            orders: BTreeMap::from([
+                ("xyz".into(), Err("boom".into())),
+                ("".into(), Ok(vec![mock_order("BTC")])),
+            ]),
+            positions: BTreeMap::new(),
+        };
+        assert!(aggregated_orders(mock, BTreeSet::from(["xyz".into()]))
+            .await
+            .is_err());
+
+        // Clearinghouse failure: xyz UNKNOWN even when native healthy.
+        let mock = DexScopedMock {
+            orders: BTreeMap::new(),
+            positions: BTreeMap::from([
+                ("xyz".into(), Err("boom".into())),
+                (
+                    "".into(),
+                    Ok(BTreeMap::from([("BTC".into(), Decimal::ONE)])),
+                ),
+            ]),
+        };
+        assert!(aggregated_positions(mock, BTreeSet::from(["xyz".into()]))
+            .await
+            .is_err());
     }
 }

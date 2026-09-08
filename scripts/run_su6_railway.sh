@@ -8,18 +8,24 @@ readonly VERY_PROFITABLE_LAYER="/app/config/very-profitable-layer.json"
 readonly READ_POLICY="/app/policy/read-api-policy.json"
 readonly TRANSPORT_POLICY="/app/policy/public-mainnet-transport.json"
 
-readonly VOLUME_ROOT="${RAILWAY_VOLUME_MOUNT_PATH:?RAILWAY_VOLUME_MOUNT_PATH is required}"
-readonly DATA_ROOT_NAME="${SU6_DATA_ROOT_NAME:?SU6_DATA_ROOT_NAME is required}"
-[[ "$DATA_ROOT_NAME" =~ ^[a-zA-Z0-9._-]+$ && "$DATA_ROOT_NAME" != . && "$DATA_ROOT_NAME" != .. ]] || {
-    printf 'invalid SU6_DATA_ROOT_NAME\n' >&2
+# Canonical production generation SYSTEM_V1. Single permanent state root.
+# Fresh roots start with zero durable baselines by default. Set
+# SU6_SOURCE_BACKFILL_PATH once to perform a validated one-time import of an
+# old root's source-state.sqlite (e.g. /data/system-v1/source-state.sqlite)
+# into the new DATA_ROOT. The import runs only when the destination database
+# does not exist yet; every later restart keeps using the destination file and
+# never re-copies (which would wipe fills accrued since the migration).
+readonly DATA_ROOT="${SU6_DATA_ROOT:-/data/system-v1}"
+[[ "$DATA_ROOT" = /* && "$DATA_ROOT" != "/" ]] || {
+    printf 'invalid SU6_DATA_ROOT\n' >&2
     exit 1
 }
-readonly DATA_ROOT="${VOLUME_ROOT}/${DATA_ROOT_NAME}"
 readonly STATE_ROOT="${DATA_ROOT}/state"
 readonly RUNTIME_ROOT="${DATA_ROOT}/runtime"
 readonly FAILURE_ROOT="${DATA_ROOT}/failure"
 readonly PROCESS_STDERR="${FAILURE_ROOT}/process.stderr"
-SOURCE_BACKFILL_FROM=""
+readonly SOURCE_DB="${DATA_ROOT}/source-state.sqlite"
+readonly BACKFILL_SRC="${SU6_SOURCE_BACKFILL_PATH:-}"
 
 ENGINE_PID=""
 STOP_REQUESTED=0
@@ -39,30 +45,36 @@ trap stop_engine INT TERM
 
 readonly BINARY_SHA="$(sha256sum "$ENGINE" | cut -d ' ' -f 1)"
 log "engine_binary_sha256=${BINARY_SHA}"
+# One-time backfill gate: validate before the engine starts so a misconfigured
+# path fails closed instead of silently running with zero baselines.
+if [[ -n "$BACKFILL_SRC" ]]; then
+    [[ "$BACKFILL_SRC" = /* && "$BACKFILL_SRC" != "/" ]] || {
+        log "invalid_source_backfill_path=${BACKFILL_SRC}"
+        exit 1
+    }
+    [[ "$BACKFILL_SRC" == /data/* ]] || {
+        log "invalid_source_backfill_path=${BACKFILL_SRC}"
+        exit 1
+    }
+    [[ ! -L "$BACKFILL_SRC" && -f "$BACKFILL_SRC" ]] || {
+        log "invalid_source_backfill_path=${BACKFILL_SRC}"
+        exit 1
+    }
+    [[ "$BACKFILL_SRC" != "$SOURCE_DB" ]] || {
+        log "invalid_source_backfill_path=${BACKFILL_SRC}"
+        exit 1
+    }
+    log "source_backfill_path=${BACKFILL_SRC}"
+fi
 # Wrapper-owned directories and diagnostics are an explicit schema, separate
 # from the engine's state/live schema. Never redirect through a symlink.
-for directory in "$VOLUME_ROOT" "$DATA_ROOT" "$STATE_ROOT" "$RUNTIME_ROOT" "$FAILURE_ROOT"; do
+for directory in "$DATA_ROOT" "$STATE_ROOT" "$RUNTIME_ROOT" "$FAILURE_ROOT"; do
     [[ ! -L "$directory" && ( ! -e "$directory" || -d "$directory" ) ]] || {
         log "invalid_runtime_directory=${directory}"
         exit 1
     }
 done
 mkdir -p "$STATE_ROOT" "$RUNTIME_ROOT" "$FAILURE_ROOT"
-if [[ -n "${SU6_SOURCE_BACKFILL_PATH:-}" ]]; then
-    [[ "$SU6_SOURCE_BACKFILL_PATH" = /data/* ]] || {
-        log "invalid_source_backfill_path=${SU6_SOURCE_BACKFILL_PATH} reason=outside_data"
-        exit 1
-    }
-    [[ "$SU6_SOURCE_BACKFILL_PATH" != "$DATA_ROOT/source-state.sqlite" ]] || {
-        log "invalid_source_backfill_path=${SU6_SOURCE_BACKFILL_PATH} reason=equals_destination"
-        exit 1
-    }
-    [[ -f "$SU6_SOURCE_BACKFILL_PATH" && ! -L "$SU6_SOURCE_BACKFILL_PATH" ]] || {
-        log "invalid_source_backfill_path=${SU6_SOURCE_BACKFILL_PATH} reason=not_regular_file"
-        exit 1
-    }
-    SOURCE_BACKFILL_FROM="$SU6_SOURCE_BACKFILL_PATH"
-fi
 shopt -s nullglob dotglob
 for artifact in "$FAILURE_ROOT"/*; do
     case "${artifact##*/}" in
@@ -113,7 +125,9 @@ persist_exit() {
 log "continuous_engine_start=true run_id=${RUN_ID} previous_run_id=${PREVIOUS_RUN_ID} data_root=${DATA_ROOT} execution=authenticated_live"
 
 set +e
-if [[ -n "$SOURCE_BACKFILL_FROM" ]]; then
+# Branch instead of an empty `"${BACKFILL_ARGS[@]}"` expansion: that form fails
+# under `set -u` on bash 3.2 when no backfill flag is set.
+if [[ -n "$BACKFILL_SRC" ]]; then
     "$ENGINE" continuous \
         --config "$CONFIG" \
         --very-profitable-layer "$VERY_PROFITABLE_LAYER" \
@@ -121,7 +135,7 @@ if [[ -n "$SOURCE_BACKFILL_FROM" ]]; then
         --transport-policy "$TRANSPORT_POLICY" \
         --output "$RUNTIME_ROOT" \
         --state-root "$STATE_ROOT" \
-        --source-backfill-from "$SOURCE_BACKFILL_FROM" \
+        --source-backfill-from "$BACKFILL_SRC" \
         2>"$PROCESS_STDERR" &
 else
     "$ENGINE" continuous \

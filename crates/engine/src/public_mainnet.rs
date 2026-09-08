@@ -60,10 +60,12 @@ impl PublicTransportPolicy {
             || self.queue_delay_allowance_ms == 0
             || self.transport_p99_allowance_ms == 0
             || self.market_validity_ms == 0
-            || self.perp_dexes.len() > 4
+            || self.perp_dexes.len() > 20
             || self.perp_dexes.iter().any(|dex| {
-                dex != "xyz"
-                    || dex.is_empty()
+                // Explicit allowlist: any valid builder-dex name (including
+                // future dexes beyond `xyz`). `hyna` stays excludable at the
+                // metadata/parse layer so discovery never re-enables it.
+                dex.is_empty()
                     || dex.len() > 32
                     || !dex
                         .bytes()
@@ -150,6 +152,10 @@ struct PositionWire {
 #[serde(rename_all = "camelCase")]
 struct UserFeesWire {
     user_cross_rate: String,
+    #[serde(default)]
+    user_add_rate: Option<String>,
+    #[serde(default)]
+    active_referral_discount: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -165,6 +171,15 @@ pub struct MarketMetadataResponse {
     /// endpoint, converted from a unit fraction to basis points.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub live_taker_fee_bps: Option<Decimal>,
+    /// DEX deployer fee scales (`perpDexs`) keyed by DEX name. Missing
+    /// entries default to 1.0 in the authoritative fee calculator.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub dex_fee_scales: BTreeMap<String, Decimal>,
+    /// Account-level perp fee state from `userFees` (taker/maker/referral).
+    /// Refreshed alongside `live_taker_fee_bps`; preferred by the
+    /// authoritative fee resolver when present.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub user_fee_state: Option<crate::hip3_fees::UserPerpFeeState>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -176,6 +191,14 @@ pub struct MarketAssetContext {
 pub struct MarketMetadataAsset {
     pub name: String,
     pub size_decimals: u32,
+    /// Per-market HIP-3 growth mode (`growthMode == "enabled"` in meta).
+    /// Native assets are always false.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub growth_mode: bool,
+}
+
+fn is_false(value: &bool) -> bool {
+    !value
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -251,6 +274,7 @@ pub struct HyperliquidPublicTransport<C: Clock> {
     expanded_source_candidates: Arc<Mutex<BTreeSet<String>>>,
     discovered_perp_dexes: Arc<Mutex<BTreeSet<String>>>,
     discovered_perp_dex_order: Arc<Mutex<Vec<String>>>,
+    discovered_perp_dex_fee_scales: Arc<Mutex<BTreeMap<String, Decimal>>>,
 }
 
 const TECHNICAL_UNIVERSE_LIMIT: usize = 25;
@@ -324,6 +348,7 @@ impl<C: Clock> HyperliquidPublicTransport<C> {
             expanded_source_candidates: Arc::new(Mutex::new(BTreeSet::new())),
             discovered_perp_dexes: Arc::new(Mutex::new(BTreeSet::new())),
             discovered_perp_dex_order: Arc::new(Mutex::new(Vec::new())),
+            discovered_perp_dex_fee_scales: Arc::new(Mutex::new(BTreeMap::new())),
         })
     }
 
@@ -392,6 +417,35 @@ impl<C: Clock> HyperliquidPublicTransport<C> {
             .clone()
     }
 
+    pub fn discovered_perp_dex_fee_scales(&self) -> BTreeMap<String, Decimal> {
+        self.discovered_perp_dex_fee_scales
+            .lock()
+            .expect("perp DEX fee mutex poisoned")
+            .clone()
+    }
+
+    /// Attach discovered deployer fee scales for DEXes present in this
+    /// metadata snapshot. Runs on the existing metadata refresh path (no
+    /// hot-path requests).
+    fn apply_discovered_fee_scales(&self, metadata: &mut MarketMetadataResponse) {
+        let scales = self.discovered_perp_dex_fee_scales();
+        if scales.is_empty() {
+            return;
+        }
+        let mut present = BTreeSet::new();
+        for asset in &metadata.universe {
+            let dex = crate::hip3::dex_for_market(&asset.name);
+            if !dex.is_empty() {
+                present.insert(dex.to_string());
+            }
+        }
+        for dex in present {
+            if let Some(scale) = scales.get(&dex) {
+                metadata.dex_fee_scales.insert(dex, *scale);
+            }
+        }
+    }
+
     pub fn candidate_audit_snapshot(&self) -> CandidateAuditSnapshot {
         self.candidate_audit
             .lock()
@@ -399,7 +453,7 @@ impl<C: Clock> HyperliquidPublicTransport<C> {
             .clone()
     }
 
-    async fn fetch_live_taker_fee_bps(&self, user: &str) -> Result<Decimal, ReadFailure> {
+    async fn fetch_user_fees_bytes(&self, user: &str) -> Result<Vec<u8>, ReadFailure> {
         self.metrics.requests_started.fetch_add(1, Ordering::SeqCst);
         let response = self
             .client
@@ -427,7 +481,7 @@ impl<C: Clock> HyperliquidPublicTransport<C> {
             return Err(ReadFailure::InvalidResponse);
         }
         let bytes = read_bounded(response, self.policy.maximum_response_bytes).await?;
-        parse_user_taker_fee_bps(&bytes).map_err(|_| ReadFailure::InvalidResponse)
+        Ok(bytes.to_vec())
     }
 
     async fn fetch_auxiliary_info(&self, body: &Value) -> Result<Vec<u8>, ReadFailure> {
@@ -603,16 +657,31 @@ impl<C: Clock> HyperliquidPublicTransport<C> {
         if request.kind == ReadRequestKind::ExpandedSourceState && !expanded_source {
             return Err(ReadFailure::InvalidResponse);
         }
-        if self.policy.streaming.enabled && request.kind == ReadRequestKind::ExchangeMetadata {
-            let dex_bytes = self
-                .fetch_auxiliary_info(&json!({"type":"perpDexs"}))
-                .await?;
-            let dex_order =
-                parse_perp_dex_order(&dex_bytes).map_err(|_| ReadFailure::InvalidResponse)?;
-            *self
-                .discovered_perp_dex_order
-                .lock()
-                .expect("discovered perp DEX order mutex poisoned") = dex_order;
+        if request.kind == ReadRequestKind::ExchangeMetadata && !scoped_metadata {
+            // Authoritative builder-DEX discovery for both streaming
+            // (`allPerpMetas`) and REST (`metaAndAssetCtxs` per admitted DEX)
+            // paths. The discovered order is the sole input to HIP-3 asset-ID
+            // resolution; the policy allowlist only selects which discovered
+            // DEXes are hydrated, never the DEX universe itself.
+            if let Ok(dex_bytes) = self.fetch_auxiliary_info(&json!({"type":"perpDexs"})).await {
+                if let Ok(dex_order) = parse_perp_dex_order(&dex_bytes) {
+                    *self
+                        .discovered_perp_dex_order
+                        .lock()
+                        .expect("discovered perp DEX order mutex poisoned") = dex_order;
+                    // Refresh DEX deployer fee scales on the same discovery
+                    // refresh (cached; never a hot-path request).
+                    *self
+                        .discovered_perp_dex_fee_scales
+                        .lock()
+                        .expect("perp DEX fee mutex poisoned") =
+                        parse_perp_dex_fee_scales(&dex_bytes);
+                } else if self.policy.streaming.enabled {
+                    return Err(ReadFailure::InvalidResponse);
+                }
+            } else if self.policy.streaming.enabled {
+                return Err(ReadFailure::InvalidResponse);
+            }
         }
         if request.kind.is_source_state() {
             validate_candidate_address(&subject).map_err(|failure| {
@@ -821,13 +890,21 @@ impl<C: Clock> HyperliquidPublicTransport<C> {
             _ => {}
         }
         if let PublicPayload::MarketMetadata(metadata) = &mut payload {
+            self.apply_discovered_fee_scales(metadata);
             let fee_user = self
                 .fee_user
                 .lock()
                 .expect("fee user mutex poisoned")
                 .clone();
             if let Some(fee_user) = fee_user.filter(|_| !scoped_metadata) {
-                metadata.live_taker_fee_bps = Some(self.fetch_live_taker_fee_bps(&fee_user).await?);
+                let fee_bytes = self.fetch_user_fees_bytes(&fee_user).await?;
+                metadata.user_fee_state = Some(
+                    parse_user_fee_state(&fee_bytes).map_err(|_| ReadFailure::InvalidResponse)?,
+                );
+                metadata.live_taker_fee_bps = Some(
+                    parse_user_taker_fee_bps(&fee_bytes)
+                        .map_err(|_| ReadFailure::InvalidResponse)?,
+                );
             }
         }
         if !self.policy.streaming.enabled {
@@ -1430,17 +1507,89 @@ fn merge_market_metadata(
             return Err(ReadFailure::InvalidResponse);
         }
     }
+    // Fee state merges alongside market metadata on the same refresh path.
+    for (dex, scale) in additional.dex_fee_scales {
+        aggregate.dex_fee_scales.insert(dex, scale);
+    }
+    if additional.user_fee_state.is_some() {
+        aggregate.user_fee_state = additional.user_fee_state;
+    }
+    if additional.live_taker_fee_bps.is_some() {
+        aggregate.live_taker_fee_bps = additional.live_taker_fee_bps;
+    }
     Ok(())
 }
 
 fn parse_user_taker_fee_bps(bytes: &[u8]) -> Result<Decimal, PublicReadError> {
+    parse_user_fee_state(bytes).and_then(|state| {
+        state
+            .taker_rate
+            .checked_mul(Decimal::from(10_000))
+            .filter(|fee| *fee >= Decimal::ZERO && *fee <= Decimal::from(100))
+            .ok_or(PublicReadError::InvalidPayload)
+    })
+}
+
+/// Full account-level perp fee state from `userFees` (taker + maker +
+/// referral). Uses the actual trading account's effective rates.
+pub fn parse_user_fee_state(
+    bytes: &[u8],
+) -> Result<crate::hip3_fees::UserPerpFeeState, PublicReadError> {
     let wire: UserFeesWire =
         serde_json::from_slice(bytes).map_err(|_| PublicReadError::InvalidPayload)?;
-    Decimal::from_str(&wire.user_cross_rate)
-        .ok()
-        .and_then(|rate| rate.checked_mul(Decimal::from(10_000)))
-        .filter(|fee| *fee >= Decimal::ZERO && *fee <= Decimal::from(100))
-        .ok_or(PublicReadError::InvalidPayload)
+    let taker_rate =
+        Decimal::from_str(&wire.user_cross_rate).map_err(|_| PublicReadError::InvalidPayload)?;
+    let maker_rate = wire
+        .user_add_rate
+        .as_deref()
+        .map(Decimal::from_str)
+        .transpose()
+        .map_err(|_| PublicReadError::InvalidPayload)?
+        .unwrap_or(taker_rate);
+    let active_referral_discount = wire
+        .active_referral_discount
+        .as_deref()
+        .map(Decimal::from_str)
+        .transpose()
+        .map_err(|_| PublicReadError::InvalidPayload)?
+        .unwrap_or(Decimal::ZERO);
+    let state = crate::hip3_fees::UserPerpFeeState {
+        taker_rate,
+        maker_rate,
+        active_referral_discount,
+    };
+    if !state.validate() || taker_rate < Decimal::ZERO {
+        return Err(PublicReadError::InvalidPayload);
+    }
+    Ok(state)
+}
+
+/// Per-market HIP-3 growth mode (`growthMode == "enabled"` in meta rows).
+fn parse_growth_mode(row: &Value) -> bool {
+    row.get("growthMode")
+        .and_then(Value::as_str)
+        .is_some_and(|mode| mode.eq_ignore_ascii_case("enabled"))
+}
+
+/// DEX deployer fee scale from a `perpDexs` entry. Accepts the documented
+/// `scale`/`feeScale`/`deployerFeeScale` shapes as strings or numbers;
+/// absent entries default to 1.0 (the standard 2x HIP-3 rate).
+fn parse_dex_fee_scale(row: &Value) -> Decimal {
+    for key in ["scale", "feeScale", "deployerFeeScale", "feeShare"] {
+        if let Some(value) = row.get(key) {
+            let parsed = match value {
+                Value::String(text) => Decimal::from_str(text).ok(),
+                Value::Number(number) => Decimal::from_str(&number.to_string()).ok(),
+                _ => None,
+            };
+            if let Some(scale) =
+                parsed.filter(|scale| *scale >= Decimal::ZERO && *scale < Decimal::from(10))
+            {
+                return scale;
+            }
+        }
+    }
+    Decimal::ONE
 }
 
 #[cfg(test)]
@@ -1480,6 +1629,7 @@ fn parse_metadata_with_technical_universe(
         parsed.push(MarketMetadataAsset {
             name,
             size_decimals,
+            growth_mode: parse_growth_mode(asset),
         });
     }
     if parsed.is_empty() {
@@ -1513,6 +1663,8 @@ fn parse_metadata_with_technical_universe(
             universe: parsed,
             contexts,
             live_taker_fee_bps: None,
+            dex_fee_scales: BTreeMap::new(),
+            user_fee_state: None,
         },
         technical_assets,
     ))
@@ -1656,6 +1808,7 @@ fn parse_all_perp_metas(
             universe.push(MarketMetadataAsset {
                 name,
                 size_decimals,
+                growth_mode: parse_growth_mode(row),
             });
         }
     }
@@ -1667,6 +1820,8 @@ fn parse_all_perp_metas(
             universe,
             contexts: BTreeMap::new(),
             live_taker_fee_bps: None,
+            dex_fee_scales: BTreeMap::new(),
+            user_fee_state: None,
         },
         dexes,
     ))
@@ -1697,6 +1852,27 @@ fn parse_perp_dex_order(bytes: &[u8]) -> Result<Vec<String>, PublicReadError> {
         order.push(name.to_string());
     }
     Ok(order)
+}
+
+/// DEX deployer fee scales from a `perpDexs` payload, keyed by DEX name.
+/// Entries without a scale field default to 1.0; malformed payloads yield an
+/// empty map (callers keep the calculator default) rather than failing the
+/// authoritative DEX discovery they ride along with.
+fn parse_perp_dex_fee_scales(bytes: &[u8]) -> BTreeMap<String, Decimal> {
+    let Ok(rows) = serde_json::from_slice::<Vec<Value>>(bytes) else {
+        return BTreeMap::new();
+    };
+    let mut scales = BTreeMap::new();
+    for row in rows.into_iter().skip(1) {
+        let Some(name) = row.get("name").and_then(Value::as_str) else {
+            continue;
+        };
+        if name.is_empty() || name == "hyna" {
+            continue;
+        }
+        scales.insert(name.to_string(), parse_dex_fee_scale(&row));
+    }
+    scales
 }
 
 fn collect_perp_meta_groups<'a>(
@@ -1954,6 +2130,65 @@ mod tests {
         );
         assert!(parse_user_taker_fee_bps(br#"{"userCrossRate":"-0.1"}"#).is_err());
         assert!(parse_user_taker_fee_bps(br#"{"userCrossRate":"nan"}"#).is_err());
+    }
+
+    #[test]
+    fn user_fee_state_parses_taker_maker_and_referral_together() {
+        let state = parse_user_fee_state(
+            br#"{"userCrossRate":"0.000315","userAddRate":"0.000105","activeReferralDiscount":"0.04"}"#,
+        )
+        .unwrap();
+        assert_eq!(state.taker_rate, Decimal::from_str("0.000315").unwrap());
+        assert_eq!(state.maker_rate, Decimal::from_str("0.000105").unwrap());
+        assert_eq!(
+            state.active_referral_discount,
+            Decimal::from_str("0.04").unwrap()
+        );
+        // Legacy payloads without maker/referral fields still parse.
+        let legacy = parse_user_fee_state(br#"{"userCrossRate":"0.000315"}"#).unwrap();
+        assert_eq!(legacy.maker_rate, legacy.taker_rate);
+        assert_eq!(legacy.active_referral_discount, Decimal::ZERO);
+        assert!(parse_user_fee_state(
+            br#"{"userCrossRate":"0.000315","activeReferralDiscount":"1.0"}"#
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn perp_dex_fee_scales_and_growth_mode_parse_per_venue() {
+        let dex_bytes = serde_json::to_vec(&json!([
+            null,
+            {"name":"xyz","feeScale":"0.5"},
+            {"name":"foo","deployerFeeScale":"2"},
+            {"name":"bar"},
+        ]))
+        .unwrap();
+        let scales = parse_perp_dex_fee_scales(&dex_bytes);
+        assert_eq!(scales["xyz"], Decimal::from_str("0.5").unwrap());
+        assert_eq!(scales["foo"], Decimal::from(2));
+        assert_eq!(scales["bar"], Decimal::ONE);
+        assert!(parse_growth_mode(&json!({"growthMode":"enabled"})));
+        assert!(!parse_growth_mode(&json!({})));
+        // Growth mode is per-market state, not DEX-global.
+        let bytes = serde_json::to_vec(&json!([
+            {"universe":[{"name":"BTC","szDecimals":5}]},
+            {"universe":[
+                {"name":"NVDA","szDecimals":2,"growthMode":"enabled"},
+                {"name":"GOLD","szDecimals":2}
+            ]}
+        ]))
+        .unwrap();
+        let dex_order = vec!["".to_string(), "xyz".to_string()];
+        let (metadata, _) = parse_all_perp_metas(&bytes, &dex_order).unwrap();
+        let growth = metadata
+            .universe
+            .iter()
+            .map(|asset| (asset.name.as_str(), asset.growth_mode))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            growth,
+            vec![("BTC", false), ("xyz:NVDA", true), ("xyz:GOLD", false),]
+        );
     }
 
     #[test]

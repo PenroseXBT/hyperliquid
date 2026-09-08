@@ -687,6 +687,8 @@ pub struct CohortRiskFlags {
     pub incomplete_authoritative_wallet_state: bool,
     pub stale_unrealized_profit_dominated: bool,
     pub short_covering_not_initiation: bool,
+    #[serde(default)]
+    pub long_covering_not_initiation: bool,
     pub adverse_funding: bool,
     pub liquidation_cascade: bool,
     pub recent_additions_unwound: bool,
@@ -740,6 +742,7 @@ pub enum CohortDecisionReason {
     StaleUnrealizedProfit,
     NearlyCompletedTwap,
     ShortCovering,
+    LongCovering,
     AdverseFunding,
     LiquidationCascade,
     DominantWallet,
@@ -980,6 +983,11 @@ impl VeryProfitableCohortEngine {
                 && current.net_notional < Decimal::ZERO
                 && current.net_notional > previous.net_notional
         });
+        let derived_long_covering = previous_frame.as_ref().is_some_and(|previous| {
+            previous.net_notional > Decimal::ZERO
+                && current.net_notional > Decimal::ZERO
+                && current.net_notional < previous.net_notional
+        });
         let derived_recent_additions_unwound = previous_target.as_ref().is_some_and(|previous| {
             (previous.cohort_direction > 0 && impulse < -input.rebalance_tolerance)
                 || (previous.cohort_direction < 0 && impulse > input.rebalance_tolerance)
@@ -1016,10 +1024,18 @@ impl VeryProfitableCohortEngine {
         {
             reasons.insert(CohortDecisionReason::NearlyCompletedTwap);
         }
-        if (input.risk_flags.short_covering_not_initiation || derived_short_covering)
-            && input.aggregate.cohort_position < Decimal::ZERO
-        {
-            reasons.insert(CohortDecisionReason::ShortCovering);
+        // Covering vetoes are LONG/SHORT symmetric and apply only when the
+        // candidate would reduce/cover that side. Initiation or expansion of
+        // the same side (proposed_direction == side sign) is never vetoed as
+        // "covering", so new SHORT selection stays production-reachable while
+        // actual cover-reductions remain gated.
+        for veto in covering_vetoes(
+            proposed_direction,
+            input.aggregate.cohort_position,
+            input.risk_flags.short_covering_not_initiation || derived_short_covering,
+            input.risk_flags.long_covering_not_initiation || derived_long_covering,
+        ) {
+            reasons.insert(veto);
         }
         if !input.defer_market_context_admission && input.risk_flags.adverse_funding {
             reasons.insert(CohortDecisionReason::AdverseFunding);
@@ -1252,6 +1268,27 @@ fn impulse_at(
 fn directional_agreement(values: [Decimal; 3]) -> bool {
     let directions = values.map(sign);
     directions[0] != 0 && directions[0] == directions[1] && directions[1] == directions[2]
+}
+
+/// Symmetric covering vetoes. A covering signal vetoes only reduction of the
+/// side being covered (proposed_direction != side sign). Initiation or
+/// expansion of that same side is never vetoed, keeping new SHORT (and LONG)
+/// selection production-reachable. Returns zero, one, or (in mixed states)
+/// both vetoes; ordering is deterministic.
+fn covering_vetoes(
+    proposed_direction: i8,
+    cohort_position: Decimal,
+    short_covering: bool,
+    long_covering: bool,
+) -> Vec<CohortDecisionReason> {
+    let mut vetoes = Vec::new();
+    if proposed_direction >= 0 && short_covering && cohort_position < Decimal::ZERO {
+        vetoes.push(CohortDecisionReason::ShortCovering);
+    }
+    if proposed_direction <= 0 && long_covering && cohort_position > Decimal::ZERO {
+        vetoes.push(CohortDecisionReason::LongCovering);
+    }
+    vetoes
 }
 
 fn sign(value: Decimal) -> i8 {
@@ -1797,6 +1834,39 @@ mod tests {
         ] {
             assert!(protected.reasons.contains(&reason));
         }
+    }
+
+    #[test]
+    fn covering_vetoes_are_symmetric_and_never_block_initiation() {
+        let short_pos = Decimal::new(-8, 1);
+        let long_pos = Decimal::new(8, 1);
+        // New SHORT initiation/expansion while shorts cover elsewhere: allowed.
+        assert!(covering_vetoes(-1, short_pos, true, false).is_empty());
+        // New LONG initiation/expansion while longs cover elsewhere: allowed.
+        assert!(covering_vetoes(1, long_pos, false, true).is_empty());
+        // Reducing/covering the side being covered: vetoed, symmetric.
+        assert_eq!(
+            covering_vetoes(0, short_pos, true, false),
+            vec![CohortDecisionReason::ShortCovering]
+        );
+        assert_eq!(
+            covering_vetoes(0, long_pos, false, true),
+            vec![CohortDecisionReason::LongCovering]
+        );
+        assert_eq!(
+            covering_vetoes(1, short_pos, true, false),
+            vec![CohortDecisionReason::ShortCovering]
+        );
+        assert_eq!(
+            covering_vetoes(-1, long_pos, false, true),
+            vec![CohortDecisionReason::LongCovering]
+        );
+        // Opposite-side initiation is not a cover of this side.
+        assert!(covering_vetoes(1, long_pos, true, false).is_empty());
+        assert!(covering_vetoes(-1, short_pos, false, true).is_empty());
+        // No covering signal: no veto either side.
+        assert!(covering_vetoes(-1, short_pos, false, false).is_empty());
+        assert!(covering_vetoes(1, long_pos, false, false).is_empty());
     }
 
     #[test]

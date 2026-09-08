@@ -508,6 +508,12 @@ pub struct MfceValidationSummary {
 pub struct MfceModelState {
     pub epoch: u64,
     pub trained_through_sample_id: u64,
+    /// Exact durable activation boundary from the training attempt
+    /// (`activation_sample_id = attempted_through + 1`). Legacy snapshots
+    /// predate this field and deserialize as 0, in which case predict()
+    /// falls back to the historical reconstruction.
+    #[serde(default)]
+    pub activation_sample_id: u64,
     pub feature_version: u32,
     pub feature_count: u32,
     pub q10_model: String,
@@ -955,6 +961,15 @@ pub struct MfceEngine {
     policy_outputs: BTreeMap<String, MfcePolicyOutput>,
 }
 
+/// Owned snapshot of the mutable MFCE planning surface. See
+/// `MfceEngine::planning_checkpoint`.
+#[derive(Debug, Clone)]
+pub struct MfcePlanningCheckpoint {
+    state: MfcePersistentState,
+    policy_outputs: BTreeMap<String, MfcePolicyOutput>,
+    completed_source_epoch: u64,
+}
+
 impl MfcePersistentState {
     pub fn time_high_watermark(&self) -> u64 {
         let sample_high_watermark = self.samples.iter().fold(0, |high, sample| {
@@ -1302,6 +1317,26 @@ impl MfceEngine {
     pub fn replace_state(&mut self, state: MfcePersistentState) -> Result<(), MfceError> {
         *self = Self::from_state(state)?;
         Ok(())
+    }
+
+    /// Owned checkpoint of the mutable planning surface only. Model handles
+    /// and background training handles are read-only during planning and are
+    /// intentionally not part of the checkpoint.
+    pub fn planning_checkpoint(&self) -> MfcePlanningCheckpoint {
+        MfcePlanningCheckpoint {
+            state: self.state.clone(),
+            policy_outputs: self.policy_outputs.clone(),
+            completed_source_epoch: self.completed_source_epoch,
+        }
+    }
+
+    /// Restores a checkpoint taken by `planning_checkpoint`. Used only to
+    /// roll back a planning attempt that advanced MFCE without committing a
+    /// coherent DecisionRecord + DecisionSample.
+    pub fn restore_planning_checkpoint(&mut self, checkpoint: MfcePlanningCheckpoint) {
+        self.state = checkpoint.state;
+        self.policy_outputs = checkpoint.policy_outputs;
+        self.completed_source_epoch = checkpoint.completed_source_epoch;
     }
 
     pub fn note_accepted_source_snapshot(&mut self) -> Result<u64, MfceError> {
@@ -2032,11 +2067,17 @@ impl MfceEngine {
         }
         let next_epoch = attempt.candidate_epoch;
         let attempted_through_sample_id = attempt.attempted_through_sample_id;
+        let activation_sample_id = attempt.activation_sample_id;
         let (sender, receiver) = std::sync::mpsc::sync_channel(1);
         std::thread::Builder::new()
             .name("mfce-lightgbm-trainer".into())
             .spawn(move || {
-                let result = train_candidate(&samples, incumbent.as_ref(), next_epoch);
+                let result = train_candidate(
+                    &samples,
+                    incumbent.as_ref(),
+                    next_epoch,
+                    activation_sample_id,
+                );
                 let _ = sender.send(CompletedTraining {
                     attempted_through_sample_id,
                     result,
@@ -2078,11 +2119,16 @@ impl MfceEngine {
             });
         }
         let incumbent_is_eligible = self.state.incumbent.as_ref().is_some_and(|model| {
-            model
-                .trained_through_sample_id
-                .checked_add(model.validation.validation_samples)
-                .and_then(|sample| sample.checked_add(1))
-                .is_some_and(|activation_from| self.state.next_sample_id >= activation_from)
+            if model.activation_sample_id != 0 {
+                self.state.next_sample_id >= model.activation_sample_id
+            } else {
+                // Legacy models predate the durable activation identity.
+                model
+                    .trained_through_sample_id
+                    .checked_add(model.validation.validation_samples)
+                    .and_then(|sample| sample.checked_add(1))
+                    .is_some_and(|activation_from| self.state.next_sample_id >= activation_from)
+            }
         });
         let (base_quantiles, used_model) =
             match self.models.as_ref().filter(|_| incumbent_is_eligible) {
@@ -2901,6 +2947,7 @@ fn train_candidate(
     samples: &[MfceTrainingSample],
     incumbent: Option<&MfceModelState>,
     epoch: u64,
+    activation_sample_id: u64,
 ) -> Result<Option<MfceModelState>, MfceError> {
     if samples.len() < MFCE_MIN_TRAINING_SAMPLES {
         return Ok(None);
@@ -2995,6 +3042,7 @@ fn train_candidate(
     Ok(Some(MfceModelState {
         epoch,
         trained_through_sample_id,
+        activation_sample_id,
         feature_version: MFCE_FEATURE_VERSION,
         feature_count: MFCE_MODEL_FEATURE_COUNT as u32,
         q10_sha256: sha256_hex(q10_model.as_bytes()),
@@ -3028,10 +3076,36 @@ fn served_validation_predictions(
         .map(|(index, sample)| {
             let base_quantiles = raw_model_predictions
                 .map(|predictions| (predictions[index].q10, predictions[index].q50));
+            // Mirror live predict() support selection using the training
+            // prefix only, so the gate scores the served prediction.
+            let origin_support = training_prefix
+                .iter()
+                .filter(|s| s.features.origin() == sample.features.origin())
+                .count();
+            if origin_support < MFCE_MIN_BACKOFF_SAMPLES {
+                // Live serves the conservative bootstrap prior here and
+                // ignores any raw model output.
+                let q10 = MFCE_BOOTSTRAP_Q10_BPS
+                    .to_f64()
+                    .ok_or(MfceError::Arithmetic)?;
+                let q50 = MFCE_BOOTSTRAP_Q50_BPS
+                    .to_f64()
+                    .ok_or(MfceError::Arithmetic)?;
+                return Ok(crate::QuantilePrediction { q10, q50 });
+            }
+            let objective_has_support = training_prefix
+                .iter()
+                .filter(|s| {
+                    s.features.origin() == sample.features.origin()
+                        && s.objective == sample.objective
+                })
+                .count()
+                >= MFCE_MIN_BACKOFF_SAMPLES;
             let conditional = compose_conditional_quantiles(
-                training_prefix
-                    .iter()
-                    .filter(|s| s.features.origin() == sample.features.origin()),
+                training_prefix.iter().filter(|s| {
+                    s.features.origin() == sample.features.origin()
+                        && (!objective_has_support || s.objective == sample.objective)
+                }),
                 &sample.asset,
                 sample.direction,
                 base_quantiles,
@@ -4456,10 +4530,11 @@ mod tests {
                 sample
             })
             .collect::<Vec<_>>();
-        let candidate = train_candidate(&samples, None, 1)
+        let candidate = train_candidate(&samples, None, 1, 501)
             .unwrap()
             .expect("chronologically calibrated candidate");
         assert_eq!(candidate.trained_through_sample_id, 400);
+        assert_eq!(candidate.activation_sample_id, 501);
 
         let mut engine = MfceEngine::default();
         engine.state.samples = samples.into();
@@ -4485,6 +4560,7 @@ mod tests {
         assert_eq!(incumbent.epoch, 1);
         assert_eq!(incumbent.trained_through_sample_id, 400);
         assert_ne!(incumbent.trained_through_sample_id, 500);
+        assert_eq!(incumbent.activation_sample_id, 501);
         let served = engine
             .predict("BTC", MfceDirection::Long, &features(0))
             .unwrap();

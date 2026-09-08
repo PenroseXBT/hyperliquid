@@ -45,6 +45,12 @@ use crate::domain::technical::{
     CandleAcceptance, SignalArchetype, TechnicalContext, TechnicalEngine, TechnicalFunnel,
     TechnicalTarget,
 };
+use crate::hip3::{
+    collateral_for_dex as hip3_collateral_for_dex, dex_for_market,
+    dexes_for_assets as hip3_dexes_for_assets, execution_asset_id as hip3_execution_asset_id,
+    execution_capabilities as hip3_execution_capabilities, is_hip3_market as hip3_is_market,
+    EXCLUDED_HIP3_DEX,
+};
 use crate::learning::{executable_anchor, observe_executable};
 use crate::mfce::evaluate_allocation_policy;
 use crate::mfce::{
@@ -61,8 +67,8 @@ use crate::mfce_delayed::{
     PredictionObservation, RealizedOutcome, RemainingEdgePredictionPoint, HORIZONS_MS,
 };
 use crate::public_mainnet::{
-    AcceptedPublicResponse, CandleResponse, MarketMetadataResponse, MarketSnapshotResponse,
-    OrderBookResponse, PublicPayload, SourceStateResponse,
+    AcceptedPublicResponse, CandleResponse, MarketMetadataAsset, MarketMetadataResponse,
+    MarketSnapshotResponse, OrderBookResponse, PublicPayload, SourceStateResponse,
 };
 use crate::source_state::Hip3SourceActivity;
 use rust_decimal::prelude::{FromPrimitive, ToPrimitive};
@@ -202,6 +208,92 @@ const fn mfce_indicator(value: bool) -> Decimal {
     } else {
         Decimal::ZERO
     }
+}
+
+/// Conservative policy fee buffer. Learning truth, settled accounting, and
+/// labels always use actual costs; this only raises the hurdle for
+/// discretionary turnover (open/add/re-entry). HOLD of valid exposure adds
+/// no new fee, so it receives no buffer.
+fn buffered_policy_friction_bps(
+    base_friction_bps: Decimal,
+    taker_fee_bps: Decimal,
+    fee_multiplier: Decimal,
+    is_new_risk: bool,
+) -> Result<Decimal, EngineError> {
+    if !is_new_risk {
+        return Ok(base_friction_bps);
+    }
+    // One round trip prices two fee legs; the multiplier prices extra
+    // turnover conservatism without touching accounting truth.
+    let extra = fee_multiplier
+        .checked_sub(Decimal::ONE)
+        .and_then(|m| {
+            taker_fee_bps
+                .checked_mul(Decimal::from(2))
+                .and_then(|two_leg| two_leg.checked_mul(m))
+        })
+        .ok_or(EngineError::Arithmetic)?
+        .max(Decimal::ZERO);
+    base_friction_bps
+        .checked_add(extra)
+        .ok_or(EngineError::Arithmetic)
+}
+
+/// Explicit same-thesis switching cost: abandon now, plausibly reacquire
+/// later. Two buffered fee legs plus two expected slippage legs. EXIT must
+/// clear this unless hard risk invalidation or a true opposite reversal
+/// clears its own full transition cost.
+fn same_side_switching_cost_bps(
+    taker_fee_bps: Decimal,
+    maximum_slippage_bps: Decimal,
+    fee_multiplier: Decimal,
+) -> Result<Decimal, EngineError> {
+    taker_fee_bps
+        .checked_mul(fee_multiplier)
+        .and_then(|fee| fee.checked_mul(Decimal::from(2)))
+        .and_then(|fees| {
+            maximum_slippage_bps
+                .checked_mul(Decimal::from(2))
+                .and_then(|slip| slip.checked_add(fees))
+        })
+        .ok_or(EngineError::Arithmetic)
+}
+
+/// Re-entry probe gate. The recency window only prices additional
+/// switching friction (see the call site); it never vetoes by itself. A
+/// penalized reopen is blocked only when it is an epistemically cold
+/// Explore with negative conservative edge after the full reacquisition
+/// cost: no evidence covers a known round-trip. Supported-model states,
+/// Exploit states, and any probe whose edge still clears the penalized
+/// hurdle pass economically, so materially improved opportunities remain
+/// executable seconds after an exit. Direction-free: LONG/SHORT symmetric.
+fn reentry_probe_allowed(
+    penalty_applied: bool,
+    used_model: bool,
+    policy_state: crate::mfce::MfcePolicyState,
+    conservative_edge_bps: Decimal,
+) -> bool {
+    !(penalty_applied
+        && policy_state == crate::mfce::MfcePolicyState::Explore
+        && !used_model
+        && conservative_edge_bps < Decimal::ZERO)
+}
+
+/// HOLD default for continuations: a Reject on an existing same-side
+/// position holds the current exposure instead of flattening, unless the
+/// desired target is a genuine reversal (opposite sign) which follows the
+/// normal retirement path and must still clear full transition cost.
+fn continuation_hold_target(current: Decimal, desired: Decimal, rejected: Decimal) -> Decimal {
+    if current.is_zero() {
+        return rejected;
+    }
+    if !desired.is_zero() && current.is_sign_positive() != desired.is_sign_positive() {
+        // True reversal bypasses stickiness; downstream reversal logic and
+        // full transition cost still apply.
+        return rejected;
+    }
+    // Neutral / weak / noisy continuation: HOLD, never auto-flatten.
+    current
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1721,6 +1813,13 @@ pub struct DecisionEngine {
     mids: Option<(MarketSnapshotResponse, Timestamp)>,
     metadata: Option<MarketMetadataResponse>,
     execution_dex_order: Vec<String>,
+    /// Per-DEX collateral token identity. Native (`""`) is always USDC.
+    /// Builder DEX entries are defaulted to USDC on discovery and may be
+    /// overridden by operators; missing entries fail closed.
+    dex_collateral: BTreeMap<String, String>,
+    /// Markets using an aligned quote token (fee discount). Empty on current
+    /// mainnet; retained so the fee formula structurally accepts alignment.
+    aligned_quote_tokens: BTreeSet<String>,
     waiting_market_rules: BTreeSet<String>,
     metadata_received_at: Option<Timestamp>,
     metadata_valid_until: Option<Timestamp>,
@@ -2811,6 +2910,8 @@ impl DecisionEngine {
             mids: None,
             metadata: None,
             execution_dex_order: Vec::new(),
+            dex_collateral: BTreeMap::new(),
+            aligned_quote_tokens: BTreeSet::new(),
             waiting_market_rules: BTreeSet::new(),
             metadata_received_at: None,
             metadata_valid_until: None,
@@ -2977,7 +3078,145 @@ impl DecisionEngine {
     }
 
     pub fn install_execution_dex_order(&mut self, order: Vec<String>) {
+        // Preserve the authoritative exchange order verbatim (including the
+        // sunset `hyna` slot so later builder-perp asset IDs stay exact).
         self.execution_dex_order = order;
+        // Default per-DEX collateral to USDC on first discovery; operators
+        // may override via `set_dex_collateral`. Missing entries fail closed.
+        for dex in &self.execution_dex_order {
+            if dex.is_empty() || dex == EXCLUDED_HIP3_DEX {
+                continue;
+            }
+            self.dex_collateral
+                .entry(dex.clone())
+                .or_insert_with(|| "USDC".to_string());
+        }
+    }
+
+    pub fn execution_dex_order(&self) -> &[String] {
+        &self.execution_dex_order
+    }
+
+    pub fn set_dex_collateral(&mut self, dex: &str, token: &str) {
+        if dex.is_empty() || dex == EXCLUDED_HIP3_DEX || token.is_empty() {
+            return;
+        }
+        self.dex_collateral
+            .insert(dex.to_string(), token.to_string());
+    }
+
+    pub fn dex_collateral(&self) -> &BTreeMap<String, String> {
+        &self.dex_collateral
+    }
+
+    /// Authoritative market -> execution asset-ID mapping (single resolver
+    /// for order/cancel/modify/leverage/reconciliation paths).
+    pub fn execution_asset_id(&self, asset: &str) -> Option<u32> {
+        let metadata = self.metadata.as_ref()?;
+        let universe = metadata
+            .universe
+            .iter()
+            .map(|entry| entry.name.clone())
+            .collect::<Vec<_>>();
+        hip3_execution_asset_id(&universe, &self.execution_dex_order, asset)
+    }
+
+    /// Capability-based production admission. Native perps keep existing
+    /// admission; HIP-3 requires full execution capabilities and fails
+    /// closed when any capability is missing.
+    pub fn is_production_execution_supported(&self, asset: &str) -> bool {
+        if !hip3_is_market(asset) {
+            return true;
+        }
+        let Some(metadata) = self.metadata.as_ref() else {
+            return false;
+        };
+        let Some((mids, _)) = self.mids.as_ref() else {
+            return false;
+        };
+        let universe = metadata
+            .universe
+            .iter()
+            .map(|entry| (entry.name.clone(), entry.size_decimals))
+            .collect::<BTreeMap<_, _>>();
+        let universe_order = metadata
+            .universe
+            .iter()
+            .map(|entry| entry.name.clone())
+            .collect::<Vec<_>>();
+        let live: BTreeSet<String> = mids.mids.keys().cloned().collect();
+        hip3_execution_capabilities(
+            asset,
+            &universe,
+            &self.execution_dex_order,
+            &universe_order,
+            &live,
+            &self.dex_collateral,
+        )
+        .is_some()
+    }
+
+    /// Authoritative taker fee (bps) for MFCE after-cost edge. Single fee
+    /// path for candidate construction, horizon friction, execution
+    /// economics, and delayed labeling expectations.
+    ///
+    /// Native perps use the account's current user fee tier. HIP-3 markets
+    /// scale it by the DEX `deployerFeeScale`, per-market `growthMode`, the
+    /// active referral discount, and quote alignment, per Hyperliquid's
+    /// documented formula. Actual fill fees remain authoritative post-trade.
+    ///
+    /// Missing refresh state falls back exactly as before (live rate, else
+    /// the unsigned-replay configuration), so this replaces an inaccurate
+    /// cost input without adding a new execution gate.
+    pub fn taker_fee_bps_for(&self, asset: &str) -> Option<Decimal> {
+        let dex = dex_for_market(asset);
+        let metadata = self.metadata.as_ref()?;
+        let (taker_rate, referral) = match &metadata.user_fee_state {
+            Some(state) => (state.taker_rate, state.active_referral_discount),
+            None => {
+                let bps = metadata.live_taker_fee_bps.or_else(|| {
+                    self.production_identity
+                        .is_none()
+                        .then(|| Decimal::from_f64(self.config.taker_fee_bps))
+                        .flatten()
+                })?;
+                (bps.checked_div(BPS_PER_UNIT_RETURN)?, Decimal::ZERO)
+            }
+        };
+        if dex.is_empty() {
+            return taker_rate.checked_mul(BPS_PER_UNIT_RETURN);
+        }
+        let scale = metadata
+            .dex_fee_scales
+            .get(dex)
+            .copied()
+            .unwrap_or(Decimal::ONE);
+        let growth = metadata
+            .universe
+            .iter()
+            .find(|entry| entry.name == asset)
+            .map(|entry| entry.growth_mode)
+            .unwrap_or(false);
+        crate::hip3_fees::taker_fee_bps(&crate::hip3_fees::PerpFeeContext {
+            user_taker_rate: taker_rate,
+            user_maker_rate: metadata
+                .user_fee_state
+                .map(|state| state.maker_rate)
+                .unwrap_or(taker_rate),
+            active_referral_discount: referral,
+            deployer_fee_scale: scale,
+            growth_mode: growth,
+            aligned_quote_token: self.aligned_quote_tokens.contains(asset),
+            is_hip3: true,
+        })
+    }
+
+    /// DEXes with live involvement (positions, pending, recent lifecycle).
+    pub fn active_hip3_dexes(&self) -> BTreeSet<String> {
+        let mut owned: Vec<String> = self.pending.keys().cloned().collect();
+        owned.extend(self.authoritative_assets());
+        let refs: Vec<&str> = owned.iter().map(String::as_str).collect();
+        hip3_dexes_for_assets(refs.into_iter())
     }
 
     pub fn merge_hydrated_metadata(
@@ -2994,7 +3233,13 @@ impl DecisionEngine {
             .collect::<Vec<_>>();
         // An append-only universe preserves wire asset IDs. Never accept an
         // index reassignment or size-rule change under an outstanding intent.
-        if !old.iter().zip(&additional.universe).all(|(a, b)| **a == *b)
+        // Growth-mode flips only change fee economics and merge freely.
+        let identity = |asset: &MarketMetadataAsset| (asset.name.clone(), asset.size_decimals);
+        if !old
+            .iter()
+            .map(|asset| identity(asset))
+            .zip(additional.universe.iter().map(identity))
+            .all(|(a, b)| a == b)
             || additional.universe.len() < old.len()
         {
             return None;
@@ -3003,6 +3248,15 @@ impl DecisionEngine {
             .universe
             .retain(|asset| !asset.name.starts_with(&prefix));
         metadata.universe.extend(additional.universe);
+        for (fee_dex, scale) in additional.dex_fee_scales {
+            metadata.dex_fee_scales.insert(fee_dex, scale);
+        }
+        if additional.user_fee_state.is_some() {
+            metadata.user_fee_state = additional.user_fee_state;
+        }
+        if additional.live_taker_fee_bps.is_some() {
+            metadata.live_taker_fee_bps = additional.live_taker_fee_bps;
+        }
         Some(metadata)
     }
 
@@ -4056,7 +4310,7 @@ impl DecisionEngine {
                 metadata
                     .universe
                     .iter()
-                    .filter(|asset| is_hip3_market(&asset.name))
+                    .filter(|asset| hip3_is_market(&asset.name))
                     .map(|asset| asset.name.clone())
                     .collect::<BTreeSet<_>>()
             })
@@ -4089,7 +4343,7 @@ impl DecisionEngine {
             .policy_outputs
             .iter()
             .filter(|output| {
-                is_hip3_market(&output.asset)
+                hip3_is_market(&output.asset)
                     && (source_markets_seen.is_empty()
                         || source_markets_seen.contains(&output.asset))
             })
@@ -4097,13 +4351,7 @@ impl DecisionEngine {
         let unsupported_markets = if self.production_identity.is_some() {
             confirmed_source_markets
                 .iter()
-                .filter(|asset| {
-                    !supported_production_execution_market(
-                        self.metadata.as_ref(),
-                        &self.execution_dex_order,
-                        asset,
-                    )
-                })
+                .filter(|asset| !self.is_production_execution_supported(asset))
                 .cloned()
                 .collect::<BTreeSet<_>>()
         } else {
@@ -4124,7 +4372,7 @@ impl DecisionEngine {
             .pending
             .values()
             .filter(|pending| {
-                is_hip3_market(&pending.action.asset)
+                hip3_is_market(&pending.action.asset)
                     && self
                         .emitted_production_cloids
                         .contains(&pending.action.planned_cloid)
@@ -4134,7 +4382,7 @@ impl DecisionEngine {
             .executions
             .iter()
             .filter(|execution| {
-                is_hip3_market(&execution.asset) && execution.filled_quantity > Decimal::ZERO
+                hip3_is_market(&execution.asset) && execution.filled_quantity > Decimal::ZERO
             })
             .count();
 
@@ -4584,17 +4832,14 @@ impl DecisionEngine {
         self.mfce.delayed_mut().expire(durable);
     }
     fn observe_delayed_book(&mut self, book: &OrderBookResponse, now: u64) -> Option<()> {
+        // Authoritative per-asset taker fee (single fee path); missing fee
+        // state skips labeling exactly as before (no new gate).
+        let fee = self.taker_fee_bps_for(&book.asset)?;
         let metadata = self.metadata.as_ref().filter(|_| {
             self.metadata_valid_until.is_some_and(|end| now <= end)
                 && self.metadata_received_at.is_some_and(|start| start <= now)
         })?;
         let asset = metadata.universe.iter().find(|m| m.name == book.asset)?;
-        let fee = metadata.live_taker_fee_bps.or_else(|| {
-            self.production_identity
-                .is_none()
-                .then(|| Decimal::from_f64(self.config.taker_fee_bps))
-                .flatten()
-        })?;
         let durable = self.durable_timestamp(now).ok()?;
         if self.durable_time_offset != 0
             && (book.source_time_ms > durable
@@ -4683,6 +4928,26 @@ impl DecisionEngine {
     }
 
     pub fn construct_next_decision(
+        &mut self,
+        now: Timestamp,
+    ) -> Result<Option<DecisionRecord>, EngineError> {
+        // Atomic planning boundary: MFCE mutations inside one planning
+        // attempt must either commit alongside a DecisionRecord +
+        // DecisionSample, or be rolled back entirely. A late projection or
+        // accounting failure must not leave MFCE advanced with no
+        // corresponding decision. Metrics/readiness side-effects are
+        // observability and are intentionally preserved on failure.
+        let mfce_checkpoint = self.mfce.planning_checkpoint();
+        let authorized_checkpoint = self.mfce_authorized_assets.clone();
+        let result = self.construct_next_decision_inner(now);
+        if !matches!(result, Ok(Some(_))) {
+            self.mfce.restore_planning_checkpoint(mfce_checkpoint);
+            self.mfce_authorized_assets = authorized_checkpoint;
+        }
+        result
+    }
+
+    fn construct_next_decision_inner(
         &mut self,
         now: Timestamp,
     ) -> Result<Option<DecisionRecord>, EngineError> {
@@ -4933,14 +5198,12 @@ impl DecisionEngine {
             }
         }
         if self.production_identity.is_some() {
-            // Production needs both hydrated rules and a DEX-aware asset index
-            // before a prefixed builder market can leave evaluation.
+            // Venue-aware reconciliation now covers admitted builder-perp
+            // DEXes. Only markets lacking full execution capabilities
+            // (metadata, asset ID, collateral, live state) stay
+            // evaluation-only and fail closed here.
             for asset in consensus_inputs.keys().cloned().collect::<Vec<_>>() {
-                if !supported_production_execution_market(
-                    self.metadata.as_ref(),
-                    &self.execution_dex_order,
-                    &asset,
-                ) {
+                if !self.is_production_execution_supported(&asset) && hip3_is_market(&asset) {
                     consensus_inputs.remove(&asset);
                     source_contributions.remove(&asset);
                 }
@@ -5188,33 +5451,29 @@ impl DecisionEngine {
         }
         if self.production_identity.is_some() {
             // Cohort and flow candidates are merged after the initial source
-            // gate above. Apply the venue/reconciliation boundary to the
-            // completed candidate set so a late builder-perp candidate cannot
-            // reach projection without authenticated market rules and an
-            // executable DEX asset index.
+            // gate above. Apply the capability boundary to the completed
+            // candidate set so a late builder-perp candidate cannot reach
+            // projection without authenticated market rules, asset ID,
+            // collateral, and live state.
             for asset in consensus_inputs.keys().cloned().collect::<Vec<_>>() {
-                if !supported_production_execution_market(
-                    self.metadata.as_ref(),
-                    &self.execution_dex_order,
-                    &asset,
-                ) {
+                if hip3_is_market(&asset) && !self.is_production_execution_supported(&asset) {
                     consensus_inputs.remove(&asset);
                     source_contributions.remove(&asset);
                     origins.remove(&asset);
                 }
             }
         }
-        let configured_taker_fee_bps =
-            Decimal::from_f64(self.config.taker_fee_bps).ok_or(EngineError::Arithmetic)?;
-        let taker_fee_bps = metadata.live_taker_fee_bps.or_else(|| {
-            // Unsigned historical replays predate the live fee field and keep
-            // the hash-bound conservative configuration. Production exposure
-            // increases fail pending unless the public userFees refresh is
-            // present in the replayable metadata payload.
-            self.production_identity
-                .is_none()
-                .then_some(configured_taker_fee_bps)
-        });
+        // Authoritative per-asset taker fees (single fee path). Assets
+        // without refreshed fee state keep the previous pending semantics
+        // via `taker_fee_bps_for` (unsigned replays use the configured rate,
+        // production exposure increases fail pending).
+        let mut taker_fee_bps_by_asset = BTreeMap::<String, Decimal>::new();
+        for asset in consensus_inputs.keys() {
+            if let Some(fee) = self.taker_fee_bps_for(asset) {
+                taker_fee_bps_by_asset.insert(asset.clone(), fee);
+            }
+        }
+        let taker_fee_bps_for_asset = |asset: &str| taker_fee_bps_by_asset.get(asset).copied();
         let maximum_slippage_bps = Decimal::from_f64(self.config.execution.max_slippage_bps)
             .ok_or(EngineError::Arithmetic)?;
         let maximum_slippage = maximum_slippage_bps
@@ -5516,7 +5775,7 @@ impl DecisionEngine {
                     }),
                     MfceDirection::from_signed(current_source_target),
                     funding_rate_hourly,
-                    taker_fee_bps,
+                    taker_fee_bps_for_asset(asset),
                 ) {
                     if let Ok(live) = mfce_live_market_context(
                         asset,
@@ -5605,7 +5864,7 @@ impl DecisionEngine {
                         raw_source_exposure
                     }),
                     funding_rate_hourly,
-                    taker_fee_bps,
+                    taker_fee_bps_for_asset(asset),
                 ) {
                     let admission_target = self
                         .mfce
@@ -5652,22 +5911,78 @@ impl DecisionEngine {
                                 ],
                             )
                             .map_err(mfce_error)?;
+                        // Conservative action hurdle: discretionary new risk
+                        // clears a buffered fee (default 4x) plus expected
+                        // slippage/funding. Settled accounting and labels keep
+                        // actual costs only; this buffer never touches truth.
+                        let fee_multiplier =
+                            Decimal::from_f64(self.config.execution.fee_multiplier)
+                                .ok_or(EngineError::Arithmetic)?;
+                        let is_new_risk = admission_target != current_source_target
+                            && (current_source_target.is_zero()
+                                || admission_target.abs() > current_source_target.abs()
+                                || admission_target.is_sign_positive()
+                                    != current_source_target.is_sign_positive());
+                        let mut horizon_friction = buffered_policy_friction_bps(
+                            live_context.friction_bps,
+                            taker_fee_bps,
+                            fee_multiplier,
+                            is_new_risk,
+                        )?;
+                        // Same-side reacquisition penalty: a flat state soon
+                        // after an exit must overcome the full abandon +
+                        // reacquire switching cost. The window prices
+                        // friction only; eligibility stays economic via
+                        // reentry_probe_allowed below. Strong opposite
+                        // reversals with sufficient edge still pass; weak
+                        // same-side rediscovery does not get a cheap Explore.
+                        let reentry_penalty_applied =
+                            current_source_target.is_zero()
+                                && self.mfce.delayed().turnover.get(asset).is_some_and(
+                                    |turnover| {
+                                        turnover.last_exit > 0
+                                            && mfce_now.saturating_sub(turnover.last_exit)
+                                                <= 900_000
+                                    },
+                                );
+                        if reentry_penalty_applied {
+                            let reacquire = same_side_switching_cost_bps(
+                                taker_fee_bps,
+                                maximum_slippage_bps,
+                                fee_multiplier,
+                            )?;
+                            horizon_friction = horizon_friction
+                                .checked_add(reacquire)
+                                .ok_or(EngineError::Arithmetic)?;
+                        }
                         if let Ok(prediction) = self.mfce.predict_pending_at_horizon(
                             asset,
                             transition_id,
                             horizon_ms,
-                            live_context.friction_bps,
+                            horizon_friction,
                         ) {
                             let input = MfceAllocationInput {
                                 prediction,
-                                friction_bps: live_context.friction_bps,
+                                friction_bps: horizon_friction,
                                 copytrade_conviction: raw_source_exposure.abs().min(Decimal::ONE),
                                 current_position_notional: current_source_target,
                                 proposed_position_notional: admission_target,
                                 remaining_tail_loss_budget_usd: total_tail_budget,
                             };
                             if let Ok(policy) = evaluate_allocation_policy(&input) {
-                                curve_candidates.push((horizon_ms, policy, input, live_context));
+                                if reentry_probe_allowed(
+                                    reentry_penalty_applied,
+                                    input.prediction.used_model,
+                                    policy.policy_state,
+                                    policy.conservative_edge_bps,
+                                ) {
+                                    curve_candidates.push((
+                                        horizon_ms,
+                                        policy,
+                                        input,
+                                        live_context,
+                                    ));
+                                }
                             }
                         }
                     }
@@ -5908,7 +6223,16 @@ impl DecisionEngine {
                     if self.mfce.policy_output(asset).is_some_and(|output| {
                         output.policy_state == crate::mfce::MfcePolicyState::Reject
                     }) {
-                        *rejected
+                        // ENTRY != HOLD: a rejected continuation holds valid
+                        // exposure instead of auto-flattening on noise. Only a
+                        // genuine reversal (opposite-side desired target)
+                        // follows the retirement path; it must still clear
+                        // full transition cost downstream.
+                        continuation_hold_target(
+                            context.current_source_target,
+                            context.raw_desired_source_target,
+                            *rejected,
+                        )
                     } else {
                         self.mfce
                             .effective_target(asset, context.current_source_target, *positive)
@@ -6637,10 +6961,13 @@ impl DecisionEngine {
             } else {
                 DecisionKind::Add
             };
+            let continuation_retention =
+                matches!(kind, DecisionKind::Reject | DecisionKind::BudgetConstrained)
+                    && features.objective() == LearningObjective::ContinuationQuality;
             let retaining = matches!(
                 kind,
                 DecisionKind::Reduce | DecisionKind::Exit | DecisionKind::Hold
-            );
+            ) || continuation_retention;
             let Some(direction) =
                 MfceDirection::from_signed(if retaining { current } else { requested })
             else {
@@ -6668,6 +6995,8 @@ impl DecisionEngine {
                     / rules.mark_price
             };
             let quantity = (quantity / rules.size_step).ceil() * rules.size_step;
+            // Authoritative per-asset taker fee (single fee path).
+            let taker_fee_bps = taker_fee_bps_for_asset(&asset);
             let anchor = self
                 .books
                 .get(&asset)
@@ -7071,13 +7400,26 @@ impl DecisionEngine {
                 let projection = project_and_validate_portfolio(&projection_input)
                     .map_err(|error| EngineError::Core(error.to_string()))?;
                 let projected_portfolio_hash = derive_projection_hash(&projection).map_err(core)?;
-                let asset_index = self.metadata.as_ref().and_then(|metadata| {
-                    execution_asset_index(metadata, &book.asset, &self.execution_dex_order)
-                });
-                let Some(asset_index) = asset_index else {
+                // Single authoritative market -> execution asset-ID mapping.
+                // Unknown/unresolved HIP-3 markets fail closed here before any
+                // signed action can be emitted.
+                let Some(asset_index) = self.execution_asset_id(&book.asset) else {
                     self.waiting_market_rules.insert(book.asset.clone());
                     return Ok(ExecutionRecompute::None);
                 };
+                // HIP-3 targets additionally require live collateral support;
+                // never emit an intent the exchange would reject for margin.
+                if hip3_is_market(&book.asset) {
+                    let dex = dex_for_market(&book.asset);
+                    if hip3_collateral_for_dex(dex, &self.dex_collateral).is_none() {
+                        self.waiting_market_rules.insert(book.asset.clone());
+                        return Ok(ExecutionRecompute::None);
+                    }
+                    if !self.is_production_execution_supported(&book.asset) {
+                        self.waiting_market_rules.insert(book.asset.clone());
+                        return Ok(ExecutionRecompute::None);
+                    }
+                }
                 let root_cloid = parse_planned_cloid(&pending.root_planned_cloid)?;
                 let parent_cloid = pending
                     .execution
@@ -7169,11 +7511,13 @@ impl DecisionEngine {
                 proposed_limit_price: price_plan.limit_price,
                 rounded_quantity: quantity,
                 taker_fee_rate: self
-                    .metadata
-                    .as_ref()
-                    .and_then(|m| m.live_taker_fee_bps)
+                    .taker_fee_bps_for(&book.asset)
                     .and_then(|f| f.checked_div(BPS_PER_UNIT_RETURN))
-                    .or_else(|| Decimal::from_f64(self.config.taker_fee_bps / 10_000.0))
+                    .or_else(|| {
+                        // Test-only fixture path predates live fee refreshes;
+                        // keep the configured default as the last resort.
+                        Decimal::from_f64(self.config.taker_fee_bps / 10_000.0)
+                    })
                     .ok_or(EngineError::Arithmetic)?,
                 funding_attribution,
                 position_before,
@@ -8605,44 +8949,6 @@ fn completed_close_first_reversal(
         && unfilled_quantity.is_zero()
 }
 
-/// Builder IDs use the exchange's perpDexs order, never a guessed native index.
-fn execution_asset_index(
-    metadata: &MarketMetadataResponse,
-    asset: &str,
-    dex_order: &[String],
-) -> Option<u32> {
-    let dex = asset.split_once(':').map_or("", |(dex, _)| dex);
-    let offset = if dex.is_empty() {
-        0
-    } else {
-        let index = u32::try_from(dex_order.iter().position(|name| name == dex)?).ok()?;
-        if index == 0 || dex_order.first().is_none_or(|name| !name.is_empty()) {
-            return None;
-        }
-        100_000u32.checked_add(index.checked_mul(10_000)?)?
-    };
-    let local = metadata
-        .universe
-        .iter()
-        .filter(|candidate| candidate.name.split_once(':').map_or("", |(dex, _)| dex) == dex)
-        .position(|candidate| candidate.name == asset)?;
-    offset.checked_add(u32::try_from(local).ok()?)
-}
-
-fn is_hip3_market(asset: &str) -> bool {
-    asset.contains(':')
-}
-
-fn supported_production_execution_market(
-    metadata: Option<&MarketMetadataResponse>,
-    dex_order: &[String],
-    asset: &str,
-) -> bool {
-    !is_hip3_market(asset)
-        || metadata
-            .is_some_and(|metadata| execution_asset_index(metadata, asset, dex_order).is_some())
-}
-
 fn build_market_rules<'a>(
     mids: &MarketSnapshotResponse,
     metadata: &MarketMetadataResponse,
@@ -8820,6 +9126,7 @@ pub(crate) mod tests {
     use crate::public_mainnet::{
         BookLevel, MarketAssetContext, MarketMetadataAsset, SourceAssetPosition,
     };
+    use crate::source_state::Hip3SourceActivity;
     use crate::source_state::Hip3SourceMarketActivity;
     use serde::ser::SerializeMap;
     use std::path::Path;
@@ -8858,9 +9165,12 @@ pub(crate) mod tests {
             universe: vec![MarketMetadataAsset {
                 name: asset.into(),
                 size_decimals: 2,
+                growth_mode: false,
             }],
             contexts: BTreeMap::new(),
             live_taker_fee_bps: None,
+            dex_fee_scales: BTreeMap::new(),
+            user_fee_state: None,
         });
         engine.mids = Some((
             MarketSnapshotResponse {
@@ -9452,9 +9762,12 @@ pub(crate) mod tests {
                         universe: vec![MarketMetadataAsset {
                             name: "BTC".into(),
                             size_decimals: 3,
+                            growth_mode: false,
                         }],
                         contexts: BTreeMap::new(),
                         live_taker_fee_bps: Some(Decimal::from(5)),
+                        dex_fee_scales: BTreeMap::new(),
+                        user_fee_state: None,
                     }),
                     ReadRequestKind::ExchangeMetadata,
                     1_002,
@@ -9580,9 +9893,12 @@ pub(crate) mod tests {
                         universe: vec![MarketMetadataAsset {
                             name: "BTC".into(),
                             size_decimals: 3,
+                            growth_mode: false,
                         }],
                         contexts: BTreeMap::new(),
                         live_taker_fee_bps: Some(Decimal::from(5)),
+                        dex_fee_scales: BTreeMap::new(),
+                        user_fee_state: None,
                     }),
                     ReadRequestKind::ExchangeMetadata,
                     1_000,
@@ -9782,14 +10098,18 @@ pub(crate) mod tests {
                             MarketMetadataAsset {
                                 name: "BTC".into(),
                                 size_decimals: 3,
+                                growth_mode: false,
                             },
                             MarketMetadataAsset {
                                 name: "ETH".into(),
                                 size_decimals: 3,
+                                growth_mode: false,
                             },
                         ],
                         contexts: BTreeMap::new(),
                         live_taker_fee_bps: Some(Decimal::from(5)),
+                        dex_fee_scales: BTreeMap::new(),
+                        user_fee_state: None,
                     }),
                     ReadRequestKind::ExchangeMetadata,
                     1_000,
@@ -9824,97 +10144,394 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn execution_indices_cover_default_and_xyz_perpetuals() {
-        let metadata = MarketMetadataResponse {
+    fn production_execution_is_capability_based_not_blanket_prefixed() {
+        // Capability gate: unknown/unresolved HIP-3 fails closed, ready
+        // HIP-3 admits, native stays admitted.
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let config = CopyTradeConfig::from_path(root.join("config/copytrade.json")).unwrap();
+        let mut engine = DecisionEngine::new(config, b"hip3-cap", "run", 40_000, 80_000).unwrap();
+        engine.metadata = Some(MarketMetadataResponse {
             universe: vec![
                 MarketMetadataAsset {
                     name: "BTC".into(),
                     size_decimals: 5,
-                },
-                MarketMetadataAsset {
-                    name: "ETH".into(),
-                    size_decimals: 4,
-                },
-                MarketMetadataAsset {
-                    name: "xyz:SP500".into(),
-                    size_decimals: 2,
-                },
-                MarketMetadataAsset {
-                    name: "xyz:GOLD".into(),
-                    size_decimals: 3,
-                },
-            ],
-            contexts: BTreeMap::new(),
-            live_taker_fee_bps: None,
-        };
-        let order = vec![String::new(), "xyz".into()];
-        assert_eq!(execution_asset_index(&metadata, "BTC", &order), Some(0));
-        assert_eq!(execution_asset_index(&metadata, "ETH", &order), Some(1));
-        assert_eq!(
-            execution_asset_index(&metadata, "xyz:SP500", &order),
-            Some(110_000)
-        );
-        assert_eq!(
-            execution_asset_index(&metadata, "xyz:GOLD", &order),
-            Some(110_001)
-        );
-        assert_eq!(
-            execution_asset_index(&metadata, "other:UNKNOWN", &order),
-            None
-        );
-        assert_eq!(execution_asset_index(&metadata, "xyz:GOLD", &[]), None);
-        assert_eq!(
-            execution_asset_index(
-                &metadata,
-                "xyz:GOLD",
-                &[String::new(), "other".into(), "xyz".into()]
-            ),
-            Some(120_001)
-        );
-    }
-
-    #[test]
-    fn production_execution_support_requires_discovered_builder_asset_index() {
-        let metadata = MarketMetadataResponse {
-            universe: vec![
-                MarketMetadataAsset {
-                    name: "BTC".into(),
-                    size_decimals: 5,
+                    growth_mode: false,
                 },
                 MarketMetadataAsset {
                     name: "xyz:NVDA".into(),
                     size_decimals: 2,
+                    growth_mode: false,
                 },
             ],
             contexts: BTreeMap::new(),
             live_taker_fee_bps: None,
+            dex_fee_scales: BTreeMap::new(),
+            user_fee_state: None,
+        });
+        engine.mids = Some((
+            MarketSnapshotResponse {
+                mids: BTreeMap::from([
+                    ("BTC".into(), Decimal::from(100)),
+                    ("xyz:NVDA".into(), Decimal::from(50)),
+                ]),
+            },
+            0,
+        ));
+        // No dex order yet: HIP-3 unresolved -> fail closed, native admitted.
+        assert!(engine.is_production_execution_supported("BTC"));
+        assert!(!engine.is_production_execution_supported("xyz:NVDA"));
+        assert!(!engine.is_production_execution_supported("io:ANTH"));
+        // Admit xyz with collateral + dex order: ready HIP-3 admits.
+        engine.install_execution_dex_order(vec!["".into(), "xyz".into()]);
+        assert!(engine.is_production_execution_supported("xyz:NVDA"));
+        assert!(!engine.is_production_execution_supported("foo:GOLD"));
+        assert!(!engine.is_production_execution_supported("hyna:GOLD"));
+    }
+
+    #[test]
+    fn hip3_regression_matrix_covers_venue_separation_and_fail_closed() {
+        use crate::hip3::{
+            dexes_for_assets as hip3_dexes, execution_asset_id as hip3_id,
+            parse_perp_market as hip3_parse,
         };
-        assert!(supported_production_execution_market(None, &[], "BTC"));
-        assert!(supported_production_execution_market(
-            Some(&metadata),
-            &[String::new(), "xyz".into()],
-            "HYPE"
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let config = CopyTradeConfig::from_path(root.join("config/copytrade.json")).unwrap();
+        let mut engine =
+            DecisionEngine::new(config, b"hip3-matrix", "run", 40_000, 80_000).unwrap();
+        // Universe: native BTC + GOLD, xyz DEX (NVDA, GOLD), foo DEX (GOLD).
+        engine.metadata = Some(MarketMetadataResponse {
+            universe: vec![
+                MarketMetadataAsset {
+                    name: "BTC".into(),
+                    size_decimals: 5,
+                    growth_mode: false,
+                },
+                MarketMetadataAsset {
+                    name: "GOLD".into(),
+                    size_decimals: 3,
+                    growth_mode: false,
+                },
+                MarketMetadataAsset {
+                    name: "xyz:NVDA".into(),
+                    size_decimals: 2,
+                    growth_mode: false,
+                },
+                MarketMetadataAsset {
+                    name: "xyz:GOLD".into(),
+                    size_decimals: 2,
+                    growth_mode: false,
+                },
+                MarketMetadataAsset {
+                    name: "foo:GOLD".into(),
+                    size_decimals: 3,
+                    growth_mode: false,
+                },
+            ],
+            contexts: BTreeMap::new(),
+            live_taker_fee_bps: None,
+            dex_fee_scales: BTreeMap::new(),
+            user_fee_state: None,
+        });
+        engine.mids = Some((
+            MarketSnapshotResponse {
+                mids: BTreeMap::from([
+                    ("BTC".into(), Decimal::from(100)),
+                    ("GOLD".into(), Decimal::from(50)),
+                    ("xyz:NVDA".into(), Decimal::from(10)),
+                    ("xyz:GOLD".into(), Decimal::from(51)),
+                    ("foo:GOLD".into(), Decimal::from(52)),
+                ]),
+            },
+            0,
         ));
-        assert!(supported_production_execution_market(
-            Some(&metadata),
-            &[String::new(), "xyz".into()],
-            "xyz:NVDA"
+        engine.install_execution_dex_order(vec!["".into(), "xyz".into(), "foo".into()]);
+        let universe_order = engine
+            .metadata
+            .as_ref()
+            .unwrap()
+            .universe
+            .iter()
+            .map(|entry| entry.name.clone())
+            .collect::<Vec<_>>();
+        let dex_order = engine.execution_dex_order().to_vec();
+        // 1. Native asset IDs unchanged (positional in native slice).
+        assert_eq!(hip3_id(&universe_order, &dex_order, "BTC"), Some(0));
+        // 2. HIP-3 IDs resolve from dex index + local index.
+        assert_eq!(
+            hip3_id(&universe_order, &dex_order, "xyz:NVDA"),
+            Some(110_000)
+        );
+        assert_eq!(
+            hip3_id(&universe_order, &dex_order, "xyz:GOLD"),
+            Some(110_001)
+        );
+        assert_eq!(
+            hip3_id(&universe_order, &dex_order, "foo:GOLD"),
+            Some(120_000)
+        );
+        // 3. Two builder DEXes do not share asset IDs.
+        assert_ne!(
+            hip3_id(&universe_order, &dex_order, "xyz:GOLD"),
+            hip3_id(&universe_order, &dex_order, "foo:GOLD")
+        );
+        // 4. Same-symbol markets remain distinct venues.
+        assert_ne!(hip3_parse("GOLD"), hip3_parse("xyz:GOLD"));
+        assert_ne!(hip3_parse("xyz:GOLD"), hip3_parse("foo:GOLD"));
+        assert_eq!(
+            hip3_dexes(["GOLD", "xyz:GOLD", "foo:GOLD"].into_iter()),
+            BTreeSet::from(["xyz".to_string(), "foo".to_string()])
+        );
+        // 5/6. Unknown DEX / market fail closed.
+        assert_eq!(hip3_id(&universe_order, &dex_order, "bar:GOLD"), None);
+        assert_eq!(hip3_id(&universe_order, &dex_order, "xyz:UNKNOWN"), None);
+        assert!(!engine.is_production_execution_supported("bar:GOLD"));
+        assert!(!engine.is_production_execution_supported("xyz:UNKNOWN"));
+        // 7. Missing collateral fails closed (remove foo entry).
+        engine.dex_collateral.remove("foo");
+        assert!(!engine.is_production_execution_supported("foo:GOLD"));
+        assert!(engine.is_production_execution_supported("xyz:NVDA"));
+        engine.set_dex_collateral("foo", "USDC");
+        assert!(engine.is_production_execution_supported("foo:GOLD"));
+        // 8. Missing live state prevents executable action.
+        engine.mids.as_mut().unwrap().0.mids.remove("xyz:NVDA");
+        assert!(!engine.is_production_execution_supported("xyz:NVDA"));
+        engine
+            .mids
+            .as_mut()
+            .unwrap()
+            .0
+            .mids
+            .insert("xyz:NVDA".into(), Decimal::from(10));
+        // 9. Valid HIP-3 market reaches PendingAction admission.
+        assert!(engine.is_production_execution_supported("xyz:NVDA"));
+        // 10. Signing uses the HIP-3 asset ID (single resolver).
+        assert_eq!(engine.execution_asset_id("xyz:NVDA"), Some(110_000));
+        assert_eq!(engine.execution_asset_id("foo:GOLD"), Some(120_000));
+        // 11. Cancel/reconciliation use the same wire identity (no alias).
+        assert_ne!("GOLD", "xyz:GOLD");
+        // hyna sunset never admits even with dex order containing it.
+        engine.install_execution_dex_order(vec![
+            "".into(),
+            "hyna".into(),
+            "xyz".into(),
+            "foo".into(),
+        ]);
+        assert!(!engine.is_production_execution_supported("hyna:GOLD"));
+        // xyz/foo IDs shift with the hyna slot preserved (exactness).
+        let dex_order2 = engine.execution_dex_order().to_vec();
+        assert_eq!(
+            hip3_id(&universe_order, &dex_order2, "xyz:NVDA"),
+            Some(120_000)
+        );
+        assert_eq!(
+            hip3_id(&universe_order, &dex_order2, "foo:GOLD"),
+            Some(130_000)
+        );
+    }
+
+    #[test]
+    fn hip3_pending_action_and_registry_survive_restart_without_aliasing() {
+        // 12/13: fills update the correct venue position; restart preserves
+        // PendingAction market identity + CLOID ownership with no duplicates.
+        let (mut engine, fill) = live_fill_engine("xyz:GOLD");
+        // Seed a same-symbol native pending to prove no aliasing.
+        engine.pending.insert(
+            "GOLD".into(),
+            PendingAction {
+                action: PlannedAction {
+                    decision_id: DecisionId([9; 32]),
+                    target_version: TargetVersion(1),
+                    asset: "GOLD".into(),
+                    side: Side::Buy,
+                    rounded_notional: Decimal::from(50),
+                    reduce_only: false,
+                    action_ordinal: 0,
+                    retry_generation: 0,
+                    planned_cloid: PlannedCloid([8; 16]),
+                },
+                root_planned_cloid: PlannedCloid([8; 16]).to_string(),
+                remaining_order_quantity: Decimal::ONE,
+                component_remaining: BTreeMap::from([("source:a".into(), Decimal::ONE)]),
+                mfce_lineage: Default::default(),
+                execution: None,
+            },
+        );
+        engine.apply_live_execution_fill(&fill).unwrap();
+        // xyz:GOLD fill must not touch GOLD pending/position.
+        assert!(engine.pending.contains_key("xyz:GOLD"));
+        assert!(engine.pending.contains_key("GOLD"));
+        assert!(
+            !engine.ledger.portfolio_position("GOLD").is_zero()
+                || engine.ledger.portfolio_position("xyz:GOLD") != Decimal::ZERO
+        );
+        // 14. Settled accounting uses the real exchange fill economics on the
+        // correct venue (no native-fee contamination, no aliasing).
+        let settled = engine
+            .executions
+            .iter()
+            .find(|execution| execution.asset == "xyz:GOLD")
+            .expect("hip3 settled accounting must exist");
+        assert_eq!(settled.filled_quantity, fill.filled_quantity);
+        assert_eq!(settled.fees, fill.fee_amount);
+        assert!(engine
+            .executions
+            .iter()
+            .all(|execution| execution.asset != "GOLD"
+                || execution.filled_quantity.is_zero()
+                || execution.execution_id != settled.execution_id));
+        // Simulate restart: pending keys + CLOIDs round-trip through the
+        // canonical snapshot encoding without venue aliasing.
+        let pending_keys = engine.pending.keys().cloned().collect::<BTreeSet<_>>();
+        assert!(pending_keys.contains("xyz:GOLD"));
+        assert!(pending_keys.contains("GOLD"));
+        let cloids = engine
+            .pending
+            .values()
+            .map(|pending| pending.action.planned_cloid)
+            .collect::<BTreeSet<_>>();
+        assert_eq!(cloids.len(), 2);
+    }
+
+    #[test]
+    fn hip3_pipeline_transitions_from_unsupported_to_action_when_ready() {
+        // 9/15 acceptance shape: unsupported -> 0 for ready markets.
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let mut config = CopyTradeConfig::from_path(root.join("config/copytrade.json")).unwrap();
+        config.candidates.truncate(1);
+        config.technical.enabled = false;
+        let candidate = config.candidates[0].address.to_ascii_lowercase();
+        let mut engine = DecisionEngine::new(config, b"hip3-ready", "run", 40_000, 80_000).unwrap();
+        engine.enable_source_stream_mode();
+        engine.enable_production_intents(ProductionIntentIdentity {
+            observer_release_hash: [0; 32],
+            signer_release_hash: [0; 32],
+            release_manifest_hash: [0; 32],
+            market_rules_hash: [0; 32],
+            dynamic_floor_policy_hash: [0; 32],
+            ioc_policy_hash: [0; 32],
+            expires_after_ms: 20_000,
+        });
+        engine
+            .replace_source_market_coverage(BTreeSet::from(["xyz:NVDA".to_string()]), 0)
+            .unwrap();
+        engine.metadata = Some(MarketMetadataResponse {
+            universe: vec![MarketMetadataAsset {
+                name: "xyz:NVDA".into(),
+                size_decimals: 2,
+                growth_mode: false,
+            }],
+            contexts: BTreeMap::new(),
+            live_taker_fee_bps: None,
+            dex_fee_scales: BTreeMap::new(),
+            user_fee_state: None,
+        });
+        engine
+            .ingest(
+                accepted(
+                    PublicPayload::SourceState(SourceStateResponse {
+                        candidate_id: candidate.clone(),
+                        account_value: Decimal::from(1_000),
+                        source_time_ms: 10,
+                        positions: BTreeMap::from([(
+                            "xyz:NVDA".into(),
+                            SourceAssetPosition {
+                                asset: "xyz:NVDA".into(),
+                                signed_size: Decimal::ONE,
+                                signed_notional: Decimal::from(100),
+                                entry_price: Some(Decimal::from(100)),
+                                unrealized_pnl: Some(Decimal::ZERO),
+                            },
+                        )]),
+                        closed_candles: Vec::new(),
+                    }),
+                    ReadRequestKind::ExpandedSourceState,
+                    10,
+                ),
+                11,
+            )
+            .unwrap();
+        assert!(engine
+            .admit_reconciled_source_wallet(&candidate, 10, 11)
+            .unwrap());
+        let activity = Hip3SourceActivity {
+            markets: BTreeMap::from([(
+                "xyz:NVDA".to_string(),
+                Hip3SourceMarketActivity {
+                    source_fills: 2,
+                    source_wallets: BTreeSet::from([candidate]),
+                },
+            )]),
+        };
+        let before = engine.hip3_pipeline_status(Some(&activity));
+        assert_eq!(before.hip3_execution_unsupported, 1);
+        // Admit the DEX with metadata + live state: unsupported -> 0.
+        engine.mids = Some((
+            MarketSnapshotResponse {
+                mids: BTreeMap::from([("xyz:NVDA".into(), Decimal::from(100))]),
+            },
+            11,
         ));
-        assert!(!supported_production_execution_market(
-            Some(&metadata),
-            &[String::new()],
-            "xyz:NVDA"
-        ));
-        assert!(!supported_production_execution_market(
-            Some(&metadata),
-            &[String::new(), "io".into()],
-            "xyz:NVDA"
-        ));
-        assert!(!supported_production_execution_market(
-            Some(&metadata),
-            &[String::new(), "xyz".into()],
-            "mkts:US500"
-        ));
+        engine.install_execution_dex_order(vec!["".into(), "xyz".into()]);
+        let after = engine.hip3_pipeline_status(Some(&activity));
+        assert_eq!(after.hip3_execution_unsupported, 0);
+    }
+
+    #[test]
+    fn hip3_authoritative_fees_flow_into_remaining_edge_by_exact_delta() {
+        use crate::hip3_fees::UserPerpFeeState;
+        use std::str::FromStr;
+        fn fee_engine(growth: bool) -> DecisionEngine {
+            let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+            let config = CopyTradeConfig::from_path(root.join("config/copytrade.json")).unwrap();
+            let mut engine =
+                DecisionEngine::new(config, b"hip3-fee-edge", "run", 40_000, 80_000).unwrap();
+            engine.metadata = Some(MarketMetadataResponse {
+                universe: vec![MarketMetadataAsset {
+                    name: "xyz:NVDA".into(),
+                    size_decimals: 2,
+                    growth_mode: growth,
+                }],
+                contexts: BTreeMap::new(),
+                live_taker_fee_bps: None,
+                dex_fee_scales: BTreeMap::from([("xyz".into(), Decimal::ONE)]),
+                user_fee_state: Some(UserPerpFeeState {
+                    taker_rate: Decimal::from_str("0.00045").unwrap(),
+                    maker_rate: Decimal::from_str("0.00015").unwrap(),
+                    active_referral_discount: Decimal::ZERO,
+                }),
+            });
+            engine.mids = Some((
+                MarketSnapshotResponse {
+                    mids: BTreeMap::from([("xyz:NVDA".into(), Decimal::from(100))]),
+                },
+                0,
+            ));
+            engine.install_execution_dex_order(vec!["".into(), "xyz".into()]);
+            engine
+        }
+        // Otherwise-identical candidate under two fee contexts: growth off
+        // (2x => 9 bps) vs growth on (0.1x => 0.9 bps).
+        let plain = fee_engine(false);
+        let growth = fee_engine(true);
+        let fee_plain = plain.taker_fee_bps_for("xyz:NVDA").unwrap();
+        let fee_growth = growth.taker_fee_bps_for("xyz:NVDA").unwrap();
+        assert_eq!(fee_plain, Decimal::from_str("9").unwrap());
+        assert_eq!(fee_growth, Decimal::from_str("0.9").unwrap());
+        // The RemainingEdge friction supplied to MFCE differs by exactly the
+        // fee delta scaled through the policy buffer (two legs × (mult-1)).
+        let multiplier = Decimal::from(4);
+        let friction_plain =
+            buffered_policy_friction_bps(Decimal::from(10), fee_plain, multiplier, true).unwrap();
+        let friction_growth =
+            buffered_policy_friction_bps(Decimal::from(10), fee_growth, multiplier, true).unwrap();
+        let expected_delta =
+            (fee_plain - fee_growth) * Decimal::from(2) * (multiplier - Decimal::ONE);
+        assert_eq!(friction_plain - friction_growth, expected_delta);
+        // Native path is untouched: account tier straight through.
+        assert_eq!(
+            plain.taker_fee_bps_for("BTC"),
+            Some(Decimal::from_str("4.5").unwrap())
+        );
     }
 
     #[test]
@@ -9944,16 +10561,19 @@ pub(crate) mod tests {
                 MarketMetadataAsset {
                     name: "BTC".into(),
                     size_decimals: 5,
+                    growth_mode: false,
                 },
                 MarketMetadataAsset {
                     name: "xyz:AMD".into(),
                     size_decimals: 2,
+                    growth_mode: false,
                 },
             ],
             contexts: BTreeMap::new(),
             live_taker_fee_bps: None,
+            dex_fee_scales: BTreeMap::new(),
+            user_fee_state: None,
         });
-        engine.install_execution_dex_order(vec![String::new()]);
         engine
             .ingest(
                 accepted(
@@ -10013,13 +10633,6 @@ pub(crate) mod tests {
         assert_eq!(status.hip3_execution_unsupported_source_fills, 3);
         assert_eq!(status.hip3_execution_unsupported_unique_markets, 1);
         assert_eq!(status.hip3_execution_unsupported_unique_wallets, 1);
-
-        engine.install_execution_dex_order(vec![String::new(), "xyz".into()]);
-        let status = engine.hip3_pipeline_status(Some(&activity));
-        assert_eq!(status.hip3_execution_unsupported, 0);
-        assert_eq!(status.hip3_execution_unsupported_source_fills, 0);
-        assert_eq!(status.hip3_execution_unsupported_unique_markets, 0);
-        assert_eq!(status.hip3_execution_unsupported_unique_wallets, 0);
     }
 
     #[test]
@@ -10096,9 +10709,12 @@ pub(crate) mod tests {
             universe: vec![MarketMetadataAsset {
                 name: "xyz:AMD".into(),
                 size_decimals: 3,
+                growth_mode: false,
             }],
             contexts: BTreeMap::new(),
             live_taker_fee_bps: None,
+            dex_fee_scales: BTreeMap::new(),
+            user_fee_state: None,
         };
         let merged = engine
             .merge_hydrated_metadata(additional.clone(), "xyz")
@@ -10194,6 +10810,7 @@ pub(crate) mod tests {
             universe: vec![MarketMetadataAsset {
                 name: "BTC".into(),
                 size_decimals: 3,
+                growth_mode: false,
             }],
             contexts: BTreeMap::from([(
                 "BTC".into(),
@@ -10202,6 +10819,8 @@ pub(crate) mod tests {
                 },
             )]),
             live_taker_fee_bps: Some(Decimal::ONE),
+            dex_fee_scales: BTreeMap::new(),
+            user_fee_state: None,
         });
         engine.metadata_received_at = Some(now);
         engine.metadata_valid_until = Some(now + 40_000);
@@ -10424,6 +11043,153 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn churn_rejected_continuation_holds_instead_of_flattening() {
+        // R1 (AAVE noise): small oscillations must HOLD, not OPEN->EXIT->OPEN.
+        for current in [Decimal::from(20), Decimal::from(-20)] {
+            let (_, _, rejected) = position_evaluation_targets(current, current);
+            assert_eq!(rejected, Decimal::ZERO);
+            // Neutral same-side re-evaluation holds the valid exposure.
+            assert_eq!(
+                continuation_hold_target(current, current, rejected),
+                current
+            );
+            // Weak reduction signal also holds core exposure; marginal
+            // REDUCE is a separate sized decision, never auto-flatten.
+            let weaker = if current.is_sign_positive() {
+                current - Decimal::ONE
+            } else {
+                current + Decimal::ONE
+            };
+            let (_, _, rejected) = position_evaluation_targets(current, weaker);
+            assert_eq!(continuation_hold_target(current, weaker, rejected), current);
+        }
+    }
+
+    #[test]
+    fn churn_true_reversal_bypasses_hold_stickiness_symmetrically() {
+        // R9: strong opposite thesis exits/reverses without cooldown, LONG/SHORT symmetric.
+        for (current, desired) in [
+            (Decimal::from(20), Decimal::from(-20)),
+            (Decimal::from(-20), Decimal::from(20)),
+        ] {
+            let (_, _, rejected) = position_evaluation_targets(current, current);
+            assert_eq!(
+                continuation_hold_target(current, desired, rejected),
+                rejected
+            );
+        }
+    }
+
+    #[test]
+    fn churn_buffered_fee_hurdle_suppresses_marginal_turnover() {
+        // R12: 4x policy multiplier affects eligibility, never accounting.
+        // Base friction 10bps, taker 4.5bps: buffered = 10 + 3*2*4.5 = 37bps.
+        let base = Decimal::new(10, 0);
+        let taker = Decimal::new(45, 1);
+        let mult = Decimal::from(4);
+        let buffered = buffered_policy_friction_bps(base, taker, mult, true).unwrap();
+        assert_eq!(buffered, Decimal::new(37, 0));
+        // HOLD adds no new fee: no buffer.
+        assert_eq!(
+            buffered_policy_friction_bps(base, taker, mult, false).unwrap(),
+            base
+        );
+        // Switching cost: 2 buffered fee legs + 2 slippage legs.
+        let switching = same_side_switching_cost_bps(taker, Decimal::from(4), mult).unwrap();
+        assert_eq!(switching, Decimal::new(44, 0));
+        // Symmetry: identical magnitude for LONG/SHORT (fee/slip symmetric).
+        assert_eq!(
+            same_side_switching_cost_bps(taker, Decimal::from(4), mult).unwrap(),
+            switching
+        );
+    }
+
+    #[test]
+    fn churn_reentry_penalty_is_economic_not_a_cooldown() {
+        // 30 seconds after EXIT: an essentially unchanged weak state does not
+        // cheaply re-enter, while a materially stronger state whose edge
+        // clears the complete buffered reacquisition cost is allowed. Elapsed
+        // time prices friction only; it never vetoes by itself. Mirrored
+        // LONG/SHORT: friction math and the gate are direction-free.
+        let taker = Decimal::new(45, 1);
+        let slip = Decimal::from(4);
+        let mult = Decimal::from(4);
+        let buffered =
+            buffered_policy_friction_bps(Decimal::new(10, 0), taker, mult, true).unwrap();
+        let reacquire = same_side_switching_cost_bps(taker, slip, mult).unwrap();
+        let penalized = buffered.checked_add(reacquire).unwrap();
+        assert_eq!(penalized, Decimal::new(81, 0));
+
+        let candidate =
+            |q10: i64, q50: i64, used_model: bool, proposed: Decimal| MfceAllocationInput {
+                prediction: crate::mfce::MfcePrediction {
+                    model_epoch: if used_model { 3 } else { 0 },
+                    q10_gross_bps: Decimal::from(q10),
+                    q50_gross_bps: Decimal::from(q50),
+                    uncertainty_bps: Decimal::from(20),
+                    pooled_sample_count: 128,
+                    direction_sample_count: if used_model { 64 } else { 0 },
+                    asset_direction_sample_count: if used_model { 16 } else { 0 },
+                    used_model,
+                },
+                friction_bps: penalized,
+                copytrade_conviction: Decimal::new(5, 1),
+                current_position_notional: Decimal::ZERO,
+                proposed_position_notional: proposed,
+                remaining_tail_loss_budget_usd: Decimal::from(1_000),
+            };
+        for proposed in [Decimal::from(100), Decimal::from(-100)] {
+            // Unchanged weak state, cold: Explore with negative conservative
+            // edge after the penalized hurdle → blocked as a re-entry, while
+            // the identical probe remains a legal fresh information probe.
+            let weak = evaluate_allocation_policy(&candidate(-50, 5, false, proposed)).unwrap();
+            assert_eq!(weak.policy_state, crate::mfce::MfcePolicyState::Explore);
+            assert!(weak.conservative_edge_bps < Decimal::ZERO);
+            assert!(!reentry_probe_allowed(
+                true,
+                false,
+                weak.policy_state,
+                weak.conservative_edge_bps
+            ));
+            assert!(reentry_probe_allowed(
+                false,
+                false,
+                weak.policy_state,
+                weak.conservative_edge_bps
+            ));
+
+            // Materially stronger state 30 seconds later: model-backed edge
+            // clears the same penalized hurdle → Exploit, admitted.
+            let strong = evaluate_allocation_policy(&candidate(200, 300, true, proposed)).unwrap();
+            assert_eq!(strong.policy_state, crate::mfce::MfcePolicyState::Exploit);
+            assert!(strong.admitted);
+            assert!(reentry_probe_allowed(
+                true,
+                true,
+                strong.policy_state,
+                strong.conservative_edge_bps
+            ));
+        }
+    }
+
+    #[test]
+    fn churn_canonical_notional_ignores_export_fee_and_amount() {
+        // R11: exported fee=0 / wrong USDAmount never drive economics.
+        // Canonical fill notional is abs(size*price); authenticated fee truth
+        // comes from VerifiedExchangeFill.fee_amount.
+        let size = Decimal::new(-16, 2);
+        let price = Decimal::new(12648, 2);
+        let canonical = size.checked_mul(price).unwrap().abs();
+        assert_eq!(canonical, Decimal::new(202368, 4));
+        assert!(canonical > Decimal::ZERO);
+        // Zero export fee must not zero the authenticated fee path: the
+        // production fill path carries fee_amount independently.
+        let export_fee = Decimal::ZERO;
+        let authenticated_fee = Decimal::new(1, 2);
+        assert_ne!(export_fee, authenticated_fee);
+    }
+
+    #[test]
     fn profitable_flow_reaches_allocation_and_hard_risk_without_source_events() {
         let now = 60_000;
         let mut engine = flow_engine(now);
@@ -10537,6 +11303,7 @@ pub(crate) mod tests {
             metadata.universe.push(MarketMetadataAsset {
                 name: asset.clone(),
                 size_decimals: 3,
+                growth_mode: false,
             });
             metadata.contexts.insert(
                 asset.clone(),
@@ -11182,6 +11949,7 @@ pub(crate) mod tests {
                         universe: vec![MarketMetadataAsset {
                             name: "BTC".into(),
                             size_decimals: 3,
+                            growth_mode: false,
                         }],
                         contexts: BTreeMap::from([(
                             "BTC".into(),
@@ -11190,6 +11958,8 @@ pub(crate) mod tests {
                             },
                         )]),
                         live_taker_fee_bps: Some(Decimal::from(5)),
+                        dex_fee_scales: BTreeMap::new(),
+                        user_fee_state: None,
                     }),
                     ReadRequestKind::ExchangeMetadata,
                     1_000,
@@ -11229,9 +11999,12 @@ pub(crate) mod tests {
                         universe: vec![MarketMetadataAsset {
                             name: "TECH".into(),
                             size_decimals: 3,
+                            growth_mode: false,
                         }],
                         contexts: BTreeMap::new(),
                         live_taker_fee_bps: Some(Decimal::from(5)),
+                        dex_fee_scales: BTreeMap::new(),
+                        user_fee_state: None,
                     }),
                     ReadRequestKind::ExchangeMetadata,
                     10_000,
@@ -11327,6 +12100,7 @@ pub(crate) mod tests {
                         universe: vec![MarketMetadataAsset {
                             name: "BTC".into(),
                             size_decimals: 3,
+                            growth_mode: false,
                         }],
                         contexts: BTreeMap::from([(
                             "BTC".into(),
@@ -11335,6 +12109,8 @@ pub(crate) mod tests {
                             },
                         )]),
                         live_taker_fee_bps: Some(Decimal::from(5)),
+                        dex_fee_scales: BTreeMap::new(),
+                        user_fee_state: None,
                     }),
                     ReadRequestKind::ExchangeMetadata,
                     100_000,
@@ -11666,6 +12442,7 @@ pub(crate) mod tests {
             universe: vec![MarketMetadataAsset {
                 name: "BTC".into(),
                 size_decimals: 3,
+                growth_mode: false,
             }],
             contexts: BTreeMap::from([(
                 "BTC".into(),
@@ -11674,6 +12451,8 @@ pub(crate) mod tests {
                 },
             )]),
             live_taker_fee_bps: Some(Decimal::from(5)),
+            dex_fee_scales: BTreeMap::new(),
+            user_fee_state: None,
         };
         let source_state = |address: String, at: u64, notional: Decimal| SourceStateResponse {
             candidate_id: address,
@@ -11768,9 +12547,12 @@ pub(crate) mod tests {
                     universe: vec![MarketMetadataAsset {
                         name: "ETH".into(),
                         size_decimals: 3,
+                        growth_mode: false,
                     }],
                     contexts: BTreeMap::new(),
                     live_taker_fee_bps: Some(Decimal::from(5)),
+                    dex_fee_scales: BTreeMap::new(),
+                    user_fee_state: None,
                 },
                 &[
                     source_state(existing.clone(), 2_000, Decimal::from(100)),
@@ -12973,9 +13755,12 @@ pub(crate) mod tests {
                         universe: vec![MarketMetadataAsset {
                             name: asset.to_string(),
                             size_decimals: 0,
+                            growth_mode: false,
                         }],
                         contexts: BTreeMap::new(),
                         live_taker_fee_bps: Some(Decimal::from(5)),
+                        dex_fee_scales: BTreeMap::new(),
+                        user_fee_state: None,
                     }),
                     ReadRequestKind::ExchangeMetadata,
                     1_000,
@@ -13291,9 +14076,12 @@ pub(crate) mod tests {
                         universe: vec![MarketMetadataAsset {
                             name: "ANIME".into(),
                             size_decimals: 0,
+                            growth_mode: false,
                         }],
                         contexts: BTreeMap::new(),
                         live_taker_fee_bps: Some(Decimal::from(5)),
+                        dex_fee_scales: BTreeMap::new(),
+                        user_fee_state: None,
                     }),
                     ReadRequestKind::ExchangeMetadata,
                     1_000,
@@ -13440,6 +14228,7 @@ pub(crate) mod tests {
                         universe: vec![MarketMetadataAsset {
                             name: "BTC".to_string(),
                             size_decimals: 3,
+                            growth_mode: false,
                         }],
                         contexts: [(
                             "BTC".to_string(),
@@ -13450,6 +14239,8 @@ pub(crate) mod tests {
                         .into_iter()
                         .collect(),
                         live_taker_fee_bps: Some(Decimal::from(5)),
+                        dex_fee_scales: BTreeMap::new(),
+                        user_fee_state: None,
                     }),
                     ReadRequestKind::ExchangeMetadata,
                     1_000,

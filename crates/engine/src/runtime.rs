@@ -16,9 +16,7 @@ use crate::execution::{
 use crate::public_mainnet::{
     HyperliquidPublicTransport, PublicTransportPolicy, SourceStateResponse,
 };
-use crate::source_state::{
-    import_source_backfill, SourceBackfillOutcome, SourceContinuityStatus, SourceStateStore,
-};
+use crate::source_state::{SourceBackfillOutcome, SourceContinuityStatus, SourceStateStore};
 use crate::state_root::{StateRootStartup, UnsignedStateRoot};
 use crate::streaming::{
     parse_asset_contexts, valid_market, MarketDirectory, StreamingEvent, StreamingHandle,
@@ -109,6 +107,27 @@ fn sha256_file(path: impl AsRef<Path>) -> Result<String, Box<dyn Error>> {
         .iter()
         .map(|byte| format!("{byte:02x}"))
         .collect())
+}
+fn reject_symlinked_backfill_path(backfill: &Path, dest: &Path) -> Result<(), Box<dyn Error>> {
+    if !backfill.is_absolute() {
+        return Err("source backfill path must be absolute".into());
+    }
+    for path in [backfill, dest] {
+        if std::fs::symlink_metadata(path)
+            .map(|metadata| metadata.file_type().is_symlink())
+            .unwrap_or(false)
+        {
+            return Err(format!(
+                "source backfill path must never be a symlink: {}",
+                path.display()
+            )
+            .into());
+        }
+    }
+    if backfill == dest {
+        return Err("source backfill file must not equal the destination database".into());
+    }
+    Ok(())
 }
 fn persist_unsigned_state(
     engine: &mut DecisionEngine,
@@ -440,21 +459,27 @@ pub async fn run_continuous_daemon(options: RuntimeOptions) -> Result<PathBuf, B
             .and_then(|root| root.parent())
             .ok_or("continuous source-state database has no data root")?
             .join("source-state.sqlite");
-        if let Some(source) = options.source_backfill_from.as_ref() {
-            match import_source_backfill(source, &source_database_path)
-                .map_err(|error| format!("source backfill import failed closed: {error}"))?
-            {
-                SourceBackfillOutcome::Imported(report) => {
-                    eprintln!(
-                        "source_backfill_imported=true wallets={} durable_baselines={} fill_events={} history_cursors={}",
-                        report.wallets,
-                        report.durable_baselines,
-                        report.fill_events,
-                        report.history_cursors,
+        if let Some(backfill) = options.source_backfill_from.as_ref() {
+            reject_symlinked_backfill_path(backfill, &source_database_path)?;
+            match crate::source_state::import_source_backfill(&source_database_path, backfill) {
+                Ok(SourceBackfillOutcome::Imported(summary)) => {
+                    println!(
+                        "source_backfill_imported=true wallets={} durable_baselines={} fill_events={} history_cursors={} from={}",
+                        summary.wallets,
+                        summary.durable_baselines,
+                        summary.fill_events,
+                        summary.history_cursors,
+                        backfill.display()
                     );
                 }
-                SourceBackfillOutcome::SkippedDestinationExists => {
-                    eprintln!("source_backfill_skipped=true reason=destination_exists");
+                Ok(SourceBackfillOutcome::SkippedDestinationExists) => {
+                    println!(
+                        "source_backfill_skipped=true reason=destination_exists dest={}",
+                        source_database_path.display()
+                    );
+                }
+                Err(error) => {
+                    return Err(format!("source backfill import failed closed: {error}").into());
                 }
             }
         }
@@ -497,7 +522,7 @@ pub async fn run_continuous_daemon(options: RuntimeOptions) -> Result<PathBuf, B
         .map_err(|error| format!("streaming transport: {error:?}"))?;
     println!("source_cohort_loaded={} restored_source_baselines={} source_sqlite_available={} live_confirmations_reset=true", config.candidates.len(), restored_source_baselines, durable_sources.is_some());
     let mut market_directory: Option<MarketDirectory> = None;
-    let mut stream_live_taker_fee_bps = None;
+    let mut stream_fee_snapshot = crate::streaming::StreamFeeSnapshot::default();
     let mut stream_connected = false;
     let mut reconciliation_started_at = start.saturating_sub(1);
     if restored_source_baselines != 0 {
@@ -736,7 +761,8 @@ pub async fn run_continuous_daemon(options: RuntimeOptions) -> Result<PathBuf, B
             let dexes = engine
                 .waiting_market_rules()
                 .iter()
-                .filter_map(|asset| asset.split_once(':').map(|(dex, _)| dex.to_owned()))
+                .map(|asset| crate::hip3::dex_for_market(asset).to_owned())
+                .filter(|dex| !dex.is_empty())
                 .collect::<BTreeSet<_>>();
             if !dexes.is_empty() {
                 let dex = dexes
@@ -966,16 +992,7 @@ pub async fn run_continuous_daemon(options: RuntimeOptions) -> Result<PathBuf, B
                                         *metadata = merged;
                                         eprintln!("market_rules_hydrated=true dex={}", response.subject);
                                     }
-                                    let execution_dex_order = transport.discovered_perp_dex_order();
-                                    engine.install_execution_dex_order(execution_dex_order.clone());
-                                    if let Some(live) = &direct_live {
-                                        live.lock()
-                                            .await
-                                            .install_perp_dex_order(execution_dex_order)
-                                            .map_err(|error| {
-                                                format!("execution DEX order: {error}")
-                                            })?;
-                                    }
+                                    engine.install_execution_dex_order(transport.discovered_perp_dex_order());
                                     let directory = MarketDirectory::from_metadata(metadata)
                                         .map_err(|error| format!("stream market directory: {error:?}"))?;
                                     let mut priority = streaming_sources
@@ -1007,7 +1024,11 @@ pub async fn run_continuous_daemon(options: RuntimeOptions) -> Result<PathBuf, B
                                             .checked_add(60_000)
                                             .ok_or("trade subscription rotation overflow")?;
                                     }
-                                    stream_live_taker_fee_bps = metadata.live_taker_fee_bps;
+                                    stream_fee_snapshot.live_taker_fee_bps =
+                                        metadata.live_taker_fee_bps;
+                                    stream_fee_snapshot.dex_fee_scales =
+                                        metadata.dex_fee_scales.clone();
+                                    stream_fee_snapshot.user_fee_state = metadata.user_fee_state;
                                     market_directory = Some(directory);
                                 }
                                 _ => {}
@@ -1018,7 +1039,18 @@ pub async fn run_continuous_daemon(options: RuntimeOptions) -> Result<PathBuf, B
                         }
                         let accepted_at = clock.now_ms();
                         let executions_before = engine.metrics().executions;
+                        let was_market_metadata = completed_request.kind
+                            == crate::domain::scheduler::ReadRequestKind::ExchangeMetadata;
                         engine.ingest(response, accepted_at).map_err(|e| e.to_string())?;
+                        if was_market_metadata {
+                            // REST path also learns the authoritative perpDexs
+                            // order (fetched alongside metadata) so HIP-3
+                            // asset IDs resolve identically in both modes.
+                            let order = transport.discovered_perp_dex_order();
+                            if !order.is_empty() {
+                                engine.install_execution_dex_order(order);
+                            }
+                        }
                         if let Some(state) = confirmed_baseline {
                             let admitted = engine
                                 .admit_reconciled_source_wallet(
@@ -1183,7 +1215,7 @@ pub async fn run_continuous_daemon(options: RuntimeOptions) -> Result<PathBuf, B
                             let Ok((mids, metadata)) = parse_asset_contexts(
                                 &data,
                                 directory,
-                                stream_live_taker_fee_bps,
+                                &stream_fee_snapshot,
                             ) else {
                                 // Replaceable market context is allowed to go
                                 // explicitly missing. Its existing validity
@@ -1811,6 +1843,9 @@ async fn dispatch_runtime_intents(
 ) -> Result<(), Box<dyn Error>> {
     let direct_live = direct_live.ok_or("authenticated production runtime unavailable")?;
     let mut live = direct_live.lock().await;
+    // Venue-aware reconciliation: the signer aggregates native + every DEX
+    // with open exposure / pending lifecycle before each barrier.
+    live.set_active_dexes(engine.active_hip3_dexes());
     let recovering = live.recovery_only();
     let mut intents = engine.take_prepared_authorized_intents();
     if recovering {
@@ -2435,6 +2470,13 @@ mod tests {
             Ok(ExchangePositionSnapshot {
                 positions: self.0.lock().unwrap().positions.clone(),
                 account_equity: Decimal::from(101),
+                observed_at_ms: 100,
+                source_hash: PayloadHash([0; 32]),
+            })
+        }
+        async fn read_equity(&self) -> Result<ExchangeEquitySnapshot, ReconciliationError> {
+            Ok(ExchangeEquitySnapshot {
+                equity: Decimal::from(101),
                 observed_at_ms: 100,
                 source_hash: PayloadHash([0; 32]),
             })

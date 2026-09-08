@@ -6,7 +6,7 @@ use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::str::FromStr;
 
 const SCHEMA_VERSION: i64 = 1;
@@ -100,183 +100,6 @@ pub struct Hip3SourceActivity {
 pub struct Hip3SourceMarketActivity {
     pub source_fills: u64,
     pub source_wallets: BTreeSet<String>,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct SourceBackfillReport {
-    pub wallets: u64,
-    pub durable_baselines: u64,
-    pub fill_events: u64,
-    pub history_cursors: u64,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum SourceBackfillOutcome {
-    Imported(SourceBackfillReport),
-    SkippedDestinationExists,
-}
-
-pub fn import_source_backfill(
-    source: impl AsRef<Path>,
-    destination: impl AsRef<Path>,
-) -> Result<SourceBackfillOutcome, String> {
-    let source = source.as_ref();
-    let destination = destination.as_ref();
-    reject_symlink_path(source, "source backfill source")?;
-    let source_meta = std::fs::symlink_metadata(source)
-        .map_err(|error| format!("inspect source backfill source: {error}"))?;
-    if !source_meta.is_file() {
-        return Err("source backfill source is not a regular file".into());
-    }
-    let destination_parent = destination
-        .parent()
-        .ok_or("source backfill destination has no parent")?;
-    std::fs::create_dir_all(destination_parent)
-        .map_err(|error| format!("create source backfill destination parent: {error}"))?;
-    reject_symlink_path(destination_parent, "source backfill destination parent")?;
-    let source_canonical = std::fs::canonicalize(source)
-        .map_err(|error| format!("canonicalize source backfill source: {error}"))?;
-    let destination_canonical = destination_parent
-        .canonicalize()
-        .map_err(|error| format!("canonicalize source backfill destination parent: {error}"))?
-        .join(
-            destination
-                .file_name()
-                .ok_or("source backfill destination has no filename")?,
-        );
-    if source_canonical == destination_canonical {
-        return Err("source backfill source equals destination".into());
-    }
-    if destination_artifacts_exist(destination)? {
-        return Ok(SourceBackfillOutcome::SkippedDestinationExists);
-    }
-
-    let import_result = import_source_backfill_inner(&source_canonical, &destination_canonical);
-    if import_result.is_err() {
-        remove_partial_backfill_destination(&destination_canonical);
-    }
-    import_result
-}
-
-fn import_source_backfill_inner(
-    source: &Path,
-    destination: &Path,
-) -> Result<SourceBackfillOutcome, String> {
-    let source_text = source
-        .to_str()
-        .ok_or("source backfill source path is not valid UTF-8")?;
-    let destination_text = destination
-        .to_str()
-        .ok_or("source backfill destination path is not valid UTF-8")?;
-    let source = Connection::open_with_flags(
-        source_text,
-        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
-    )
-    .map_err(|error| format!("open source backfill source: {error}"))?;
-    source
-        .execute("VACUUM INTO ?1", [destination_text])
-        .map_err(|error| format!("vacuum source backfill snapshot: {error}"))?;
-    validate_backfilled_source_state(destination).map(SourceBackfillOutcome::Imported)
-}
-
-fn validate_backfilled_source_state(destination: &Path) -> Result<SourceBackfillReport, String> {
-    reject_symlink_path(destination, "source backfill destination")?;
-    let connection = Connection::open_with_flags(
-        destination,
-        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
-    )
-    .map_err(|error| format!("open source backfill destination: {error}"))?;
-    let version = connection
-        .query_row(
-            "SELECT schema_version FROM source_meta WHERE singleton = 1",
-            [],
-            |row| row.get::<_, i64>(0),
-        )
-        .map_err(|error| format!("read source backfill schema version: {error}"))?;
-    if version != SCHEMA_VERSION {
-        return Err(format!(
-            "source backfill schema mismatch: expected {SCHEMA_VERSION}, found {version}"
-        ));
-    }
-    let store = SourceStateStore {
-        connection,
-        process_generation: 0,
-    };
-    let durable_baselines = store.load_baselines()?.len() as u64;
-    let (wallets, fill_events, history_cursors): (u64, u64, u64) = store
-        .connection
-        .query_row(
-            "SELECT
-                 (SELECT count(*) FROM source_wallet),
-                 (SELECT count(*) FROM source_fill_event),
-                 (SELECT count(*) FROM source_history_cursor)",
-            [],
-            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
-        )
-        .map_err(|error| format!("count source backfill rows: {error}"))?;
-    Ok(SourceBackfillReport {
-        wallets,
-        durable_baselines,
-        fill_events,
-        history_cursors,
-    })
-}
-
-fn destination_artifacts_exist(destination: &Path) -> Result<bool, String> {
-    let mut exists = false;
-    for artifact in source_state_artifacts(destination) {
-        match std::fs::symlink_metadata(&artifact) {
-            Ok(metadata) if metadata.file_type().is_symlink() => {
-                return Err(format!(
-                    "source backfill destination artifact is a symlink: {}",
-                    artifact.display()
-                ));
-            }
-            Ok(_) => exists = true,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-            Err(error) => {
-                return Err(format!(
-                    "inspect source backfill destination artifact {}: {error}",
-                    artifact.display()
-                ))
-            }
-        }
-    }
-    Ok(exists)
-}
-
-fn source_state_artifacts(destination: &Path) -> [PathBuf; 4] {
-    [
-        destination.to_path_buf(),
-        PathBuf::from(format!("{}-wal", destination.display())),
-        PathBuf::from(format!("{}-shm", destination.display())),
-        PathBuf::from(format!("{}-journal", destination.display())),
-    ]
-}
-
-fn remove_partial_backfill_destination(destination: &Path) {
-    for artifact in source_state_artifacts(destination) {
-        if std::fs::symlink_metadata(&artifact)
-            .map(|metadata| !metadata.file_type().is_symlink())
-            .unwrap_or(false)
-        {
-            let _ = std::fs::remove_file(artifact);
-        }
-    }
-}
-
-fn reject_symlink_path(path: &Path, label: &str) -> Result<(), String> {
-    for ancestor in path.ancestors() {
-        match std::fs::symlink_metadata(ancestor) {
-            Ok(metadata) if metadata.file_type().is_symlink() => {
-                return Err(format!("{label} contains symlink: {}", ancestor.display()));
-            }
-            Ok(_) => {}
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-            Err(error) => return Err(format!("inspect {label} {}: {error}", ancestor.display())),
-        }
-    }
-    Ok(())
 }
 
 /// Single-writer durable source baseline store. Durable baselines survive a
@@ -726,6 +549,265 @@ impl SourceStateStore {
     }
 }
 
+/// Summary of a validated one-time SQLite backfill import.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SourceBackfillSummary {
+    pub wallets: usize,
+    pub durable_baselines: usize,
+    pub fill_events: u64,
+    pub history_cursors: usize,
+}
+
+/// Outcome of attempting a backfill import before `SourceStateStore::open`.
+///
+/// `SkippedDestinationExists` is the idempotent steady state: the destination
+/// already exists, so every restart keeps using its own durable data and never
+/// re-copies the old root (which would wipe fills accrued since the import).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SourceBackfillOutcome {
+    Imported(SourceBackfillSummary),
+    SkippedDestinationExists,
+}
+
+fn require_regular_file_no_symlink(path: &Path, field: &str) -> Result<(), String> {
+    let metadata = std::fs::symlink_metadata(path)
+        .map_err(|error| format!("{field} is not accessible: {error}"))?;
+    let file_type = metadata.file_type();
+    if file_type.is_symlink() {
+        return Err(format!(
+            "{field} must never be a symlink: {}",
+            path.display()
+        ));
+    }
+    if !file_type.is_file() {
+        return Err(format!(
+            "{field} must be a regular file: {}",
+            path.display()
+        ));
+    }
+    Ok(())
+}
+
+fn dest_sidecar_exists(dest: &Path) -> Result<bool, String> {
+    let dest_string = dest.to_string_lossy().into_owned();
+    let mut exists = false;
+    for suffix in [
+        String::new(),
+        "-wal".to_string(),
+        "-shm".to_string(),
+        "-journal".to_string(),
+    ] {
+        let candidate = if suffix.is_empty() {
+            dest.to_path_buf()
+        } else {
+            Path::new(&format!("{dest_string}{suffix}")).to_path_buf()
+        };
+        match std::fs::symlink_metadata(&candidate) {
+            Ok(metadata) if metadata.file_type().is_symlink() => {
+                return Err(format!(
+                    "source backfill destination must never be a symlink: {}",
+                    candidate.display()
+                ));
+            }
+            Ok(_) => exists = true,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(format!(
+                    "inspect source backfill destination {}: {error}",
+                    candidate.display()
+                ));
+            }
+        }
+    }
+    Ok(exists)
+}
+
+/// One-time validated import of an old root's `source-state.sqlite` into a
+/// fresh `DATA_ROOT`.
+///
+/// Must be called before `SourceStateStore::open` on the destination. Uses
+/// `VACUUM INTO` so the copy includes WAL content as one consistent snapshot
+/// instead of a raw file copy that can drop uncheckpointed fills. Validates
+/// schema version and every durable baseline checksum; on validation failure
+/// the partial destination is removed and an error is returned so the caller
+/// fails closed instead of starting with zero baselines silently.
+///
+/// Idempotency: if any destination file (`sqlite`, `-wal`, `-shm`,
+/// `-journal`) already exists, no copy is performed and
+/// `SkippedDestinationExists` is returned. Re-importing on every restart
+/// would wipe fills accrued since the migration. To re-import, stop the
+/// service, wipe the destination root, then restart with the flag set.
+pub fn import_source_backfill(
+    dest: impl AsRef<Path>,
+    src: impl AsRef<Path>,
+) -> Result<SourceBackfillOutcome, String> {
+    let dest = dest.as_ref();
+    let src = src.as_ref();
+    if dest_sidecar_exists(dest)? {
+        return Ok(SourceBackfillOutcome::SkippedDestinationExists);
+    }
+    require_regular_file_no_symlink(src, "source backfill file")?;
+    if src == dest {
+        return Err("source backfill file must not equal the destination database".into());
+    }
+    let dest_parent = dest
+        .parent()
+        .ok_or("source backfill destination has no parent")?;
+    std::fs::create_dir_all(dest_parent)
+        .map_err(|error| format!("create source backfill destination parent: {error}"))?;
+    let parent_type = std::fs::symlink_metadata(dest_parent)
+        .map_err(|error| format!("inspect source backfill destination parent: {error}"))?
+        .file_type();
+    if parent_type.is_symlink() || !parent_type.is_dir() {
+        return Err(format!(
+            "source backfill destination parent must be a real directory: {}",
+            dest_parent.display()
+        ));
+    }
+
+    // Open the source with a normal connection so WAL content is visible.
+    // VACUUM INTO only reads the source; it never bumps its generation.
+    let src_connection =
+        Connection::open(src).map_err(|error| format!("open source backfill file: {error}"))?;
+    src_connection
+        .busy_timeout(std::time::Duration::from_secs(5))
+        .map_err(|error| format!("configure source backfill busy timeout: {error}"))?;
+    let schema_version: i64 = src_connection
+        .query_row(
+            "SELECT schema_version FROM source_meta WHERE singleton = 1",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(|error| format!("source backfill is not a source-state database: {error}"))?;
+    if schema_version != SCHEMA_VERSION {
+        return Err(format!(
+            "source backfill schema mismatch: expected {SCHEMA_VERSION}, found {schema_version}"
+        ));
+    }
+    let dest_string = dest.to_string_lossy().into_owned();
+    let escaped = dest_string.replace('\'', "''");
+    src_connection
+        .execute_batch(&format!("VACUUM INTO '{escaped}'"))
+        .map_err(|error| format!("copy source backfill snapshot: {error}"))?;
+    drop(src_connection);
+
+    // Validate the copied snapshot before the caller opens it for writing:
+    // every durable baseline checksum must verify, regardless of which cohort
+    // is currently enabled. Cohort re-enablement happens in `open()`.
+    let validation = (|| -> Result<SourceBackfillSummary, String> {
+        let connection = Connection::open_with_flags(dest, OpenFlags::SQLITE_OPEN_READ_ONLY)
+            .map_err(|error| format!("open copied source backfill: {error}"))?;
+        let version: i64 = connection
+            .query_row(
+                "SELECT schema_version FROM source_meta WHERE singleton = 1",
+                [],
+                |row| row.get(0),
+            )
+            .map_err(|error| format!("read copied source backfill schema: {error}"))?;
+        if version != SCHEMA_VERSION {
+            return Err(format!(
+                "copied source backfill schema mismatch: expected {SCHEMA_VERSION}, found {version}"
+            ));
+        }
+        let wallets: i64 = connection
+            .query_row("SELECT count(*) FROM source_wallet", [], |row| row.get(0))
+            .map_err(|error| format!("count copied source wallets: {error}"))?;
+        let history_cursors: i64 = connection
+            .query_row("SELECT count(*) FROM source_history_cursor", [], |row| {
+                row.get(0)
+            })
+            .map_err(|error| format!("count copied source history cursors: {error}"))?;
+        let fill_events: i64 = connection
+            .query_row("SELECT count(*) FROM source_fill_event", [], |row| {
+                row.get(0)
+            })
+            .map_err(|error| format!("count copied source fills: {error}"))?;
+        let mut baseline_statement = connection
+            .prepare(
+                "SELECT w.wallet_address, w.account_value, w.last_exchange_time_ms, w.state_hash
+                 FROM source_wallet w
+                 JOIN source_recovery r USING(wallet_address)
+                 WHERE r.durable_baseline = 1
+                 ORDER BY w.wallet_address",
+            )
+            .map_err(|error| format!("prepare copied baseline validation: {error}"))?;
+        let baseline_rows = baseline_statement
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, i64>(2)?,
+                    row.get::<_, Vec<u8>>(3)?,
+                ))
+            })
+            .map_err(|error| format!("query copied baselines: {error}"))?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|error| format!("read copied baselines: {error}"))?;
+        drop(baseline_statement);
+        for (wallet, account_value, source_time_ms, expected_hash) in &baseline_rows {
+            let source_time_ms = decode_u64(*source_time_ms, "source exchange time")?;
+            let mut positions = BTreeMap::new();
+            let mut position_statement = connection
+                .prepare(
+                    "SELECT coin, signed_size, signed_notional, entry_price, unrealized_pnl
+                     FROM source_position WHERE wallet_address = ?1 ORDER BY coin",
+                )
+                .map_err(|error| format!("prepare copied positions: {error}"))?;
+            let position_rows = position_statement
+                .query_map([wallet], |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, Option<String>>(3)?,
+                        row.get::<_, Option<String>>(4)?,
+                    ))
+                })
+                .map_err(|error| format!("query copied positions: {error}"))?
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|error| format!("read copied positions: {error}"))?;
+            for (coin, signed_size, signed_notional, entry_price, unrealized_pnl) in position_rows {
+                positions.insert(
+                    coin.clone(),
+                    SourceAssetPosition {
+                        asset: coin,
+                        signed_size: parse_decimal(&signed_size)?,
+                        signed_notional: parse_decimal(&signed_notional)?,
+                        entry_price: entry_price.as_deref().map(parse_decimal).transpose()?,
+                        unrealized_pnl: unrealized_pnl.as_deref().map(parse_decimal).transpose()?,
+                    },
+                );
+            }
+            let state = SourceStateResponse {
+                candidate_id: wallet.clone(),
+                account_value: parse_decimal(account_value)?,
+                source_time_ms,
+                positions,
+                closed_candles: Vec::new(),
+            };
+            if expected_hash.as_slice() != state_hash(&state)?.as_slice() {
+                return Err(format!("source backfill checksum mismatch for {wallet}"));
+            }
+        }
+        Ok(SourceBackfillSummary {
+            wallets: usize::try_from(wallets.max(0)).unwrap_or_default(),
+            durable_baselines: baseline_rows.len(),
+            fill_events: u64::try_from(fill_events.max(0)).unwrap_or_default(),
+            history_cursors: usize::try_from(history_cursors.max(0)).unwrap_or_default(),
+        })
+    })();
+    match validation {
+        Ok(summary) => Ok(SourceBackfillOutcome::Imported(summary)),
+        Err(error) => {
+            let _ = std::fs::remove_file(dest);
+            let _ = std::fs::remove_file(format!("{dest_string}-wal"));
+            let _ = std::fs::remove_file(format!("{dest_string}-shm"));
+            let _ = std::fs::remove_file(format!("{dest_string}-journal"));
+            Err(error)
+        }
+    }
+}
+
 fn journal_source_fill(
     tx: &Transaction<'_>,
     wallet: &str,
@@ -966,102 +1048,6 @@ mod tests {
             activity.markets["xyz:AMD"].source_wallets,
             BTreeSet::from([first, second])
         );
-    }
-
-    #[test]
-    fn source_backfill_import_preserves_state_then_skips_existing_destination() {
-        let source_root = tempfile::tempdir_in("/private/tmp").unwrap();
-        let dest_root = tempfile::tempdir_in("/private/tmp").unwrap();
-        let source = source_root.path().join("source-state.sqlite");
-        let dest = dest_root.path().join("source-state.sqlite");
-        let wallet = wallet('1');
-        let baseline = state(wallet.clone(), 100);
-        let mut source_store = SourceStateStore::open(&source, "old", [wallet.clone()]).unwrap();
-        source_store.persist(&baseline, true, false).unwrap();
-        source_store
-            .persist_history(
-                &page(&wallet, 100, 200, serde_json::json!([fill(150, 1, "B")])),
-                201,
-            )
-            .unwrap();
-        drop(source_store);
-
-        let report = match import_source_backfill(&source, &dest).unwrap() {
-            SourceBackfillOutcome::Imported(report) => report,
-            SourceBackfillOutcome::SkippedDestinationExists => panic!("fresh import skipped"),
-        };
-        assert_eq!(report.wallets, 1);
-        assert_eq!(report.durable_baselines, 1);
-        assert_eq!(report.fill_events, 1);
-        assert_eq!(report.history_cursors, 1);
-
-        let dest_store = SourceStateStore::open(&dest, "new", [wallet.clone()]).unwrap();
-        assert_eq!(dest_store.load_baselines().unwrap(), vec![baseline]);
-        assert_eq!(
-            dest_store.continuity_status().unwrap(),
-            SourceContinuityStatus {
-                durable_baselines: 1,
-                live_state_confirmed: 0,
-                live_state_recovering: 1,
-                history_contiguous: 1,
-                history_catching_up: 0,
-                history_gapped: 0
-            }
-        );
-        drop(dest_store);
-
-        assert_eq!(
-            import_source_backfill(&source, &dest).unwrap(),
-            SourceBackfillOutcome::SkippedDestinationExists
-        );
-    }
-
-    #[test]
-    fn source_backfill_rejects_corruption_and_removes_partial_destination() {
-        let source_root = tempfile::tempdir_in("/private/tmp").unwrap();
-        let dest_root = tempfile::tempdir_in("/private/tmp").unwrap();
-        let source = source_root.path().join("source-state.sqlite");
-        let dest = dest_root.path().join("source-state.sqlite");
-        let wallet = wallet('2');
-        let mut source_store = SourceStateStore::open(&source, "old", [wallet.clone()]).unwrap();
-        source_store
-            .persist(&state(wallet, 100), true, false)
-            .unwrap();
-        source_store
-            .connection
-            .execute("UPDATE source_wallet SET state_hash = zeroblob(32)", [])
-            .unwrap();
-        drop(source_store);
-
-        assert!(import_source_backfill(&source, &dest).is_err());
-        assert!(!dest.exists());
-    }
-
-    #[test]
-    fn source_backfill_missing_existing_and_symlink_boundaries_fail_closed() {
-        let root = tempfile::tempdir_in("/private/tmp").unwrap();
-        let source = root.path().join("source-state.sqlite");
-        let dest = root.path().join("dest.sqlite");
-        assert!(import_source_backfill(&source, &dest).is_err());
-
-        let wallet = wallet('3');
-        let source_store = SourceStateStore::open(&source, "old", [wallet]).unwrap();
-        drop(source_store);
-        std::fs::write(&dest, b"existing").unwrap();
-        assert_eq!(
-            import_source_backfill(&source, &dest).unwrap(),
-            SourceBackfillOutcome::SkippedDestinationExists
-        );
-
-        let link = root.path().join("source-link.sqlite");
-        #[cfg(unix)]
-        {
-            std::os::unix::fs::symlink(&source, &link).unwrap();
-            assert!(import_source_backfill(&link, root.path().join("new.sqlite")).is_err());
-            let dest_link = root.path().join("dest-link.sqlite");
-            std::os::unix::fs::symlink(root.path().join("target.sqlite"), &dest_link).unwrap();
-            assert!(import_source_backfill(&source, &dest_link).is_err());
-        }
     }
 
     #[test]
@@ -1641,5 +1627,144 @@ mod tests {
             .contains("checksum mismatch"));
         drop(store);
         std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn backfill_imports_fresh_root_then_skips_on_every_restart() {
+        let old_root = tempfile::tempdir().unwrap();
+        let old_path = old_root.path().join("source-state.sqlite");
+        let first = wallet('a');
+        let second = wallet('b');
+        let mut old =
+            SourceStateStore::open(&old_path, "2-wallet", [first.clone(), second.clone()]).unwrap();
+        old.persist(&state(first.clone(), 1000), true, false)
+            .unwrap();
+        old.persist_history(
+            &page(&first, 100, 200, serde_json::json!([fill(150, 7, "B")])),
+            201,
+        )
+        .unwrap();
+        let expected_baselines = old.load_baselines().unwrap();
+        assert_eq!(expected_baselines.len(), 1);
+        let expected_history: String = old
+            .connection
+            .query_row(
+                "SELECT group_concat(wallet_address||':'||COALESCE(last_fill_time_ms,0)||':'||COALESCE(contiguous_through_ms,0)||':'||history_state,'|') FROM (SELECT * FROM source_history_cursor ORDER BY wallet_address)",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        drop(old);
+
+        let new_root = tempfile::tempdir().unwrap();
+        let new_path = new_root.path().join("nested").join("source-state.sqlite");
+        match import_source_backfill(&new_path, &old_path).unwrap() {
+            SourceBackfillOutcome::Imported(summary) => {
+                assert_eq!(summary.durable_baselines, 1);
+                assert_eq!(summary.fill_events, 1);
+                assert_eq!(summary.wallets, 2);
+            }
+            SourceBackfillOutcome::SkippedDestinationExists => {
+                panic!("fresh destination must be imported, not skipped")
+            }
+        }
+
+        // Normal open after import bumps the generation, re-enables the cohort,
+        // preserves fills/history, and resets live confirmation (recovery barrier).
+        let store =
+            SourceStateStore::open(&new_path, "2-wallet", [first.clone(), second.clone()]).unwrap();
+        assert_eq!(store.process_generation(), 2);
+        assert_eq!(store.load_baselines().unwrap(), expected_baselines);
+        let history_after: String = store
+            .connection
+            .query_row(
+                "SELECT group_concat(wallet_address||':'||COALESCE(last_fill_time_ms,0)||':'||COALESCE(contiguous_through_ms,0)||':'||history_state,'|') FROM (SELECT * FROM source_history_cursor ORDER BY wallet_address)",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(history_after, expected_history);
+        let live_confirmed: i64 = store
+            .connection
+            .query_row(
+                "SELECT live_confirmed FROM source_recovery WHERE durable_baseline = 1",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(live_confirmed, 0);
+        drop(store);
+
+        // Every later restart with the flag still set must keep the destination
+        // file and never re-copy (which would wipe fills accrued since import).
+        assert_eq!(
+            import_source_backfill(&new_path, &old_path).unwrap(),
+            SourceBackfillOutcome::SkippedDestinationExists
+        );
+        let store =
+            SourceStateStore::open(&new_path, "2-wallet", [first.clone(), second.clone()]).unwrap();
+        assert_eq!(store.load_baselines().unwrap(), expected_baselines);
+    }
+
+    #[test]
+    fn backfill_rejects_corrupt_snapshot_and_removes_partial_copy() {
+        let old_root = tempfile::tempdir().unwrap();
+        let old_path = old_root.path().join("source-state.sqlite");
+        let first = wallet('c');
+        let mut old = SourceStateStore::open(&old_path, "test", [first.clone()]).unwrap();
+        old.persist(&state(first, 100), true, false).unwrap();
+        old.connection
+            .execute("UPDATE source_wallet SET state_hash = X'00'", [])
+            .unwrap();
+        drop(old);
+
+        let new_root = tempfile::tempdir().unwrap();
+        let new_path = new_root.path().join("source-state.sqlite");
+        assert!(import_source_backfill(&new_path, &old_path)
+            .unwrap_err()
+            .contains("checksum mismatch"));
+        assert!(!new_path.exists());
+    }
+
+    #[test]
+    fn backfill_rejects_missing_source_and_existing_destination() {
+        let root = tempfile::tempdir().unwrap();
+        let missing = root.path().join("missing.sqlite");
+        let dest = root.path().join("dest.sqlite");
+        assert!(import_source_backfill(&dest, &missing).is_err());
+        std::fs::write(&dest, b"existing").unwrap();
+        let src = root.path().join("src.sqlite");
+        let wallet = wallet('d');
+        let store = SourceStateStore::open(&src, "test", [wallet]).unwrap();
+        drop(store);
+        assert_eq!(
+            import_source_backfill(&dest, &src).unwrap(),
+            SourceBackfillOutcome::SkippedDestinationExists
+        );
+        assert_eq!(std::fs::read(&dest).unwrap(), b"existing");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn backfill_never_follows_symlinks() {
+        let root = tempfile::tempdir().unwrap();
+        let outside = root.path().join("outside.sqlite");
+        std::fs::write(&outside, b"untouched").unwrap();
+        let link = root.path().join("link.sqlite");
+        std::os::unix::fs::symlink(&outside, &link).unwrap();
+        let dest = root.path().join("dest.sqlite");
+        assert!(import_source_backfill(&dest, &link).is_err());
+        assert!(!dest.exists());
+        assert_eq!(std::fs::read(&outside).unwrap(), b"untouched");
+
+        let real_dest = root.path().join("real.sqlite");
+        std::fs::write(&real_dest, b"real").unwrap();
+        let dest_link = root.path().join("dest-link.sqlite");
+        std::os::unix::fs::symlink(&real_dest, &dest_link).unwrap();
+        let src = root.path().join("src.sqlite");
+        let store = SourceStateStore::open(&src, "test", [wallet('e')]).unwrap();
+        drop(store);
+        assert!(import_source_backfill(&dest_link, &src).is_err());
+        assert_eq!(std::fs::read(&real_dest).unwrap(), b"real");
     }
 }

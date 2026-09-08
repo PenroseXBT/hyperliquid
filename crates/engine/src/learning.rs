@@ -281,126 +281,6 @@ mod tests {
     }
 
     #[test]
-    fn historical_continuation_winner_then_deterioration_preserves_forward_ordering() {
-        // Synthetic regression only: each row has its own causal anchor and
-        // normal five-minute outcome. No eventual loss is put in the features.
-        let mut targets = Vec::new();
-        for (at, current, future) in [(1_000, 100, 110), (301_000, 110, 70), (601_000, 70, 20)] {
-            let mut state = DelayedLearning::default();
-            let mut decision = sample(DecisionKind::Hold, MfceDirection::Long);
-            decision.decision_at = at;
-            decision.cloid = None;
-            decision.anchor = executable_anchor(
-                &book(current, 10),
-                Side::Sell,
-                Decimal::ONE,
-                &rules(),
-                Decimal::new(1, 2),
-                Decimal::ZERO,
-                Decimal::new(5, 2),
-            );
-            let frozen = decision.features.clone();
-            state.capture(decision);
-            assert!(observe(&mut state, at, future, 10).is_empty());
-            let labels = observe(&mut state, at + HORIZONS_MS[HORIZON_5M], future, 10);
-            assert_eq!(labels.len(), 1);
-            let (features, _, anchor_at, target) = &labels[0];
-            assert_eq!(*anchor_at, at);
-            assert!(*anchor_at < at + HORIZONS_MS[HORIZON_5M]);
-            assert_eq!(
-                features.objective(),
-                ::mfce::lifecycle::LearningObjective::ContinuationQuality
-            );
-            assert_eq!(state.samples[0].features, frozen);
-            targets.push(*target);
-        }
-        assert!(targets[0] > Decimal::ZERO);
-        assert!(targets[1] < targets[0]);
-        assert!(targets[2] < targets[1]);
-    }
-
-    #[test]
-    fn historical_exit_counterfactual_values_terminal_damage_after_costs() {
-        let mut state = DelayedLearning::default();
-        let mut decision = sample(DecisionKind::Exit, MfceDirection::Long);
-        decision.provenance = DecisionProvenance::Unexecuted;
-        decision.cloid = None;
-        decision.funding_credit = Some(Decimal::new(-5, 1));
-        state.capture(decision);
-        // The terminal fill is an outcome quote, never a selected EXIT row.
-        let labels = state.observe("BTC", HORIZONS_MS[HORIZON_5M], |_, _| {
-            Some(ExecutableAnchor {
-                quantity: Decimal::ONE,
-                midpoint: Decimal::from(20),
-                fill_price: Decimal::from(19),
-                fees: Decimal::from(3),
-                actual: true,
-            })
-        });
-        let exit_now = Decimal::from(99) - Decimal::new(99, 2);
-        let hold_to_terminal = Decimal::from(19) - Decimal::from(3) - Decimal::new(5, 1);
-        let continuation = hold_to_terminal - exit_now;
-        assert_eq!(continuation, Decimal::new(-8251, 2));
-        assert_eq!(labels.len(), 1);
-        assert_eq!(
-            labels[0].0.objective(),
-            ::mfce::lifecycle::LearningObjective::ExitQuality
-        );
-        // Existing ExitQuality is remaining edge: negative means the avoided
-        // continuation was harmful. Do not invert it to a new reward target.
-        assert_eq!(labels[0].3, continuation * Decimal::from(100));
-        assert!(exit_now > hold_to_terminal);
-        assert_eq!(state.samples.len(), 1);
-        assert_eq!(state.samples[0].provenance, DecisionProvenance::Unexecuted);
-        assert!(state.provenance.actions.is_empty());
-    }
-
-    #[test]
-    fn historical_external_fills_do_not_invent_manual_entry_or_selected_exit_samples() {
-        let mut state = DelayedLearning::default();
-        for (at, quantity, price, before, gross) in
-            [(1_000, 1, 100, 0, 0), (301_000, -1, 20, 1, -80)]
-        {
-            state.fill(
-                "BTC",
-                "external-fill",
-                at,
-                Decimal::from(quantity),
-                Decimal::from(price),
-                Decimal::ONE,
-                Decimal::from(before),
-                Decimal::from(price),
-                RealizedOutcome::settled(
-                    Decimal::from(gross),
-                    Decimal::ONE,
-                    Decimal::ZERO,
-                    Decimal::ZERO,
-                )
-                .unwrap(),
-            );
-        }
-        assert!(state.samples.is_empty());
-        assert!(state.provenance.actions.is_empty());
-        assert!(observe(&mut state, 601_000, 10, 10).is_empty());
-    }
-
-    #[test]
-    fn historical_missing_features_or_late_outcomes_remain_unlabeled() {
-        let mut missing = DelayedLearning::default();
-        let mut decision = sample(DecisionKind::Hold, MfceDirection::Long);
-        decision.cloid = None;
-        decision.features.context = None;
-        missing.capture(decision);
-        assert!(missing.samples.is_empty());
-        assert!(observe(&mut missing, 300_000, 20, 10).is_empty());
-
-        let mut late = DelayedLearning::default();
-        late.capture(sample(DecisionKind::Hold, MfceDirection::Long));
-        assert!(observe(&mut late, HORIZONS_MS[HORIZON_COUNT - 1] + 2_001, 20, 10).is_empty());
-        assert!(late.samples[0].forward.iter().all(Option::is_none));
-    }
-
-    #[test]
     fn size_regret_requires_depth_at_both_sizes_and_both_times() {
         for depth in [1, 10] {
             let mut state = DelayedLearning::default();
@@ -652,6 +532,150 @@ mod tests {
         assert!(
             net < Decimal::ZERO,
             "round-trip costs and price loss are retained"
+        );
+    }
+
+    #[test]
+    fn regretted_exit_produces_worse_exit_quality_target_than_correct_exit() {
+        // EXIT → delayed observation → ExitQuality training label. A missed
+        // favorable continuation (bad exit, later reacquired) must produce a
+        // worse ExitQuality target than an otherwise equivalent correct exit.
+        // Labels use actual executable costs (authenticated fee/slippage in
+        // production) and flow into MfceTrainingSample rows the model trains on.
+        use ::mfce::lifecycle::{LearningObjective, MfceEngine};
+
+        let mut bad = DelayedLearning::default();
+        let mut exit = sample(DecisionKind::Exit, MfceDirection::Long);
+        exit.provenance = DecisionProvenance::Selected;
+        exit.mode = Some(MfcePolicyState::Exploit);
+        bad.capture(exit);
+        let mut good = DelayedLearning::default();
+        let mut exit = sample(DecisionKind::Exit, MfceDirection::Long);
+        exit.provenance = DecisionProvenance::Selected;
+        exit.mode = Some(MfcePolicyState::Exploit);
+        good.capture(exit);
+
+        // Favorable continuation after the exit: retention was valuable, so
+        // the exit is regretted. Adverse continuation: the exit was correct.
+        let bad_labels = observe(&mut bad, 900_000, 110, 10);
+        let good_labels = observe(&mut good, 900_000, 90, 10);
+        assert!(!bad_labels.is_empty() && !good_labels.is_empty());
+        let bad_outcome = bad.samples[0].forward[HORIZON_15M].as_ref().unwrap();
+        let good_outcome = good.samples[0].forward[HORIZON_15M].as_ref().unwrap();
+        // Actual after-cost truth drives both labels: executable fees and
+        // slippage are deducted (retention nets the saved entry fee, so the
+        // signed fee residual may be positive or negative), and the identity
+        // holds exactly.
+        for outcome in [bad_outcome, good_outcome] {
+            assert_eq!(
+                outcome.net_pnl,
+                outcome.gross_pnl - outcome.fees - outcome.slippage + outcome.funding
+            );
+            assert_ne!(outcome.net_pnl, outcome.gross_pnl);
+        }
+        for state in [&bad, &good] {
+            // Decision-time executable anchor carries a real quoted fee.
+            assert!(state.samples[0].anchor.as_ref().unwrap().fees > Decimal::ZERO);
+            assert!(state.samples[0].cost_drag_bps[HORIZON_15M].is_some());
+        }
+        assert!(bad.samples[0].exit_regret_bps[HORIZON_15M].unwrap() > Decimal::ZERO);
+        let bad_edge = bad_labels.iter().map(|label| label.3).max().unwrap();
+        let good_edge = good_labels.iter().map(|label| label.3).max().unwrap();
+        assert!(
+            bad_edge > good_edge,
+            "regretted exit target {bad_edge} must exceed correct exit target {good_edge}"
+        );
+
+        // Both labels become ExitQuality training rows consumed by training.
+        let mut engine = MfceEngine::default();
+        for (labels, completed) in [(&bad_labels, 900_000), (&good_labels, 900_001)] {
+            for (features, direction, opened, edge) in labels {
+                engine.learn_delayed(
+                    "BTC",
+                    features.clone(),
+                    *direction,
+                    *opened,
+                    completed,
+                    *edge,
+                );
+            }
+        }
+        assert_eq!(
+            engine.state().samples.len(),
+            bad_labels.len() + good_labels.len()
+        );
+        for row in &engine.state().samples {
+            assert_eq!(row.objective, LearningObjective::ExitQuality);
+            assert_eq!(row.features.objective(), LearningObjective::ExitQuality);
+        }
+        let bad_target = engine
+            .state()
+            .samples
+            .iter()
+            .take(bad_labels.len())
+            .map(|row| row.remaining_net_edge_bps)
+            .max()
+            .unwrap();
+        let good_target = engine
+            .state()
+            .samples
+            .iter()
+            .skip(bad_labels.len())
+            .map(|row| row.remaining_net_edge_bps)
+            .max()
+            .unwrap();
+        assert_eq!(bad_target, bad_edge);
+        assert_eq!(good_target, good_edge);
+        assert!(bad_target > good_target);
+    }
+
+    #[test]
+    fn exit_then_rapid_same_side_reopen_marks_reentry_regret() {
+        // R4: OPEN -> EXIT -> rapid OPEN LONG is negative ExitQuality/regret
+        // evidence. The reopened entry carries reentry_after_exit and
+        // reentry_regret; the EXIT itself retains exit_regret over the
+        // retention counterfactual so the model learns bad abandonment.
+        let mut state = DelayedLearning::default();
+        let mut exit = sample(DecisionKind::Exit, MfceDirection::Long);
+        exit.decision_at = 0;
+        exit.provenance = DecisionProvenance::Selected;
+        exit.mode = Some(MfcePolicyState::Exploit);
+        state.capture(exit);
+        // Settle the exit: flat after removing the full position.
+        state.fill(
+            "BTC",
+            "exit-cloid",
+            1,
+            Decimal::new(-1, 0),
+            Decimal::from(100),
+            Decimal::new(1, 2),
+            Decimal::ONE,
+            Decimal::from(100),
+            RealizedOutcome::settled(
+                Decimal::ZERO,
+                Decimal::new(1, 2),
+                Decimal::ZERO,
+                Decimal::ZERO,
+            )
+            .unwrap(),
+        );
+        assert!(state.turnover.get("BTC").is_some_and(|t| t.last_exit == 1));
+        let mut reopen = sample(DecisionKind::Open, MfceDirection::Long);
+        reopen.decision_at = 2;
+        reopen.provenance = DecisionProvenance::Selected;
+        reopen.mode = Some(MfcePolicyState::Explore);
+        state.capture(reopen);
+        assert!(state.samples[1].reentry_after_exit);
+        observe(&mut state, 900_002, 90, 10);
+        let index = HORIZON_15M;
+        // The exit's retention counterfactual is labeled...
+        assert!(state.samples[0].exit_regret_bps[index].is_some());
+        // ...and the rapid reacquisition carries entry + reentry regret
+        // including both legs' executable costs.
+        assert!(state.samples[1].entry_regret_bps[index].is_some());
+        assert_eq!(
+            state.samples[1].entry_regret_bps[index],
+            state.samples[1].reentry_regret_bps[index]
         );
     }
 

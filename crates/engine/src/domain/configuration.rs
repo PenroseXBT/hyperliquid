@@ -271,6 +271,12 @@ impl CopyTradeConfig {
             100.0,
         )?;
         finite_range("taker_fee_bps", self.taker_fee_bps, 0.0, 100.0)?;
+        finite_range(
+            "execution.fee_multiplier",
+            self.execution.fee_multiplier,
+            3.0,
+            5.0,
+        )?;
         if self.starting_equity_usd <= 0.0
             || !self.max_total_leverage.is_finite()
             || self.max_total_leverage <= 0.0
@@ -474,6 +480,10 @@ pub struct VettingConfig {
     pub lookback_days: i64,
 }
 
+fn default_fee_multiplier() -> f64 {
+    4.0
+}
+
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct ExecutionConfig {
@@ -483,6 +493,11 @@ pub struct ExecutionConfig {
     pub max_order_usd: f64,
     pub latency_timeout_ms: u64,
     pub order_rate_limit_per_sec: f64,
+    /// Conservative multiplier applied to expected fees for discretionary
+    /// policy hurdles only. Never contaminates settled accounting, labels,
+    /// or reconciliation truth. Supported range 3.0..=5.0, default 4.0.
+    #[serde(default = "default_fee_multiplier")]
+    pub fee_multiplier: f64,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]

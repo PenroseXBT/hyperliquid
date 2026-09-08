@@ -198,9 +198,6 @@ fn parse_arguments(arguments: impl Iterator<Item = String>) -> Result<Arguments,
     if release_binary.is_some() && operation != Operation::ReleaseManifest {
         return Err("--release-binary is supported only by release-manifest".into());
     }
-    if source_backfill_from.is_some() && operation != Operation::Continuous {
-        return Err("--source-backfill-from is supported only by continuous".into());
-    }
     Ok(Arguments {
         config,
         very_profitable_layer,
@@ -320,9 +317,27 @@ mod tests {
             [
                 "continuous".to_string(),
                 "--state-root".to_string(),
-                "/data/su6-continuous/state".to_string(),
+                "/data/system-v1/state".to_string(),
                 "--output".to_string(),
-                "/data/su6-continuous/runtime".to_string(),
+                "/data/system-v1/runtime".to_string(),
+            ]
+            .into_iter(),
+        )
+        .unwrap();
+        assert_eq!(parsed.operation, Operation::Continuous);
+        assert_eq!(
+            parsed.state_root,
+            Some(PathBuf::from("/data/system-v1/state"))
+        );
+        assert!(parsed.source_backfill_from.is_none());
+    }
+    #[test]
+    fn continuous_parser_accepts_source_backfill_path() {
+        let parsed = parse_arguments(
+            [
+                "continuous".to_string(),
+                "--state-root".to_string(),
+                "/data/v1/state".to_string(),
                 "--source-backfill-from".to_string(),
                 "/data/system-v1/source-state.sqlite".to_string(),
             ]
@@ -331,22 +346,9 @@ mod tests {
         .unwrap();
         assert_eq!(parsed.operation, Operation::Continuous);
         assert_eq!(
-            parsed.state_root,
-            Some(PathBuf::from("/data/su6-continuous/state"))
-        );
-        assert_eq!(
             parsed.source_backfill_from,
             Some(PathBuf::from("/data/system-v1/source-state.sqlite"))
         );
-        assert!(parse_arguments(
-            [
-                "--validate-config".to_string(),
-                "--source-backfill-from".to_string(),
-                "/data/system-v1/source-state.sqlite".to_string(),
-            ]
-            .into_iter(),
-        )
-        .is_err());
     }
     #[test]
     fn release_manifest_requires_explicit_commit() {

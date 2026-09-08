@@ -63,6 +63,9 @@ pub struct LiveExecutionRuntime<T: AuthenticatedExchangeTransport> {
     mode: ReconciliationMode,
     exchange_snapshot: Option<ExchangePositionSnapshot>,
     recovery_reason: Option<String>,
+    /// Builder DEXes with live involvement, pushed to the signer before
+    /// every reconciliation barrier so HIP-3 lifecycle stays venue-aware.
+    active_dexes: BTreeSet<String>,
 }
 
 pub struct LiveTerminalResolution {
@@ -171,10 +174,6 @@ impl<T: AuthenticatedExchangeTransport + Clone> LiveExecutionRuntime<T> {
             .collect())
     }
 
-    pub fn install_perp_dex_order(&self, order: Vec<String>) -> Result<(), SignerError> {
-        self.signer.install_perp_dex_order(order)
-    }
-
     pub async fn initialize_with_transport(
         transport: T,
         wallet: ApiWalletSecret,
@@ -197,10 +196,10 @@ impl<T: AuthenticatedExchangeTransport + Clone> LiveExecutionRuntime<T> {
                 .map_err(|error| SignerError::Ledger(error.to_string()))?
         } else {
             let equity = transport
-                .read_positions()
+                .read_equity()
                 .await
                 .map_err(|error| SignerError::Reconciliation(error.to_string()))?
-                .account_equity;
+                .equity;
             LiveTradingState::new(equity, now_ms)
                 .map_err(|error| SignerError::Ledger(error.to_string()))?
         };
@@ -223,7 +222,13 @@ impl<T: AuthenticatedExchangeTransport + Clone> LiveExecutionRuntime<T> {
             mode: ReconciliationMode::RiskOnly,
             exchange_snapshot: None,
             recovery_reason: None,
+            active_dexes: BTreeSet::new(),
         };
+        runtime.refresh_active_dexes().await;
+        runtime
+            .signer
+            .set_active_dexes(runtime.active_dexes.clone())
+            .await;
         runtime.active_cloids.extend(
             runtime
                 .signer
@@ -264,6 +269,16 @@ impl<T: AuthenticatedExchangeTransport + Clone> LiveExecutionRuntime<T> {
         if self.recovery_only() && !intent.reduce_only {
             return Err(SignerError::StartupNotReconciled);
         }
+        // Pre-fund model: hot path stays decision -> sign -> IOC. Collateral
+        // moves happen in the control plane, never synchronously per signal.
+        // Ensure the signing barrier already knows this DEX.
+        let dex = crate::hip3::dex_for_market(&intent.asset);
+        if !dex.is_empty() {
+            self.active_dexes.insert(dex.to_string());
+            self.signer
+                .set_active_dexes(self.active_dexes.clone())
+                .await;
+        }
         let authorization_now = intent.authorization.now_mono;
         let cloid = intent.planned_cloid;
         match self
@@ -301,6 +316,10 @@ impl<T: AuthenticatedExchangeTransport + Clone> LiveExecutionRuntime<T> {
     }
 
     pub async fn reconcile(&mut self, now_ms: u64) -> Result<AppliedExchangeBatch, SignerError> {
+        self.refresh_active_dexes().await;
+        self.signer
+            .set_active_dexes(self.active_dexes.clone())
+            .await;
         let result = self
             .signer
             .reconcile_startup(&mut self.state, &self.ledger_path, now_ms, 2, 1_000)
@@ -377,6 +396,25 @@ impl<T: AuthenticatedExchangeTransport + Clone> LiveExecutionRuntime<T> {
 
     pub fn state(&self) -> &LiveTradingState {
         &self.state
+    }
+
+    /// Derive active builder DEXes from durable positions plus registry
+    /// intents so restart preserves HIP-3 action ownership without a new
+    /// persistence subsystem. The signer barrier re-derives registry intent
+    /// DEXes itself on every reconciliation; this staging set covers
+    /// position-derived DEXes and DEXes seen on the submit hot path.
+    async fn refresh_active_dexes(&mut self) {
+        for asset in self.state.positions().keys() {
+            let dex = crate::hip3::dex_for_market(asset);
+            if !dex.is_empty() {
+                self.active_dexes.insert(dex.to_string());
+            }
+        }
+    }
+
+    /// Control-plane hook: pre-fund active HIP-3 DEXes outside the hot path.
+    pub fn set_active_dexes(&mut self, dexes: BTreeSet<String>) {
+        self.active_dexes = dexes.into_iter().filter(|dex| !dex.is_empty()).collect();
     }
 
     pub fn exchange_snapshot(&self) -> Option<&ExchangePositionSnapshot> {

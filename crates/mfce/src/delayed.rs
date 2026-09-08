@@ -235,7 +235,10 @@ impl DecisionSample {
         matches!(
             self.kind,
             DecisionKind::Hold | DecisionKind::Reduce | DecisionKind::Exit
-        )
+        ) || (matches!(
+            self.kind,
+            DecisionKind::Reject | DecisionKind::BudgetConstrained
+        ) && self.features.objective() == LearningObjective::ContinuationQuality)
     }
     fn economics(
         &self,
