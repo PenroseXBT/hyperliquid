@@ -887,6 +887,9 @@ pub struct MfceAllocationDecision {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct MfcePolicyOutput {
     pub asset: String,
+    pub direction: Option<MfceDirection>,
+    pub target_notional: Decimal,
+    pub signal_observed_at: u64,
     pub transition_id: u64,
     pub model_epoch: u64,
     pub policy_state: MfcePolicyState,
@@ -1873,6 +1876,12 @@ impl MfceEngine {
             asset.to_string(),
             MfcePolicyOutput {
                 asset: asset.to_string(),
+                direction: state.active.as_ref().map(|active| active.direction),
+                target_notional: state.approved_target_notional,
+                signal_observed_at: state
+                    .active
+                    .as_ref()
+                    .map_or(0, |active| active.entry_timestamp_mono),
                 transition_id,
                 model_epoch: prediction.model_epoch,
                 policy_state: decision.policy_state,

@@ -23,3 +23,15 @@ local-diagnostic-evidence/su6r1-r5/evidence/diagnostic-journals/diagnostic-journ
 local-diagnostic-evidence/su6r1-r5/state/state/.observer-state.lock
 local-diagnostic-evidence/su6r1-r5/state/state/unsigned-observer-state.msgpack
 Cargo.lock
+
+# Local incident evidence and Python caches
+.incident-private/
+__pycache__/
+**/__pycache__/
+*.pyc
+
+# Frozen Railway runtime config is part of the release artifact set.
+!railway-frozen/copytrade.json
+!railway-frozen/very-profitable-layer.json
+!railway-frozen/read-api-policy.json
+!railway-frozen/public-mainnet-transport.json

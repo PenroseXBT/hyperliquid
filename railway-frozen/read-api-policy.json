@@ -1,0 +1,36 @@
+{
+  "api": {
+    "total_weight_per_window": 900,
+    "reserved_weight_per_window": 120,
+    "source_polling_weight_per_window": 700,
+    "window_ms": 60000,
+    "max_concurrency": 2,
+    "queue_capacity": 256,
+    "source_tier_dispatch_targets_per_window": {
+      "active": 300,
+      "inactive": 69
+    },
+    "endpoint_weights": {
+      "source_state": 2,
+      "expanded_source_state": 2,
+      "source_fills": 120,
+      "market_mids": 2,
+      "exchange_metadata": 60,
+      "order_book": 2,
+      "follower_state": 2,
+      "follower_open_orders": 20
+    }
+  },
+  "retry": {
+    "initial_backoff_ms": 1000,
+    "maximum_backoff_ms": 30000,
+    "maximum_attempts": 5,
+    "maximum_lifetime_ms": 900000,
+    "jitter_bps": 1000,
+    "deterministic_seed": 12101991
+  },
+  "freshness": {
+    "configured_max_age_ms": 75000,
+    "maximum_future_skew_ms": 2000
+  }
+}

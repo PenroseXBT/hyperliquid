@@ -3013,10 +3013,26 @@ impl DecisionEngine {
         self.strategy_targets_ready && !self.execution_recovery_only()
     }
 
+    fn fresh_mfce_policy_output_at(
+        &self,
+        asset: &str,
+        durable_now: Timestamp,
+    ) -> Option<&crate::mfce::MfcePolicyOutput> {
+        let output = self.mfce.policy_output(asset)?;
+        if output.signal_observed_at == 0 || output.signal_observed_at > durable_now {
+            return None;
+        }
+        let maximum_age = self.config.global_risk.source_snapshot_max_age_ms;
+        if durable_now.saturating_sub(output.signal_observed_at) > maximum_age {
+            return None;
+        }
+        Some(output)
+    }
+
     fn suspend_strategy_target(&mut self, asset: &str, now: Timestamp) {
         self.strategy_targets_ready = false;
         self.metrics.target_readiness_rejections += 1;
-        eprintln!("strategy_target_unavailable=true asset={asset} observed_at={now} action=HOLD nonfatal=true");
+        eprintln!("global_target_readiness_unavailable=true asset={asset} observed_at={now} action=HOLD nonfatal=true");
     }
 
     pub fn release_unaccepted_production_intent(
@@ -4079,17 +4095,29 @@ impl DecisionEngine {
                 let refreshes_active_mfce = self.mfce.has_active_transition(&asset);
                 self.books
                     .insert(asset.clone(), (book.clone(), response.received_at_mono));
-                let admission_recomputed = refreshes_active_mfce
+                let prepared_intents_before = self.prepared_authorized_intents.len();
+                let mut execution_recompute = if self.pending.contains_key(&asset) {
+                    self.try_execute_pending(&book, response.received_at_mono)?
+                } else {
+                    ExecutionRecompute::None
+                };
+                let intent_prepared =
+                    self.prepared_authorized_intents.len() > prepared_intents_before;
+                let admission_recomputed = !intent_prepared
+                    && refreshes_active_mfce
                     && self
                         .construct_next_decision(response.received_at_mono)?
                         .is_some();
-                let execution_recompute = if refreshes_active_mfce && !admission_recomputed {
-                    ExecutionRecompute::None
-                } else {
-                    self.try_execute_pending(&book, response.received_at_mono)?
-                };
-                if (!admission_recomputed && triggers_recompute)
-                    || execution_recompute.is_required()
+                if !intent_prepared
+                    && execution_recompute == ExecutionRecompute::None
+                    && !(refreshes_active_mfce && !admission_recomputed)
+                {
+                    execution_recompute =
+                        self.try_execute_pending(&book, response.received_at_mono)?;
+                }
+                if !intent_prepared
+                    && ((!admission_recomputed && triggers_recompute)
+                        || execution_recompute.is_required())
                 {
                     let recomputed = self
                         .construct_next_decision(response.received_at_mono)?
@@ -4951,10 +4979,16 @@ impl DecisionEngine {
         &mut self,
         now: Timestamp,
     ) -> Result<Option<DecisionRecord>, EngineError> {
-        self.strategy_targets_ready = false;
+        // Do not clear live strategy readiness merely because a planning pass
+        // starts. Some passes intentionally return no new decision while an
+        // asset-scoped hold waits for a fresh book or source confirmation;
+        // treating that as a global no-orders latch made one manual AERO hold
+        // intermittently block every unrelated market. Global unsafe states
+        // below still clear readiness explicitly.
         // Recovery preserves the strategy target; divergence is not an exit
         // signal. Source ingestion continues, but MFCE replans only on convergence.
         if self.execution_recovery_only() {
+            self.strategy_targets_ready = false;
             return Ok(None);
         }
         self.accrue_funding(now)?;
@@ -5359,7 +5393,7 @@ impl DecisionEngine {
                 self.metrics.target_readiness_rejections =
                     self.metrics.target_readiness_rejections.saturating_add(1);
                 eprintln!(
-                    "strategy_target_unavailable=true asset={asset} observed_at={now} action=ASSET_HOLD nonfatal=true"
+                    "asset_target_hold_unavailable=true asset={asset} observed_at={now} action=ASSET_HOLD nonfatal=true"
                 );
                 let exposure = held_notional
                     .checked_div(available_gross)
@@ -5741,8 +5775,7 @@ impl DecisionEngine {
                 || (!current_source_target.is_zero() && (flow.is_some() || source_context_known));
             if !current_source_target.is_zero() {
                 let current_policy = self
-                    .mfce
-                    .policy_output(asset)
+                    .fresh_mfce_policy_output_at(asset, mfce_now)
                     .map(|output| output.policy_state);
                 let trajectory = self
                     .ledger
@@ -6220,9 +6253,12 @@ impl DecisionEngine {
                 let effective_target = if let Some((positive, rejected)) =
                     continuation_targets.get(asset)
                 {
-                    if self.mfce.policy_output(asset).is_some_and(|output| {
-                        output.policy_state == crate::mfce::MfcePolicyState::Reject
-                    }) {
+                    if self
+                        .fresh_mfce_policy_output_at(asset, mfce_now)
+                        .is_some_and(|output| {
+                            output.policy_state == crate::mfce::MfcePolicyState::Reject
+                        })
+                    {
                         // ENTRY != HOLD: a rejected continuation holds valid
                         // exposure instead of auto-flattening on noise. Only a
                         // genuine reversal (opposite-side desired target)
@@ -6281,13 +6317,14 @@ impl DecisionEngine {
         let retained_selected_increase_assets = selected_unissued_increase_assets
             .into_iter()
             .filter(|asset| {
-                self.mfce.policy_output(asset).is_some_and(|output| {
-                    matches!(
-                        output.policy_state,
-                        crate::mfce::MfcePolicyState::Explore
-                            | crate::mfce::MfcePolicyState::Exploit
-                    )
-                })
+                self.fresh_mfce_policy_output_at(asset, mfce_now)
+                    .is_some_and(|output| {
+                        matches!(
+                            output.policy_state,
+                            crate::mfce::MfcePolicyState::Explore
+                                | crate::mfce::MfcePolicyState::Exploit
+                        )
+                    })
             })
             .collect::<BTreeSet<_>>();
         let in_flight_pending_assets = self
@@ -6838,7 +6875,7 @@ impl DecisionEngine {
                         )
                     })
                     .collect();
-                let policy = self.mfce.policy_output(&asset).cloned();
+                let policy = self.fresh_mfce_policy_output_at(&asset, mfce_now).cloned();
                 if !action.reduce_only
                     && !policy.as_ref().is_some_and(|output| {
                         output.admitted
@@ -6925,7 +6962,7 @@ impl DecisionEngine {
                 .copied()
                 .unwrap_or_default();
             let delta = selected - current;
-            let output = self.mfce.policy_output(&asset);
+            let output = self.fresh_mfce_policy_output_at(&asset, mfce_now);
             let provenance = match output.and_then(|o| o.reason) {
                 Some(MfceRejectionReason::AllocationBudgetExhausted) => {
                     DecisionProvenance::AllocatorDisplaced
@@ -7210,12 +7247,15 @@ impl DecisionEngine {
         }
         if self.production_identity.is_some()
             && !pending.action.reduce_only
-            && !self.mfce.policy_output(&book.asset).is_some_and(|output| {
-                matches!(
-                    output.policy_state,
-                    crate::mfce::MfcePolicyState::Explore | crate::mfce::MfcePolicyState::Exploit
-                )
-            })
+            && !self
+                .fresh_mfce_policy_output_at(&book.asset, self.durable_timestamp(received_at)?)
+                .is_some_and(|output| {
+                    matches!(
+                        output.policy_state,
+                        crate::mfce::MfcePolicyState::Explore
+                            | crate::mfce::MfcePolicyState::Exploit
+                    )
+                })
         {
             self.retire_pending_action(
                 &book.asset,
@@ -8254,6 +8294,17 @@ impl DecisionEngine {
 
     pub fn mfce_report(&self) -> MfceReport {
         self.mfce.report()
+    }
+
+    pub fn fresh_mfce_report_at(&self, durable_now: Timestamp) -> MfceReport {
+        let mut report = self.mfce.report();
+        let maximum_age = self.config.global_risk.source_snapshot_max_age_ms;
+        report.policy_outputs.retain(|output| {
+            output.signal_observed_at != 0
+                && output.signal_observed_at <= durable_now
+                && durable_now.saturating_sub(output.signal_observed_at) <= maximum_age
+        });
+        report
     }
 
     /// Keep exact economic records for the rolling 30-day horizon and only a
@@ -10988,6 +11039,15 @@ pub(crate) mod tests {
             assert!(engine.pending.is_empty());
         }
         assert_eq!(engine.metrics.target_readiness_rejections, 2);
+        engine.mids = None;
+        assert!(engine
+            .construct_next_decision(now + 3_000)
+            .unwrap()
+            .is_none());
+        assert!(
+            engine.strategy_target_execution_enabled(),
+            "a no-op planning pass must not turn an asset-scoped hold into a global blocker"
+        );
     }
 
     #[test]
@@ -11275,6 +11335,50 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn streamed_book_executes_existing_mfce_pending_before_recompute() {
+        let now = 60_000;
+        let mut engine = flow_engine(now);
+        engine.enable_production_intents(ProductionIntentIdentity {
+            observer_release_hash: [1; 32],
+            signer_release_hash: [1; 32],
+            release_manifest_hash: [2; 32],
+            market_rules_hash: [3; 32],
+            dynamic_floor_policy_hash: [4; 32],
+            ioc_policy_hash: [5; 32],
+            expires_after_ms: 10_000,
+        });
+        engine.construct_next_decision(now).unwrap().unwrap();
+        let selected = engine.pending["BTC"].action.clone();
+        let at = now + engine.config.latency_timeout_ms;
+        let book = mfce_test_book(
+            "BTC",
+            engine.durable_timestamp(at).unwrap(),
+            Decimal::new(9_999, 2),
+            Decimal::new(10_001, 2),
+            Decimal::from(1_000),
+        );
+
+        engine
+            .ingest(
+                accepted(
+                    PublicPayload::OrderBook(book),
+                    ReadRequestKind::OrderBook,
+                    at,
+                ),
+                at,
+            )
+            .unwrap();
+
+        let intents = engine.take_prepared_authorized_intents();
+        assert_eq!(intents.len(), 1);
+        assert_eq!(intents[0].planned_cloid, selected.planned_cloid);
+        assert!(!engine.action_lifecycle_events.iter().any(|event| {
+            event.planned_cloid == selected.planned_cloid.to_string()
+                && event.outcome == ActionAttemptOutcome::SupersededByNewTarget
+        }));
+    }
+
+    #[test]
     fn selected_flow_probe_keeps_its_bounded_candidate_rank() {
         let now = 60_000;
         let mut engine = flow_engine(now);
@@ -11372,6 +11476,47 @@ pub(crate) mod tests {
         engine
             .try_execute_pending(&book, now + engine.config.latency_timeout_ms)
             .unwrap();
+
+        assert!(!engine.pending.contains_key("BTC"));
+        assert!(engine.take_prepared_authorized_intents().is_empty());
+        assert!(engine.action_lifecycle_events.iter().any(|event| {
+            event.planned_cloid == selected.planned_cloid.to_string()
+                && event.outcome == ActionAttemptOutcome::BlockedByCurrentRisk
+        }));
+    }
+
+    #[test]
+    fn stale_mfce_policy_output_is_neither_reported_nor_executable() {
+        let now = 60_000;
+        let mut engine = flow_engine(now);
+        let maximum_age = engine.config.global_risk.source_snapshot_max_age_ms;
+        engine.enable_production_intents(ProductionIntentIdentity {
+            observer_release_hash: [1; 32],
+            signer_release_hash: [1; 32],
+            release_manifest_hash: [2; 32],
+            market_rules_hash: [3; 32],
+            dynamic_floor_policy_hash: [4; 32],
+            ioc_policy_hash: [5; 32],
+            expires_after_ms: maximum_age + engine.config.latency_timeout_ms + 10_000,
+        });
+        engine.construct_next_decision(now).unwrap().unwrap();
+        let selected = engine.pending["BTC"].action.clone();
+        assert!(engine
+            .fresh_mfce_report_at(engine.durable_timestamp(now).unwrap())
+            .policy_outputs
+            .iter()
+            .any(|output| output.asset == "BTC"));
+
+        let stale_at = now + maximum_age + engine.config.latency_timeout_ms + 1;
+        assert!(engine
+            .fresh_mfce_report_at(engine.durable_timestamp(stale_at).unwrap())
+            .policy_outputs
+            .iter()
+            .all(|output| output.asset != "BTC"));
+
+        let mut book = engine.books["BTC"].0.clone();
+        book.source_time_ms = stale_at;
+        engine.try_execute_pending(&book, stale_at).unwrap();
 
         assert!(!engine.pending.contains_key("BTC"));
         assert!(engine.take_prepared_authorized_intents().is_empty());

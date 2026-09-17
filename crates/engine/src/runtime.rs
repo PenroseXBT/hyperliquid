@@ -1436,10 +1436,10 @@ fn write_continuous_status(
     streaming: Option<StreamingRuntimeStatus>,
     hip3_source_activity: Option<crate::source_state::Hip3SourceActivity>,
 ) -> Result<(), Box<dyn Error>> {
-    let mfce = engine.mfce_report();
     let unresolved_roots = engine.unresolved_actionable_root_count();
     let durable_start = engine.durable_timestamp(start)?;
     let durable_now = engine.durable_timestamp(now)?;
+    let mfce = engine.fresh_mfce_report_at(durable_now);
     let economics = [
         ("lifetime", 0),
         ("since_process_start", durable_start),
