@@ -39,17 +39,21 @@ const MFCE_MIN_BACKOFF_SAMPLES: usize = 8;
 const MFCE_ASSET_SHRINKAGE: f64 = 24.0;
 const MFCE_DIRECTION_SHRINKAGE: f64 = 48.0;
 const BPS_PER_UNIT_RETURN: Decimal = Decimal::from_parts(10_000, 0, 0, false, 0);
-const MFCE_EXPLORE_POOL_FRACTION: Decimal = Decimal::from_parts(25, 0, 0, false, 2);
-/// Epistemically cold Explore decisions share one portfolio information budget,
-/// including directions unsupported by an otherwise promoted global model.
-pub const MFCE_EXPLORE_INFORMATION_FRACTION: Decimal = Decimal::from_parts(15, 0, 0, false, 2);
+// Edge-only: explore pool is unbounded (1.0). Only net_q50 /
+// conservative_edge / net_q10 may gate size.
+const MFCE_EXPLORE_POOL_FRACTION: Decimal = Decimal::ONE;
+/// Edge-only: information budget is unbounded (1.0). Cold Explore shares
+/// full portfolio capacity; diagnostics only.
+pub const MFCE_EXPLORE_INFORMATION_FRACTION: Decimal = Decimal::ONE;
 const MFCE_MIN_EXPLORE_PRIOR_FRACTION: Decimal = Decimal::from_parts(15, 0, 0, false, 2);
 const MFCE_EXPLORE_CONVICTION_RANGE: Decimal = Decimal::from_parts(10, 0, 0, false, 2);
 const MFCE_EXPLORE_RISK_SCALE_BPS: Decimal = Decimal::from_parts(500, 0, 0, false, 0);
 const MFCE_SCORE_EPSILON_BPS: Decimal = Decimal::ONE;
-const MFCE_BOOTSTRAP_Q10_BPS: Decimal = Decimal::from_parts(100, 0, 0, true, 0);
+// Edge-only bootstrap: q10=0, q50=0, unc=0 so conservative==net_q50 at
+// 0 labels. 0-label state admits Explore on conservative>0.
+const MFCE_BOOTSTRAP_Q10_BPS: Decimal = Decimal::ZERO;
 const MFCE_BOOTSTRAP_Q50_BPS: Decimal = Decimal::ZERO;
-const MFCE_BOOTSTRAP_UNCERTAINTY_BPS: Decimal = Decimal::from_parts(100, 0, 0, false, 0);
+const MFCE_BOOTSTRAP_UNCERTAINTY_BPS: Decimal = Decimal::ZERO;
 // Capital concentration requires the calibrated lower decile itself to clear
 // zero after all modeled costs. A one-basis-point floor avoids promoting a
 // numerically zero state.
@@ -929,6 +933,7 @@ pub struct MfceReport {
     pub labels_since_retrain_attempt: u64,
     pub decision_counts: MfceDecisionCounts,
     pub policy_outputs: Vec<MfcePolicyOutput>,
+    pub blockers_removed: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1220,6 +1225,7 @@ impl MfcePersistentState {
                 .saturating_sub(self.last_retrain_attempt_sample_id),
             decision_counts: self.decision_counts,
             policy_outputs: Vec::new(),
+            blockers_removed: true,
         }
     }
 }
@@ -1436,23 +1442,10 @@ impl MfceEngine {
             .ok_or(MfceError::Arithmetic)
     }
 
-    pub fn has_information_probe_admission(&self, asset: &str) -> bool {
-        let Some(state) = self.state.assets.get(asset) else {
-            return false;
-        };
-        if !matches!(state.admission, MfceAdmissionState::Admitted { .. }) {
-            return false;
-        }
-        matches!(
-            state.admission,
-            MfceAdmissionState::Admitted { model_epoch: 0, .. }
-        ) || self.policy_outputs.get(asset).is_some_and(|output| {
-            output.admitted
-                && output.policy_state == MfcePolicyState::Explore
-                && (!output.used_model
-                    || output.asset_direction_sample_count < 2
-                        && output.direction_sample_count < MFCE_MIN_BACKOFF_SAMPLES as u64)
-        })
+    pub fn has_information_probe_admission(&self, _asset: &str) -> bool {
+        // Edge-only: cold-probe budget tracking disabled (diagnostics only).
+        // All Explore share full capacity; only edge gates size.
+        false
     }
 
     pub fn observe_raw_source(
@@ -2112,10 +2105,9 @@ impl MfceEngine {
             .count()
             < MFCE_MIN_BACKOFF_SAMPLES
         {
-            // Cold start must collect realized copytrade outcomes rather than
-            // deadlock behind a model that cannot exist yet. These deliberately
-            // conservative prior quantiles only size Explore; they cannot earn
-            // Exploit or override the q10 portfolio tail budget.
+            // Edge-only cold start: neutral prior (0/0/0) so
+            // conservative==net_q50 at 0 labels. 0-label admits Explore on
+            // conservative>0; training still runs in background.
             return Ok(MfcePrediction {
                 model_epoch: 0,
                 q10_gross_bps: MFCE_BOOTSTRAP_Q10_BPS,
@@ -2313,20 +2305,16 @@ pub fn evaluate_allocation_policy(
 
 pub fn remaining_explore_information_budget(
     source_capacity: Decimal,
-    committed_cold_explore: Decimal,
+    _committed_cold_explore: Decimal,
 ) -> Result<Decimal, MfceError> {
-    if source_capacity < Decimal::ZERO || committed_cold_explore < Decimal::ZERO {
+    // Edge-only: information fraction is 1.0; committed cold Explore is
+    // diagnostics only and never caps admission.
+    if source_capacity < Decimal::ZERO || _committed_cold_explore < Decimal::ZERO {
         return Err(MfceError::InvalidState(
             "negative cold-start Explore capacity".into(),
         ));
     }
-    let total = source_capacity
-        .checked_mul(MFCE_EXPLORE_INFORMATION_FRACTION)
-        .ok_or(MfceError::Arithmetic)?;
-    Ok(total
-        .checked_sub(committed_cold_explore)
-        .unwrap_or(Decimal::ZERO)
-        .max(Decimal::ZERO))
+    Ok(source_capacity.max(Decimal::ZERO))
 }
 
 /// Additional risk represented by a policy-sized candidate before the shared
@@ -2622,24 +2610,21 @@ fn evaluate_distribution(input: &MfceAllocationInput) -> Result<MfceAllocationDe
     let upper_edge_bps = net_q50_bps
         .checked_add(input.prediction.uncertainty_bps)
         .ok_or(MfceError::Arithmetic)?;
-    let conditional_support_is_actionable = has_actionable_conditional_support(&input.prediction);
-    let (policy_state, reason) =
-        if upper_edge_bps <= Decimal::ZERO && conditional_support_is_actionable {
-            (
-                MfcePolicyState::Reject,
-                Some(MfceRejectionReason::StrongNegativeExpectancy),
-            )
-        } else if input.prediction.used_model
-            && conditional_support_is_actionable
-            && net_q10_bps > MFCE_EXPLOIT_Q10_NET_FLOOR_BPS
-        {
-            (MfcePolicyState::Exploit, None)
-        } else {
-            // Unknown or insufficiently separated states acquire only minimum
-            // information. A model cannot earn Exploit on median edge while its
-            // calibrated lower decile remains at or below the after-cost floor.
-            (MfcePolicyState::Explore, None)
-        };
+    // Edge-only: support and model gates collapsed. Exploit iff net_q10>1,
+    // Reject iff upper<=0, regardless of support/model. Only net_q50 /
+    // conservative_edge / net_q10 / opportunity / uncertainty gate size.
+    let (policy_state, reason) = if upper_edge_bps <= Decimal::ZERO {
+        (
+            MfcePolicyState::Reject,
+            Some(MfceRejectionReason::StrongNegativeExpectancy),
+        )
+    } else if net_q10_bps > MFCE_EXPLOIT_Q10_NET_FLOOR_BPS {
+        (MfcePolicyState::Exploit, None)
+    } else {
+        // Positive upper edge but lower decile at/below floor acquires
+        // full information in edge-only mode (see explore_target_fraction).
+        (MfcePolicyState::Explore, None)
+    };
     Ok(MfceAllocationDecision {
         policy_state,
         admitted: false,
@@ -2653,9 +2638,9 @@ fn evaluate_distribution(input: &MfceAllocationInput) -> Result<MfceAllocationDe
     })
 }
 
-fn has_actionable_conditional_support(prediction: &MfcePrediction) -> bool {
-    prediction.asset_direction_sample_count >= 2
-        || prediction.direction_sample_count >= MFCE_MIN_BACKOFF_SAMPLES as u64
+fn has_actionable_conditional_support(_prediction: &MfcePrediction) -> bool {
+    // Edge-only: support is always actionable. Diagnostics only.
+    true
 }
 
 fn cross_sectional_weight(
@@ -2674,6 +2659,11 @@ fn explore_target_fraction(
     decision: &MfceAllocationDecision,
     input: &MfceAllocationInput,
 ) -> Result<Decimal, MfceError> {
+    // Edge-only: full size (1.0) whenever conservative edge is positive.
+    // Otherwise fall back to conviction/risk sizing clamped to 1.0.
+    if decision.conservative_edge_bps > Decimal::ZERO {
+        return Ok(Decimal::ONE);
+    }
     let conviction_prior = MFCE_MIN_EXPLORE_PRIOR_FRACTION
         .checked_add(
             MFCE_EXPLORE_CONVICTION_RANGE
@@ -2692,7 +2682,7 @@ fn explore_target_fraction(
     conviction_prior
         .checked_mul(risk_multiplier)
         .ok_or(MfceError::Arithmetic)
-        .map(|fraction| fraction.clamp(Decimal::ZERO, MFCE_EXPLORE_POOL_FRACTION))
+        .map(|fraction| fraction.clamp(Decimal::ZERO, Decimal::ONE))
 }
 
 const fn policy_rank(state: MfcePolicyState) -> u8 {
@@ -3880,6 +3870,8 @@ mod tests {
 
     #[test]
     fn unsupported_direction_explores_with_one_global_information_budget() {
+        // Edge-only: negative upper edge Rejects regardless of support/model.
+        // q10=-100,q50=-50,friction=10,unc=20 => net_q50=-60, upper=-40<=0.
         let mut low_conviction = allocation_candidate("LOW", 1, -100, -50, 10, 20, 1_000);
         low_conviction.input.prediction.used_model = false;
         low_conviction.input.prediction.direction_sample_count = 1;
@@ -3901,11 +3893,8 @@ mod tests {
             Decimal::from(10_000),
         )
         .unwrap();
-        assert_eq!(decisions["LOW"].policy_state, MfcePolicyState::Explore);
-        assert_eq!(decisions["HIGH"].policy_state, MfcePolicyState::Explore);
-        assert!(decisions["LOW"].admitted);
-        assert!(decisions["HIGH"].admitted);
-        assert!(decisions["HIGH"].allocation_fraction > decisions["LOW"].allocation_fraction);
+        assert_eq!(decisions["LOW"].policy_state, MfcePolicyState::Reject);
+        assert_eq!(decisions["HIGH"].policy_state, MfcePolicyState::Reject);
 
         let mut model_backed = allocation_candidate("MODEL", 3, -100, -50, 10, 20, 1_000);
         model_backed.input.prediction.direction_sample_count = 1;
@@ -3918,9 +3907,7 @@ mod tests {
             Decimal::from(150),
         )
         .unwrap();
-        assert_eq!(decision["MODEL"].policy_state, MfcePolicyState::Explore);
-        assert!(decision["MODEL"].admitted);
-        assert!(Decimal::from(1_000) * decision["MODEL"].allocation_fraction <= Decimal::from(150));
+        assert_eq!(decision["MODEL"].policy_state, MfcePolicyState::Reject);
 
         let supported_negative = allocation_candidate("SUPPORTED", 4, -100, -50, 10, 20, 1_000);
         let decision = allocate_cross_sectional(
@@ -3939,6 +3926,9 @@ mod tests {
 
     #[test]
     fn exploit_requires_conditional_direction_support() {
+        // Edge-only: support gate collapsed. Exploit iff net_q10>1,
+        // regardless of model/support. q10=30,q50=100,friction=10,unc=10
+        // gives net_q10=20>1 => Exploit with full size.
         let mut unsupported = allocation_candidate("MODEL", 1, 30, 100, 10, 10, 1_000);
         unsupported.input.prediction.direction_sample_count = 1;
         unsupported.input.prediction.asset_direction_sample_count = 0;
@@ -3950,10 +3940,8 @@ mod tests {
             Decimal::from(150),
         )
         .unwrap();
-        assert_eq!(decisions["MODEL"].policy_state, MfcePolicyState::Explore);
-        assert!(
-            Decimal::from(1_000) * decisions["MODEL"].allocation_fraction <= Decimal::from(150)
-        );
+        assert_eq!(decisions["MODEL"].policy_state, MfcePolicyState::Exploit);
+        assert_eq!(decisions["MODEL"].allocation_fraction, Decimal::ONE);
     }
 
     #[test]
@@ -4084,17 +4072,19 @@ mod tests {
 
     #[test]
     fn existing_information_probe_consumes_the_global_budget() {
+        // Edge-only: information budget is unbounded (1.0); committed cold
+        // Explore is diagnostics only and never caps admission.
         assert_eq!(
             remaining_explore_information_budget(Decimal::from(1_000), Decimal::ZERO).unwrap(),
-            Decimal::from(150)
+            Decimal::from(1_000)
         );
         assert_eq!(
             remaining_explore_information_budget(Decimal::from(1_000), Decimal::from(140)).unwrap(),
-            Decimal::TEN
+            Decimal::from(1_000)
         );
         assert_eq!(
             remaining_explore_information_budget(Decimal::from(1_000), Decimal::from(200)).unwrap(),
-            Decimal::ZERO
+            Decimal::from(1_000)
         );
     }
 
@@ -4120,6 +4110,9 @@ mod tests {
 
     #[test]
     fn a_single_uncertain_explore_state_is_limited_below_the_pool_ceiling() {
+        // Edge-only: conservative>0 gives full size (1.0). q10=-1000,q50=140,
+        // friction=10,unc=100 => net_q50=130, conservative=30>0 => Explore
+        // with allocation 1.0.
         let candidate = allocation_candidate("MEME", 1, -1_000, 140, 10, 100, 1_000);
         let decisions = allocate_cross_sectional(
             &[candidate],
@@ -4130,9 +4123,7 @@ mod tests {
         .unwrap();
         let decision = &decisions["MEME"];
         assert_eq!(decision.policy_state, MfcePolicyState::Explore);
-        assert!(decision.allocation_fraction > Decimal::ZERO);
-        assert!(decision.allocation_fraction < Decimal::from_parts(1, 0, 0, false, 1));
-        assert!(decision.allocation_fraction < MFCE_EXPLORE_POOL_FRACTION);
+        assert_eq!(decision.allocation_fraction, Decimal::ONE);
     }
 
     #[test]
@@ -4161,32 +4152,33 @@ mod tests {
 
     #[test]
     fn model_allocation_scales_openings_expansions_and_reversals() {
+        // Edge-only: explore pool is 1.0, so full size on positive edge.
         assert_eq!(
             allocated_target(
                 Decimal::ZERO,
                 Decimal::from(100),
-                MFCE_EXPLORE_POOL_FRACTION,
+                Decimal::ONE,
             )
             .unwrap(),
-            Decimal::from(25)
+            Decimal::from(100)
         );
         assert_eq!(
             allocated_target(
                 Decimal::from(50),
                 Decimal::from(100),
-                MFCE_EXPLORE_POOL_FRACTION,
+                Decimal::ONE,
             )
             .unwrap(),
-            Decimal::new(625, 1)
+            Decimal::from(100)
         );
         assert_eq!(
             allocated_target(
                 Decimal::from(50),
                 Decimal::from(-100),
-                MFCE_EXPLORE_POOL_FRACTION,
+                Decimal::ONE,
             )
             .unwrap(),
-            Decimal::from(-25)
+            Decimal::from(-100)
         );
     }
 
@@ -4354,6 +4346,8 @@ mod tests {
         assert_eq!(prediction.q10_gross_bps, MFCE_BOOTSTRAP_Q10_BPS);
         assert_eq!(prediction.q50_gross_bps, MFCE_BOOTSTRAP_Q50_BPS);
         assert_eq!(prediction.uncertainty_bps, MFCE_BOOTSTRAP_UNCERTAINTY_BPS);
+        // Edge-only bootstrap is neutral (0/0/0). With friction 10, net is
+        // negative so upper<=0 => Reject (don't trade at a loss).
         let decision = evaluate_allocation_policy(&MfceAllocationInput {
             prediction,
             friction_bps: Decimal::from(10),
@@ -4363,9 +4357,11 @@ mod tests {
             remaining_tail_loss_budget_usd: Decimal::from(1_000),
         })
         .unwrap();
-        assert_eq!(decision.policy_state, MfcePolicyState::Explore);
-        assert!(decision.admitted);
-        assert!(decision.allocation_fraction > Decimal::ZERO);
+        assert_eq!(decision.policy_state, MfcePolicyState::Reject);
+        assert_eq!(
+            decision.reason,
+            Some(MfceRejectionReason::StrongNegativeExpectancy)
+        );
     }
 
     #[test]
@@ -4526,7 +4522,37 @@ mod tests {
             Decimal::from(15),
         )
         .unwrap();
-        assert_eq!(decisions["BTC"].policy_state, MfcePolicyState::Explore);
+        // Edge-only: Exploit iff net_q10>1 regardless of model/support.
+        // Unpromoted prediction with q10=30,q50=120,friction=10 gives
+        // net_q10=20>1 => Exploit.
+        assert_eq!(decisions["BTC"].policy_state, MfcePolicyState::Exploit);
+    }
+
+    #[test]
+    fn edge_only_zero_label_explore_on_positive_conservative() {
+        // Acceptance: 0-label (used_model=false, counts 0) admits Explore on
+        // conservative>0. Manual positive-edge prediction with no support.
+        let prediction = MfcePrediction {
+            model_epoch: 0,
+            q10_gross_bps: Decimal::ZERO,
+            q50_gross_bps: Decimal::from(50),
+            uncertainty_bps: Decimal::from(10),
+            pooled_sample_count: 0,
+            direction_sample_count: 0,
+            asset_direction_sample_count: 0,
+            used_model: false,
+        };
+        let decision = evaluate_allocation_policy(&MfceAllocationInput {
+            prediction,
+            friction_bps: Decimal::from(10),
+            copytrade_conviction: Decimal::ONE,
+            current_position_notional: Decimal::ZERO,
+            proposed_position_notional: Decimal::from(1_000),
+            remaining_tail_loss_budget_usd: Decimal::from(1_000),
+        })
+        .unwrap();
+        // net_q50=40, conservative=30>0, net_q10=-10<=1 => Explore.
+        assert_eq!(decision.policy_state, MfcePolicyState::Explore);
     }
 
     #[test]

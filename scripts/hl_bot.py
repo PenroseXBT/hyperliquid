@@ -447,6 +447,8 @@ def render_status(envelope, horizon="since_process_start"):
         f"All snapshot fields: source={source}; age_s={age}; reason={','.join(reasons) or 'none'}",
         f"Healthy: {account_valid and bool(status.get('healthy'))}; last execution mode={status.get('execution_state', 'unknown')}; blockers={','.join(blockers) or 'none'}",
         f"New-risk pause={envelope.get('pause_requested')}; strategy targets ready={status.get('strategy_target_execution_enabled')}",
+        f"Edge-only: blockers_removed={status.get('blockers_removed', (status.get('mfce') or {}).get('blockers_removed', True))}; degraded={status.get('degraded_reasons', [])}; uptime_s={status.get('uptime_seconds', status.get('elapsed_seconds'))}; solvency_floor=RISK_ONLY+reconciliation+projection",
+        f"SQLite prior: diagnostics only, never enters state.samples/LightGBM matrix; sqlite_prior_performance=separate",
         f"Positions (last observed; account validity={not stale and recon.get('recovery_pending') is False}): {status.get('exchange_risk_positions')}",
         f"Signals: confirmed={stream.get('live_state_confirmed')}/{status.get('candidate_count')}; pending={stream.get('coverage_reconciliation_wallets_pending')}; stream gaps={stream.get('gaps')}",
         f"Model epoch={status.get('mfce_model_epoch')}; last evaluated outputs={len((status.get('mfce') or {}).get('policy_outputs', []))}"]
@@ -477,7 +479,7 @@ def render_signals(envelope):
     for p in sorted(outputs, key=lambda p: str(p.get('asset')))[:12]:
         at = p.get('signal_observed_at')
         age = round(time.time()-at/1000) if isinstance(at,(int,float)) else 'unknown'
-        lines.append(f"{p.get('asset')} {p.get('direction')} | source_ms={at} age_s={age} | admitted={p.get('admitted')} | target={p.get('target_notional')} | net_q50_bps={p.get('net_q50_bps')} | conservative_bps={p.get('conservative_edge_bps')} | cost_bps={p.get('friction_bps')} | reason={p.get('reason')}")
+        lines.append(f"{p.get('asset')} {p.get('direction')} | source_ms={at} age_s={age} | admitted={p.get('admitted')} | target={p.get('target_notional')} | net_q50_bps={p.get('net_q50_bps')} | conservative_bps={p.get('conservative_edge_bps')} | cost_bps={p.get('friction_bps')} | used_model={p.get('used_model')} | unc_bps={p.get('uncertainty_bps')} | reason={p.get('reason')}")
     lines.append(f"Last action outcomes: {envelope.get('lifecycle', [])[-3:]}")
     lines.append(f"Last ledger fills (account validity as above): {envelope.get('verified_fills', [])[-3:]}")
     return "\n".join(lines)

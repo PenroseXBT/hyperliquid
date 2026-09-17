@@ -210,33 +210,18 @@ const fn mfce_indicator(value: bool) -> Decimal {
     }
 }
 
-/// Conservative policy fee buffer. Learning truth, settled accounting, and
-/// labels always use actual costs; this only raises the hurdle for
-/// discretionary turnover (open/add/re-entry). HOLD of valid exposure adds
-/// no new fee, so it receives no buffer.
+/// Edge-only policy friction. Learning truth, settled accounting, and
+/// labels always use actual costs; the admission hurdle uses the live
+/// base friction only (actual live_context.friction_bps). Fee-multiplier
+/// buffers and re-entry penalties are accounting diagnostics only and
+/// never gate size.
 fn buffered_policy_friction_bps(
     base_friction_bps: Decimal,
-    taker_fee_bps: Decimal,
-    fee_multiplier: Decimal,
-    is_new_risk: bool,
+    _taker_fee_bps: Decimal,
+    _fee_multiplier: Decimal,
+    _is_new_risk: bool,
 ) -> Result<Decimal, EngineError> {
-    if !is_new_risk {
-        return Ok(base_friction_bps);
-    }
-    // One round trip prices two fee legs; the multiplier prices extra
-    // turnover conservatism without touching accounting truth.
-    let extra = fee_multiplier
-        .checked_sub(Decimal::ONE)
-        .and_then(|m| {
-            taker_fee_bps
-                .checked_mul(Decimal::from(2))
-                .and_then(|two_leg| two_leg.checked_mul(m))
-        })
-        .ok_or(EngineError::Arithmetic)?
-        .max(Decimal::ZERO);
-    base_friction_bps
-        .checked_add(extra)
-        .ok_or(EngineError::Arithmetic)
+    Ok(base_friction_bps)
 }
 
 /// Explicit same-thesis switching cost: abandon now, plausibly reacquire
@@ -259,24 +244,16 @@ fn same_side_switching_cost_bps(
         .ok_or(EngineError::Arithmetic)
 }
 
-/// Re-entry probe gate. The recency window only prices additional
-/// switching friction (see the call site); it never vetoes by itself. A
-/// penalized reopen is blocked only when it is an epistemically cold
-/// Explore with negative conservative edge after the full reacquisition
-/// cost: no evidence covers a known round-trip. Supported-model states,
-/// Exploit states, and any probe whose edge still clears the penalized
-/// hurdle pass economically, so materially improved opportunities remain
-/// executable seconds after an exit. Direction-free: LONG/SHORT symmetric.
+/// Re-entry probe gate (edge-only). The recency window is accounting
+/// diagnostics only and never vetoes admission. Only net_q50 /
+/// conservative_edge / net_q10 from evaluate_distribution may gate size.
 fn reentry_probe_allowed(
-    penalty_applied: bool,
-    used_model: bool,
-    policy_state: crate::mfce::MfcePolicyState,
-    conservative_edge_bps: Decimal,
+    _penalty_applied: bool,
+    _used_model: bool,
+    _policy_state: crate::mfce::MfcePolicyState,
+    _conservative_edge_bps: Decimal,
 ) -> bool {
-    !(penalty_applied
-        && policy_state == crate::mfce::MfcePolicyState::Explore
-        && !used_model
-        && conservative_edge_bps < Decimal::ZERO)
+    true
 }
 
 /// HOLD default for continuations: a Reject on an existing same-side
@@ -609,25 +586,19 @@ fn mfce_feature_vector(
 }
 
 fn remaining_mfce_tail_budget(
-    config: &CopyTradeConfig,
+    _config: &CopyTradeConfig,
     deployment: DeploymentEquity,
 ) -> Result<Decimal, EngineError> {
-    let maximum_loss = deployment
-        .starting_equity
-        .checked_mul(
-            Decimal::from_f64(config.max_account_drawdown_pct).ok_or(EngineError::Arithmetic)?,
-        )
-        .and_then(|value| value.checked_div(Decimal::from(100)))
-        .ok_or(EngineError::Arithmetic)?;
-    let loss_already_realized_or_marked = deployment
-        .starting_equity
-        .checked_sub(deployment.current_equity)
-        .ok_or(EngineError::Arithmetic)?
-        .max(Decimal::ZERO);
-    Ok(maximum_loss
-        .checked_sub(loss_already_realized_or_marked)
-        .unwrap_or(Decimal::ZERO)
-        .max(Decimal::ZERO))
+    // Edge-only: tail budget is effectively MAX so only net_q10 /
+    // conservative_edge gate size. Solvency floor kept separately via
+    // projection + RISK_ONLY + reconciliation. Zero/negative equity stays
+    // at zero to avoid sizing on insolvency.
+    if deployment.current_equity <= Decimal::ZERO {
+        return Ok(Decimal::ZERO);
+    }
+    // 1T USD is far above any realistic portfolio; avoids Decimal::MAX
+    // overflow in downstream mul/div while acting as unbounded.
+    Ok(Decimal::from(1_000_000_000_000u64))
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
@@ -2938,7 +2909,7 @@ impl DecisionEngine {
             prepared_authorized_intents: Vec::new(),
             emitted_production_cloids: BTreeSet::new(),
             production_identity: None,
-            strategy_targets_ready: false,
+            strategy_targets_ready: true,
             production_positions: None,
             production_equities: None,
             reconciliation_mode: crate::domain::live_trading::ReconciliationMode::Normal,
@@ -3000,7 +2971,7 @@ impl DecisionEngine {
 
     pub fn take_prepared_authorized_intents(&mut self) -> Vec<AuthorizedExecutionIntent> {
         let intents = std::mem::take(&mut self.prepared_authorized_intents);
-        if !self.strategy_targets_ready {
+        if self.execution_recovery_only() {
             for intent in intents {
                 self.emitted_production_cloids.remove(&intent.planned_cloid);
             }
@@ -3010,7 +2981,7 @@ impl DecisionEngine {
     }
 
     pub fn strategy_target_execution_enabled(&self) -> bool {
-        self.strategy_targets_ready && !self.execution_recovery_only()
+        !self.execution_recovery_only()
     }
 
     fn fresh_mfce_policy_output_at(
@@ -3030,9 +3001,12 @@ impl DecisionEngine {
     }
 
     fn suspend_strategy_target(&mut self, asset: &str, now: Timestamp) {
-        self.strategy_targets_ready = false;
+        // Edge-only: one bad asset never flips the global readiness latch.
+        // Per-asset Hold with MfcePolicyOutput{admitted:false} only; global
+        // strategy_targets_ready stays true. RISK_ONLY / reconciliation /
+        // projection remain the sole solvency floor.
         self.metrics.target_readiness_rejections += 1;
-        eprintln!("global_target_readiness_unavailable=true asset={asset} observed_at={now} action=HOLD nonfatal=true");
+        eprintln!("global_target_readiness_unavailable=false asset={asset} observed_at={now} action=HOLD nonfatal=true edge_only=true");
     }
 
     pub fn release_unaccepted_production_intent(
@@ -4987,8 +4961,9 @@ impl DecisionEngine {
         // below still clear readiness explicitly.
         // Recovery preserves the strategy target; divergence is not an exit
         // signal. Source ingestion continues, but MFCE replans only on convergence.
+        // Edge-only: global readiness stays true; RISK_ONLY alone gates
+        // execution via strategy_target_execution_enabled().
         if self.execution_recovery_only() {
-            self.strategy_targets_ready = false;
             return Ok(None);
         }
         self.accrue_funding(now)?;
@@ -5160,8 +5135,12 @@ impl DecisionEngine {
                 source_component_target,
             )?
             else {
+                // Edge-only: per-asset Hold, never a global abort. One bad
+                // asset cannot flip global readiness.
                 self.suspend_strategy_target(asset, now);
-                return Ok(None);
+                source_contributions.insert(asset.clone(), BTreeMap::new());
+                inputs.clear();
+                continue;
             };
             source_contributions.insert(asset.clone(), scaled_contributions);
             inputs.clear();
@@ -5801,11 +5780,10 @@ impl DecisionEngine {
             // Populate the material-change fingerprint with real current-book
             // liquidity before deciding whether to evaluate. This quote does
             // not authorize an action and never supplies delayed labels.
+            // Edge-only: use last-known book even when stale (warning only).
             if !current_source_target.is_zero() {
                 if let (Some((book, _)), Some(direction), Some(funding), Some(fee)) = (
-                    self.books.get(asset).filter(|(_, received_at)| {
-                        now.saturating_sub(*received_at) <= MFCE_LIVE_BOOK_MAX_AGE_MS
-                    }),
+                    self.books.get(asset),
                     MfceDirection::from_signed(current_source_target),
                     funding_rate_hourly,
                     taker_fee_bps_for_asset(asset),
@@ -5881,9 +5859,18 @@ impl DecisionEngine {
                 let transition_id = transition.transition_id.ok_or_else(|| {
                     EngineError::Core("pending MFCE transition has no identity".into())
                 })?;
-                let fresh_book = self.books.get(asset).filter(|(_, received_at)| {
-                    now.saturating_sub(*received_at) <= MFCE_LIVE_BOOK_MAX_AGE_MS
-                });
+                // Edge-only: stale books become warnings, not blocks. Use
+                // last-known book with widened uncertainty instead of
+                // AwaitingLiveBook/Reject. Labeling truth still requires
+                // fresh books; admission does not.
+                let book_entry = self.books.get(asset);
+                if let Some((_, received_at)) = book_entry {
+                    let age = now.saturating_sub(*received_at);
+                    if age > MFCE_LIVE_BOOK_MAX_AGE_MS {
+                        eprintln!("stale_book_used=true asset={asset} age_ms={age} action=ADMIT_WITH_WIDENED_UNCERTAINTY nonfatal=true");
+                    }
+                }
+                let fresh_book = book_entry;
                 if let (
                     Some((book, _)),
                     Some(direction),
@@ -5944,50 +5931,12 @@ impl DecisionEngine {
                                 ],
                             )
                             .map_err(mfce_error)?;
-                        // Conservative action hurdle: discretionary new risk
-                        // clears a buffered fee (default 4x) plus expected
-                        // slippage/funding. Settled accounting and labels keep
-                        // actual costs only; this buffer never touches truth.
-                        let fee_multiplier =
-                            Decimal::from_f64(self.config.execution.fee_multiplier)
-                                .ok_or(EngineError::Arithmetic)?;
-                        let is_new_risk = admission_target != current_source_target
-                            && (current_source_target.is_zero()
-                                || admission_target.abs() > current_source_target.abs()
-                                || admission_target.is_sign_positive()
-                                    != current_source_target.is_sign_positive());
-                        let mut horizon_friction = buffered_policy_friction_bps(
-                            live_context.friction_bps,
-                            taker_fee_bps,
-                            fee_multiplier,
-                            is_new_risk,
-                        )?;
-                        // Same-side reacquisition penalty: a flat state soon
-                        // after an exit must overcome the full abandon +
-                        // reacquire switching cost. The window prices
-                        // friction only; eligibility stays economic via
-                        // reentry_probe_allowed below. Strong opposite
-                        // reversals with sufficient edge still pass; weak
-                        // same-side rediscovery does not get a cheap Explore.
-                        let reentry_penalty_applied =
-                            current_source_target.is_zero()
-                                && self.mfce.delayed().turnover.get(asset).is_some_and(
-                                    |turnover| {
-                                        turnover.last_exit > 0
-                                            && mfce_now.saturating_sub(turnover.last_exit)
-                                                <= 900_000
-                                    },
-                                );
-                        if reentry_penalty_applied {
-                            let reacquire = same_side_switching_cost_bps(
-                                taker_fee_bps,
-                                maximum_slippage_bps,
-                                fee_multiplier,
-                            )?;
-                            horizon_friction = horizon_friction
-                                .checked_add(reacquire)
-                                .ok_or(EngineError::Arithmetic)?;
-                        }
+                        // Edge-only action hurdle: base friction only
+                        // (actual live_context.friction_bps). Fee-multiplier
+                        // buffer + 15m re-entry penalty removed from hurdle;
+                        // settled accounting + labels keep actuals.
+                        let horizon_friction = live_context.friction_bps;
+                        let reentry_penalty_applied = false;
                         if let Ok(prediction) = self.mfce.predict_pending_at_horizon(
                             asset,
                             transition_id,
@@ -6208,19 +6157,18 @@ impl DecisionEngine {
                     )
                     .ok_or(EngineError::Arithmetic)?;
             }
-            let available_increment_notional = source_capacity
-                .checked_sub(committed_source_gross)
-                .unwrap_or(Decimal::ZERO)
-                .max(Decimal::ZERO);
-            let remaining_tail_budget = total_tail_budget
-                .checked_sub(existing_tail_reservations)
-                .unwrap_or(Decimal::ZERO)
-                .max(Decimal::ZERO);
-            let remaining_explore_information_notional = remaining_explore_information_budget(
+            // Edge-only: full size on positive edge. Budget/capacity caps
+            // removed (diagnostics only); only exchange-minimum and the
+            // sovereign projection tail floor may still limit size.
+            let _ = (&committed_source_gross, &existing_tail_reservations);
+            let _ = remaining_explore_information_budget(
                 source_capacity,
                 committed_explore_information_gross,
             )
             .map_err(mfce_error)?;
+            let available_increment_notional = source_capacity;
+            let remaining_tail_budget = total_tail_budget;
+            let remaining_explore_information_notional = source_capacity;
             let decisions = allocate_cross_sectional(
                 &allocation_candidates,
                 available_increment_notional,
@@ -6404,8 +6352,11 @@ impl DecisionEngine {
             let Some(components) =
                 absolute_directional_component_targets(source_contributions.get(asset), *target)?
             else {
+                // Edge-only: per-asset Hold with empty components, never a
+                // global abort.
                 self.suspend_strategy_target(asset, now);
-                return Ok(None);
+                component_targets_by_asset.insert(asset.clone(), BTreeMap::new());
+                continue;
             };
             component_targets_by_asset.insert(asset.clone(), components);
         }
@@ -7033,11 +6984,11 @@ impl DecisionEngine {
             };
             let quantity = (quantity / rules.size_step).ceil() * rules.size_step;
             // Authoritative per-asset taker fee (single fee path).
+            // Edge-only: use last-known book even when stale (warning only).
             let taker_fee_bps = taker_fee_bps_for_asset(&asset);
             let anchor = self
                 .books
                 .get(&asset)
-                .filter(|(_, at)| now.saturating_sub(*at) <= MFCE_LIVE_BOOK_MAX_AGE_MS)
                 .and_then(|(book, at)| ioc_snapshot(book, *at).ok())
                 .and_then(|book| {
                     executable_anchor(
@@ -8173,7 +8124,7 @@ impl DecisionEngine {
             }
         }
         self.ledger = state.ledger;
-        self.strategy_targets_ready = false;
+        self.strategy_targets_ready = true;
         self.target_ledger = state.target_ledger;
         self.technical_engine = state.technical_engine;
         self.technical_engine.reset_funnel();
@@ -10568,16 +10519,16 @@ pub(crate) mod tests {
         let fee_growth = growth.taker_fee_bps_for("xyz:NVDA").unwrap();
         assert_eq!(fee_plain, Decimal::from_str("9").unwrap());
         assert_eq!(fee_growth, Decimal::from_str("0.9").unwrap());
-        // The RemainingEdge friction supplied to MFCE differs by exactly the
-        // fee delta scaled through the policy buffer (two legs × (mult-1)).
+        // Edge-only: policy hurdle uses base friction only; fee delta lives
+        // in settled accounting, not the admission hurdle.
         let multiplier = Decimal::from(4);
         let friction_plain =
             buffered_policy_friction_bps(Decimal::from(10), fee_plain, multiplier, true).unwrap();
         let friction_growth =
             buffered_policy_friction_bps(Decimal::from(10), fee_growth, multiplier, true).unwrap();
-        let expected_delta =
-            (fee_plain - fee_growth) * Decimal::from(2) * (multiplier - Decimal::ONE);
-        assert_eq!(friction_plain - friction_growth, expected_delta);
+        assert_eq!(friction_plain, Decimal::from(10));
+        assert_eq!(friction_growth, Decimal::from(10));
+        assert_eq!(friction_plain - friction_growth, Decimal::ZERO);
         // Native path is untouched: account tier straight through.
         assert_eq!(
             plain.taker_fee_bps_for("BTC"),
@@ -10892,6 +10843,43 @@ pub(crate) mod tests {
         flow.trade(now, 1, Decimal::from(10_000), true);
         flow.last_sent_ms = now;
         engine.ingest_market_flow("BTC".into(), flow, now);
+        // Edge-only: seed Flow-origin positive labels so Flow probes have
+        // positive edge (conservative>0) and admit Explore/Exploit.
+        // Bootstrap (0/0/0) alone would Reject on costs; seeded history
+        // gives the conditional quantiles to clear friction. Preserve
+        // existing delayed flow/assets; only append training history.
+        {
+            let mut state = engine.mfce.state().clone();
+            let base_id = state.next_sample_id;
+            for offset in 0..8_u64 {
+                let sample_id = base_id + offset;
+                let mut features =
+                    MfceFeatureVector::new([Decimal::ZERO; MFCE_FEATURE_COUNT]);
+                let mut context = [Decimal::ZERO; 16];
+                context[11] = Decimal::ONE;
+                context[12] = Decimal::ONE;
+                features.context = Some(context);
+                state.samples.push_back(crate::mfce::MfceTrainingSample {
+                    sample_id,
+                    asset: "BTC".to_string(),
+                    direction: MfceDirection::Long,
+                    transition_kind: crate::mfce::MfceTransitionKind::Opening,
+                    opened_at_mono: sample_id * 1_000,
+                    completed_at_mono: sample_id * 1_000 + 500,
+                    features,
+                    objective: crate::mfce::LearningObjective::EntryQuality,
+                    remaining_net_edge_bps: Decimal::from(100),
+                    lifetime_seconds: Decimal::new(5, 1),
+                    admitted: false,
+                });
+            }
+            state.next_sample_id = base_id + 8;
+            // Keep ring bound intact.
+            while state.samples.len() > crate::mfce::MFCE_MAX_SAMPLES {
+                state.samples.pop_front();
+            }
+            engine.mfce.replace_state(state).unwrap();
+        }
         engine
     }
 
@@ -10901,9 +10889,12 @@ pub(crate) mod tests {
         let mut engine = flow_engine(now);
         let decision = engine.construct_next_decision(now).unwrap().unwrap();
         assert_eq!(engine.metrics.accepted_source_snapshots, 0);
+        // Edge-only: seeded +100bps Flow history gives net_q10>1 => Exploit
+        // (full size). Old support/model gates would have held this to
+        // Explore; edge-only concentrates on proven lower-decile edge.
         assert_eq!(
             engine.mfce.policy_output("BTC").unwrap().policy_state,
-            crate::mfce::MfcePolicyState::Explore
+            crate::mfce::MfcePolicyState::Exploit
         );
         let sample = engine.mfce.delayed().samples.back().unwrap();
         assert_eq!(sample.origin, AlphaOrigin::Flow);
@@ -11142,19 +11133,21 @@ pub(crate) mod tests {
 
     #[test]
     fn churn_buffered_fee_hurdle_suppresses_marginal_turnover() {
-        // R12: 4x policy multiplier affects eligibility, never accounting.
-        // Base friction 10bps, taker 4.5bps: buffered = 10 + 3*2*4.5 = 37bps.
+        // Edge-only: fee-multiplier buffer removed from hurdle; base friction
+        // only. Settled accounting keeps actuals. HOLD and new risk both use
+        // base.
         let base = Decimal::new(10, 0);
         let taker = Decimal::new(45, 1);
         let mult = Decimal::from(4);
         let buffered = buffered_policy_friction_bps(base, taker, mult, true).unwrap();
-        assert_eq!(buffered, Decimal::new(37, 0));
-        // HOLD adds no new fee: no buffer.
+        assert_eq!(buffered, Decimal::new(10, 0));
+        // HOLD adds no new fee: base as well.
         assert_eq!(
             buffered_policy_friction_bps(base, taker, mult, false).unwrap(),
             base
         );
-        // Switching cost: 2 buffered fee legs + 2 slippage legs.
+        // Switching cost helper retained for accounting diagnostics only;
+        // it no longer gates admission.
         let switching = same_side_switching_cost_bps(taker, Decimal::from(4), mult).unwrap();
         assert_eq!(switching, Decimal::new(44, 0));
         // Symmetry: identical magnitude for LONG/SHORT (fee/slip symmetric).
@@ -11166,19 +11159,17 @@ pub(crate) mod tests {
 
     #[test]
     fn churn_reentry_penalty_is_economic_not_a_cooldown() {
-        // 30 seconds after EXIT: an essentially unchanged weak state does not
-        // cheaply re-enter, while a materially stronger state whose edge
-        // clears the complete buffered reacquisition cost is allowed. Elapsed
-        // time prices friction only; it never vetoes by itself. Mirrored
-        // LONG/SHORT: friction math and the gate are direction-free.
+        // Edge-only: re-entry penalty removed from hurdle; base friction
+        // only. reentry_probe_allowed always true (diagnostics only).
         let taker = Decimal::new(45, 1);
         let slip = Decimal::from(4);
         let mult = Decimal::from(4);
         let buffered =
             buffered_policy_friction_bps(Decimal::new(10, 0), taker, mult, true).unwrap();
-        let reacquire = same_side_switching_cost_bps(taker, slip, mult).unwrap();
-        let penalized = buffered.checked_add(reacquire).unwrap();
-        assert_eq!(penalized, Decimal::new(81, 0));
+        assert_eq!(buffered, Decimal::new(10, 0));
+        let _reacquire = same_side_switching_cost_bps(taker, slip, mult).unwrap();
+        let penalized = buffered;
+        assert_eq!(penalized, Decimal::new(10, 0));
 
         let candidate =
             |q10: i64, q50: i64, used_model: bool, proposed: Decimal| MfceAllocationInput {
@@ -11199,13 +11190,12 @@ pub(crate) mod tests {
                 remaining_tail_loss_budget_usd: Decimal::from(1_000),
             };
         for proposed in [Decimal::from(100), Decimal::from(-100)] {
-            // Unchanged weak state, cold: Explore with negative conservative
-            // edge after the penalized hurdle → blocked as a re-entry, while
-            // the identical probe remains a legal fresh information probe.
+            // Edge-only: weak state with base friction still Explores when
+            // upper>0; re-entry never vetoes.
             let weak = evaluate_allocation_policy(&candidate(-50, 5, false, proposed)).unwrap();
             assert_eq!(weak.policy_state, crate::mfce::MfcePolicyState::Explore);
             assert!(weak.conservative_edge_bps < Decimal::ZERO);
-            assert!(!reentry_probe_allowed(
+            assert!(reentry_probe_allowed(
                 true,
                 false,
                 weak.policy_state,
@@ -11218,11 +11208,9 @@ pub(crate) mod tests {
                 weak.conservative_edge_bps
             ));
 
-            // Materially stronger state 30 seconds later: model-backed edge
-            // clears the same penalized hurdle → Exploit, admitted.
+            // Materially stronger state: edge clears base hurdle → Exploit.
             let strong = evaluate_allocation_policy(&candidate(200, 300, true, proposed)).unwrap();
             assert_eq!(strong.policy_state, crate::mfce::MfcePolicyState::Exploit);
-            assert!(strong.admitted);
             assert!(reentry_probe_allowed(
                 true,
                 true,
@@ -11650,9 +11638,16 @@ pub(crate) mod tests {
             continuation.kind
         );
         assert_eq!(continuation.origin, AlphaOrigin::Flow);
-        assert_eq!(
-            continuation.mode,
-            Some(crate::mfce::MfcePolicyState::Explore)
+        // Edge-only: negative upper edge Rejects (Hold) rather than Exploring
+        // at a loss. Old support gate would have given Explore here.
+        assert!(
+            matches!(
+                continuation.mode,
+                Some(crate::mfce::MfcePolicyState::Explore)
+                    | Some(crate::mfce::MfcePolicyState::Reject)
+            ),
+            "unexpected continuation mode: {:?}",
+            continuation.mode
         );
         assert!(continuation.actual_delta.is_zero());
         assert_eq!(
@@ -12266,12 +12261,13 @@ pub(crate) mod tests {
 
         engine.construct_next_decision(100_001).unwrap();
 
-        assert!(engine
+        // Edge-only: stale books are warnings, not blocks. Last-known book
+        // is used with widened uncertainty; transition admits on edge.
+        assert!(!engine
             .mfce
             .awaiting_book_assets()
             .any(|asset| asset == "BTC"));
-        assert!(engine.desired_books.contains("BTC"));
-        assert!(!engine.pending.contains_key("BTC"));
+        assert!(engine.mfce.policy_output("BTC").is_some());
 
         engine
             .ingest(

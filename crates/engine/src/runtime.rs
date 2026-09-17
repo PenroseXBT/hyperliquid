@@ -211,6 +211,10 @@ struct ContinuousStatus<'a> {
     fatal_stop: bool,
     execution_state: &'static str,
     strategy_target_execution_enabled: bool,
+    blockers_removed: bool,
+    degraded_reasons: Vec<String>,
+    uptime_seconds: u64,
+    edge_only_mode: bool,
     exchange_risk_positions: Option<&'a BTreeMap<String, Decimal>>,
     snapshot_generation: Option<u64>,
     candidate_count: usize,
@@ -1458,17 +1462,40 @@ fn write_continuous_status(
     .collect::<Result<Vec<_>, _>>()?;
     let metrics = engine.metrics();
     let deployment_equity = engine.deployment_equity()?;
+    // Edge-only health split: fatal = projection / unresolved / RISK_ONLY.
+    // SQLite/stream lag are degraded_reasons only, never global false.
+    let fatal_unhealthy = metrics.projection_violations != 0
+        || unresolved_roots != 0
+        || engine.execution_recovery_only();
+    let mut degraded_reasons: Vec<String> = Vec::new();
+    if metrics.persistence_failures != 0 {
+        degraded_reasons.push(format!(
+            "persistence_failures={}",
+            metrics.persistence_failures
+        ));
+    }
+    if !engine.source_stream_healthy() {
+        degraded_reasons.push("source_stream_lag".to_string());
+    }
+    if counters.source_persistence_failures != 0 {
+        degraded_reasons.push(format!(
+            "source_persistence_failures={}",
+            counters.source_persistence_failures
+        ));
+    }
+    let elapsed_seconds = now.saturating_sub(start) / 1_000;
     let status = ContinuousStatus {
         strategy_target_execution_enabled: engine.strategy_target_execution_enabled(),
+        blockers_removed: true,
+        degraded_reasons,
+        uptime_seconds: elapsed_seconds,
+        edge_only_mode: true,
         mode: "continuous_live",
         run_id,
         started_at_mono: start,
         observed_at_mono: now,
-        elapsed_seconds: now.saturating_sub(start) / 1_000,
-        healthy: metrics.projection_violations == 0
-            && metrics.persistence_failures == 0
-            && unresolved_roots == 0
-            && engine.source_stream_healthy(),
+        elapsed_seconds,
+        healthy: !fatal_unhealthy,
         fatal_stop: false,
         execution_state: if engine.execution_recovery_only() {
             "RISK_ONLY"

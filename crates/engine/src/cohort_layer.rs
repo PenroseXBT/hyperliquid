@@ -155,22 +155,26 @@ impl PreparedVeryProfitableLayer {
                         .collect(),
                 )
             } else {
+                // Edge-only: quality is diagnostics only, never a veto. All
+                // tracked wallets are scheduled; decisions retained for audit.
                 let policy = config
                     .cohort_wallet_quality_policy()
                     .map_err(|error| CohortLayerError::InvalidQuality(error.to_string()))?;
                 let mut decisions = BTreeMap::new();
-                let mut qualified = BTreeSet::new();
-                let mut weights = BTreeMap::new();
                 for (address, observation) in observations {
                     let decision = apply_wallet_quality_policy(observation, &policy, Decimal::ONE)
                         .map_err(|error| CohortLayerError::InvalidQuality(error.to_string()))?;
-                    if decision.qualified {
-                        qualified.insert(address.clone());
-                        weights.insert(address.clone(), decision.bounded_wallet_weight);
-                    }
                     decisions.insert(address, decision);
                 }
-                (decisions, qualified, weights)
+                (
+                    decisions,
+                    resolution.all_members.clone(),
+                    resolution
+                        .all_members
+                        .iter()
+                        .map(|address| (address.clone(), Decimal::ONE))
+                        .collect(),
+                )
             };
         let qualified_cohort_only_members = qualified_members
             .intersection(&resolution.cohort_only_members)
@@ -496,14 +500,17 @@ mod tests {
 
     #[test]
     fn rejected_wallet_is_not_scheduled() {
+        // Edge-only: quality is diagnostics only, never a veto. Even a
+        // failing wallet is scheduled; decisions retained for audit.
         let mut config = config();
         let existing = config.candidates[0].address.clone();
         let new = address(0xcafe);
         let mut artifact = artifact(existing, new.clone());
         artifact.wallet_quality[1].win_rate_pct = Decimal::from(1);
         let prepared = PreparedVeryProfitableLayer::prepare(&artifact, &config).unwrap();
-        assert!(!prepared.qualified_members.contains(&new));
-        assert_eq!(prepared.merge_candidates(&mut config).unwrap(), 0);
+        assert!(prepared.qualified_members.contains(&new.to_ascii_lowercase()));
+        assert!(!prepared.quality_decisions.is_empty());
+        assert_eq!(prepared.merge_candidates(&mut config).unwrap(), 1);
     }
 
     #[test]
