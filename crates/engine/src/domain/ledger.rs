@@ -3,7 +3,7 @@ use crate::domain::ioc::ExecutionFill;
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::error::Error;
 use std::fmt::{Display, Formatter};
 use std::path::Path;
@@ -145,17 +145,21 @@ pub struct DualLedger {
 struct RecoveredExecutions {
     fills: Vec<crate::domain::live_trading::VerifiedExchangeFill>,
     external: Vec<crate::domain::live_trading::ExternalFillAccounting>,
+    /// Append-only ownership tombstones; retained even after episode compaction.
+    #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
+    unattributed_episodes: BTreeSet<EpisodeId>,
 }
+
 impl RecoveredExecutions {
     fn is_empty(&self) -> bool {
-        self.fills.is_empty() && self.external.is_empty()
+        self.fills.is_empty() && self.external.is_empty() && self.unattributed_episodes.is_empty()
     }
 }
 
 impl Default for DualLedger {
     fn default() -> Self {
         Self {
-            schema_version: 3,
+            schema_version: 4,
             portfolio: EpisodeBook::default(),
             sources: BTreeMap::new(),
             recovered: RecoveredExecutions::default(),
@@ -184,6 +188,10 @@ impl Display for LedgerError {
 impl Error for LedgerError {}
 
 impl DualLedger {
+    pub fn recovered_verified_fills(&self) -> &[crate::domain::live_trading::VerifiedExchangeFill] {
+        &self.recovered.fills
+    }
+
     pub fn recovered_execution_stats(&self, cutoff: u64) -> Result<(usize, Decimal), LedgerError> {
         self.recovered
             .fills
@@ -329,6 +337,65 @@ impl DualLedger {
         } else {
             -fill.quantity
         };
+        // A single exchange fill can close an episode and open the opposite
+        // side. Preserve one exchange identity and allocate its fee exactly.
+        if current == fill.position_before
+            && !current.is_zero()
+            && current.is_sign_positive() != delta.is_sign_positive()
+            && fill.quantity > current.abs()
+            && fill.price > Decimal::ZERO
+            && fill.fee_asset == "USDC"
+        {
+            let mut next = self.clone();
+            let mut close = fill.clone();
+            close.quantity = current.abs();
+            close.fee = fill
+                .fee
+                .checked_mul(close.quantity)
+                .and_then(|v| v.checked_div(fill.quantity))
+                .ok_or(LedgerError::ArithmeticOverflow("external reversal fee"))?;
+            let id = next.reduce_external(&close)?;
+            let mut open = fill.clone();
+            open.quantity = fill.quantity - close.quantity;
+            open.fee = fill.fee - close.fee;
+            open.closed_pnl = Decimal::ZERO;
+            open.position_before = Decimal::ZERO;
+            next.reduce_external(&open)?;
+            *self = next;
+            return Ok(id);
+        }
+        // Authenticated manual entries are economic events, with no invented
+        // strategy decision. Their actual exchange startPosition must match.
+        if current == fill.position_before
+            && fill.quantity > Decimal::ZERO
+            && fill.price > Decimal::ZERO
+            && fill.fee_asset == "USDC"
+            && fill.closed_pnl.is_zero()
+            && (current.is_zero() || current.is_sign_positive() == delta.is_sign_positive())
+        {
+            let mut next = self.clone();
+            let id = next.portfolio.add_external(fill, delta)?;
+            next.recovered.unattributed_episodes.insert(id);
+            if !next.source_positions_for_asset(&fill.asset).is_empty() {
+                // Manual additions make the shared episode unattributed. Retain
+                // its actual cash/position and prior closed source history; do
+                // not label the added exposure as a strategy decision.
+                for book in next.sources.values_mut() {
+                    book.positions.remove(&fill.asset);
+                    book.open.remove(&fill.asset);
+                }
+                let book = next
+                    .sources
+                    .entry("recovered:unattributed".into())
+                    .or_default();
+                let open = next.portfolio.open[&fill.asset].clone();
+                book.positions
+                    .insert(fill.asset.clone(), open.signed_quantity);
+                book.open.insert(fill.asset.clone(), open);
+            }
+            *self = next;
+            return Ok(id);
+        }
         if current != fill.position_before
             || current.is_zero()
             || fill.quantity <= Decimal::ZERO
@@ -477,6 +544,17 @@ impl DualLedger {
         execution: &ExecutionFill,
         closed_at: u64,
     ) -> Result<Option<SourceEpisode>, LedgerError> {
+        let mixed = self.open_episode_unattributed(&execution.action.asset)
+            || self.portfolio.closed.last().is_some_and(|episode| {
+                episode.asset == execution.action.asset
+                    && episode.closed_at == closed_at
+                    && self.episode_unattributed(episode.episode_id)
+            });
+        if mixed && candidate_id != "recovered:unattributed" {
+            return Err(LedgerError::InvalidLiveEvent(
+                "unattributed episode cannot acquire source credit",
+            ));
+        }
         let book = self.sources.entry(candidate_id.to_string()).or_default();
         let before = book.closed.len();
         book.apply(execution, closed_at)?;
@@ -510,6 +588,17 @@ impl DualLedger {
 
     pub fn portfolio_closed(&self) -> &[PortfolioEpisode] {
         &self.portfolio.closed
+    }
+
+    pub fn episode_unattributed(&self, id: EpisodeId) -> bool {
+        self.recovered.unattributed_episodes.contains(&id)
+    }
+
+    pub fn open_episode_unattributed(&self, asset: &str) -> bool {
+        self.portfolio
+            .open
+            .get(asset)
+            .is_some_and(|e| self.episode_unattributed(e.episode_id))
     }
 
     pub fn portfolio_closed_count(&self) -> u64 {
@@ -837,11 +926,46 @@ impl DualLedger {
         let mut ledger = serde_json::from_slice::<Self>(&bytes)
             .map_err(|error| LedgerError::Persistence(error.to_string()))?;
         ledger.migrate_cash_accounting()?;
+        ledger.migrate_ownership(&[]);
         Ok(ledger)
     }
 
+    pub(crate) fn migrate_ownership(
+        &mut self,
+        external: &[crate::domain::live_trading::ExternalFillAccounting],
+    ) {
+        if self.schema_version >= 4 {
+            return;
+        }
+        self.recovered.unattributed_episodes.extend(
+            self.portfolio
+                .open
+                .values()
+                .filter(|e| e.opening_decision_id == DecisionId([0; 32]))
+                .map(|e| e.episode_id),
+        );
+        self.recovered.unattributed_episodes.extend(
+            self.portfolio
+                .closed
+                .iter()
+                .filter(|e| e.opening_decision_id == DecisionId([0; 32]))
+                .map(|e| e.episode_id),
+        );
+        self.recovered.unattributed_episodes.extend(
+            external
+                .iter()
+                .chain(&self.recovered.external)
+                .filter(|e| {
+                    e.fill.position_before.is_zero()
+                        || (e.fill.side == Side::Buy) == e.fill.position_before.is_sign_positive()
+                })
+                .map(|e| e.episode_id),
+        );
+        self.schema_version = 4;
+    }
+
     pub fn validate_integrity(&self) -> Result<(), LedgerError> {
-        if !matches!(self.schema_version, 2 | 3) {
+        if !matches!(self.schema_version, 2..=4) {
             return Err(LedgerError::SchemaMismatch);
         }
         self.validate()
@@ -851,7 +975,7 @@ impl DualLedger {
     /// its diagnostic, changing only the derived cash result after validation.
     pub fn migrate_cash_accounting(&mut self) -> Result<bool, LedgerError> {
         self.validate_integrity()?;
-        if self.schema_version == 3 {
+        if self.schema_version >= 3 {
             return Ok(false);
         }
         let mut next = self.clone();
@@ -877,6 +1001,36 @@ impl DualLedger {
     }
 
     fn validate(&self) -> Result<(), LedgerError> {
+        if self.schema_version >= 4
+            && self.recovered.external.iter().any(|event| {
+                (event.fill.position_before.is_zero()
+                    || (event.fill.side == Side::Buy)
+                        == event.fill.position_before.is_sign_positive())
+                    && !self.episode_unattributed(event.episode_id)
+            })
+        {
+            return Err(LedgerError::InvalidLiveEvent(
+                "external ownership tombstone missing",
+            ));
+        }
+        for (id, decision) in self
+            .portfolio
+            .open
+            .values()
+            .map(|e| (e.episode_id, e.opening_decision_id))
+            .chain(
+                self.portfolio
+                    .closed
+                    .iter()
+                    .map(|e| (e.episode_id, e.opening_decision_id)),
+            )
+        {
+            if self.episode_unattributed(id) && decision != DecisionId([0; 32]) {
+                return Err(LedgerError::InvalidLiveEvent(
+                    "unattributed episode reclaimed",
+                ));
+            }
+        }
         for book in std::iter::once(&self.portfolio).chain(self.sources.values()) {
             for (asset, position) in &book.positions {
                 let open_quantity = book
@@ -910,6 +1064,61 @@ impl DualLedger {
 }
 
 impl EpisodeBook {
+    fn add_external(
+        &mut self,
+        fill: &crate::domain::live_trading::ExternalReduction,
+        delta: Decimal,
+    ) -> Result<EpisodeId, LedgerError> {
+        let value = fill
+            .quantity
+            .checked_mul(fill.price)
+            .ok_or(LedgerError::ArithmeticOverflow("external entry value"))?;
+        let id = if let Some(open) = self.open.get_mut(&fill.asset) {
+            open.opening_decision_id = DecisionId([0; 32]);
+            let after = checked_add(open.signed_quantity, delta, "external position")?;
+            open.average_entry_price = open
+                .average_entry_price
+                .checked_mul(open.signed_quantity.abs())
+                .and_then(|v| v.checked_add(value))
+                .and_then(|v| v.checked_div(after.abs()))
+                .ok_or(LedgerError::ArithmeticOverflow("external average entry"))?;
+            open.signed_quantity = after;
+            open.entry_notional = checked_add(open.entry_notional, value, "external entry")?;
+            open.fees = checked_add(open.fees, fill.fee, "external fee")?;
+            open.episode_id
+        } else {
+            let mut hash = Sha256::new();
+            hash.update(b"HL1G/EXTERNAL_EPISODE/V1");
+            for text in [&fill.asset, &fill.exchange_order_id, &fill.trade_id] {
+                hash.update((text.len() as u64).to_be_bytes());
+                hash.update(text.as_bytes());
+            }
+            let id = EpisodeId(hash.finalize().into());
+            self.open.insert(
+                fill.asset.clone(),
+                OpenEpisode {
+                    episode_id: id,
+                    asset: fill.asset.clone(),
+                    opened_at: fill.occurred_at,
+                    // Explicit absent-strategy marker, never an authorized action.
+                    opening_decision_id: DecisionId([0; 32]),
+                    signed_quantity: delta,
+                    average_entry_price: fill.price,
+                    entry_notional: value,
+                    exit_notional: Decimal::ZERO,
+                    realized_pnl: Decimal::ZERO,
+                    fees: fill.fee,
+                    funding: Decimal::ZERO,
+                    slippage: Decimal::ZERO,
+                },
+            );
+            id
+        };
+        self.positions
+            .insert(fill.asset.clone(), self.open[&fill.asset].signed_quantity);
+        Ok(id)
+    }
+
     fn reduce_external(
         &mut self,
         fill: &crate::domain::live_trading::ExternalReduction,

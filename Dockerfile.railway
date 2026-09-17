@@ -6,6 +6,7 @@ RUN apt-get update \
         bash \
         ca-certificates \
         coreutils \
+        python3 \
         tini \
     && rm -rf /var/lib/apt/lists/*
 
@@ -13,6 +14,7 @@ WORKDIR /app
 COPY --chmod=0555 railway-frozen/engine /app/bin/engine
 COPY --chmod=0444 railway-frozen/engine.sha256 /app/bin/engine.sha256
 COPY --chmod=0555 scripts/run_su6_railway.sh /app/bin/run_su6_railway.sh
+COPY --chmod=0555 scripts/hl_bot.py /app/bin/hl_bot.py
 COPY --chmod=0444 railway-frozen/copytrade.json /app/config/copytrade.json
 COPY --chmod=0444 railway-frozen/very-profitable-layer.json /app/config/very-profitable-layer.json
 COPY --chmod=0444 railway-frozen/read-api-policy.json /app/policy/read-api-policy.json
@@ -29,4 +31,4 @@ RUN sha256sum --check /app/bin/engine.sha256 \
         >/dev/null
 
 ENTRYPOINT ["/usr/bin/tini", "--"]
-CMD ["/app/bin/run_su6_railway.sh"]
+CMD ["python3", "/app/bin/hl_bot.py", "supervise"]

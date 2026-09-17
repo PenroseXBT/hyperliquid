@@ -73,9 +73,9 @@ impl StreamingPolicy {
         if self.idle_timeout_ms < 5_000
             || self.reconnect_initial_backoff_ms == 0
             || self.reconnect_maximum_backoff_ms < self.reconnect_initial_backoff_ms
-            || self.reconciliation_interval_ms < 10 * 60_000
+            || self.reconciliation_interval_ms < 5 * 60_000
             || self.reconciliation_spread_ms < 60_000
-            || self.reconciliation_spread_ms >= self.reconciliation_interval_ms
+            || self.reconciliation_spread_ms > self.reconciliation_interval_ms
             || self.hot_book_grace_ms < 5_000
             || !(1_024..=16 * 1024 * 1024).contains(&self.maximum_message_bytes)
         {
@@ -1080,6 +1080,18 @@ mod tests {
     use super::*;
 
     #[test]
+    fn five_minute_reconciliation_cadence_is_valid_for_live_scan_budget() {
+        let policy = StreamingPolicy {
+            enabled: true,
+            reconciliation_interval_ms: 5 * 60_000,
+            reconciliation_spread_ms: 60_000,
+            ..StreamingPolicy::default()
+        };
+
+        assert_eq!(policy.validate(), Ok(()));
+    }
+
+    #[test]
     fn hot_book_command_input_is_bounded_and_malformed_markets_are_omitted() {
         let mut requested = (0..=MAX_HOT_BOOKS)
             .map(|index| format!("M{index:03}"))
@@ -1098,6 +1110,7 @@ mod tests {
 
     fn baseline(candidate: String, time_ms: u64) -> SourceStateResponse {
         SourceStateResponse {
+            block_number: None,
             candidate_id: candidate,
             account_value: Decimal::from(1_000),
             source_time_ms: time_ms,

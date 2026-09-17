@@ -3,15 +3,14 @@ builder = "DOCKERFILE"
 dockerfilePath = "Dockerfile.railway"
 
 [deploy]
-startCommand = "/app/bin/run_su6_railway.sh"
+startCommand = "python3 /app/bin/hl_bot.py supervise"
 region = "asia-southeast1-eqsg3a"
 numReplicas = 1
-# A fatal engine exit is a capital-safety latch. Recovery requires an explicit
-# operator restart after the persisted failure has been diagnosed.
-restartPolicyType = "NEVER"
-restartPolicyMaxRetries = 1
+# Supervisor keeps telemetry online while the engine restarts under a pause.
+restartPolicyType = "ALWAYS"
+restartPolicyMaxRetries = 100
 overlapSeconds = 0
-drainingSeconds = 300
+drainingSeconds = 90
 
 [deploy.multiRegionConfig.asia-southeast1-eqsg3a]
 numReplicas = 1

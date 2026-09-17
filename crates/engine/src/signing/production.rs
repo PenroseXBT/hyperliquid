@@ -124,6 +124,11 @@ pub fn validate_authorized_intent(
 }
 
 fn exchange_open_order_exposure(order: &ExchangeOpenOrder) -> Option<OpenOrderExposure> {
+    // Keep the full filled exposure until reductions actually settle. A venue
+    // enforced reduce-only order cannot add exposure and earns no risk credit.
+    if order.reduce_only {
+        return None;
+    }
     let side = if order.is_buy {
         OrderSide::Buy
     } else {
@@ -140,9 +145,40 @@ fn exchange_open_order_exposure(order: &ExchangeOpenOrder) -> Option<OpenOrderEx
 fn validate_exchange_open_orders(
     snapshot: &ExchangeOpenOrdersSnapshot,
     registry: &SubmissionRegistry,
+    positions: &ExchangePositionSnapshot,
 ) -> Result<(), SignerError> {
     let mut observed = BTreeSet::new();
+    let mut observed_order_ids = BTreeSet::new();
     for order in &snapshot.orders {
+        if !observed_order_ids.insert(&order.exchange_order_id) {
+            return Err(SignerError::ExchangeTruthMismatch(
+                "duplicate exchange open-order ID".into(),
+            ));
+        }
+        let position = positions
+            .positions
+            .get(&order.asset)
+            .copied()
+            .unwrap_or_default();
+        let reduces = (order.is_buy && position < Decimal::ZERO)
+            || (!order.is_buy && position > Decimal::ZERO);
+        let valid_size = order.original_quantity >= order.remaining_quantity
+            && order.remaining_quantity >= Decimal::ZERO
+            && (order.remaining_quantity > Decimal::ZERO
+                || (order.original_quantity == Decimal::ZERO
+                    && order.is_trigger
+                    && order.is_position_tpsl));
+        // An exchange-confirmed external protective order has no engine intent.
+        // Retain it without claiming ownership or bypassing managed-order checks.
+        // Zero size is valid only for the venue's whole-position TP/SL encoding.
+        if order.cloid.is_none()
+            && order.reduce_only
+            && reduces
+            && valid_size
+            && order.limit_price > Decimal::ZERO
+        {
+            continue;
+        }
         let cloid = order.cloid.ok_or_else(|| {
             SignerError::ExchangeTruthMismatch(format!(
                 "unmanaged open order {} has no CLOID",
@@ -517,7 +553,7 @@ impl<T: AuthenticatedExchangeTransport> ProductionSigner<T> {
             .await?;
         let applied = {
             let registry = self.registry.lock().await;
-            validate_exchange_open_orders(&open_orders, &registry)?;
+            validate_exchange_open_orders(&open_orders, &registry, &positions)?;
             apply_authenticated_batches(
                 live_state,
                 &registry,
@@ -857,7 +893,7 @@ impl<T: AuthenticatedExchangeTransport> ProductionSigner<T> {
         context.projection_input.open_order_state_complete = true;
 
         let mut registry = self.registry.lock().await;
-        if let Err(error) = validate_exchange_open_orders(&open_orders, &registry) {
+        if let Err(error) = validate_exchange_open_orders(&open_orders, &registry, &positions) {
             if !intent.reduce_only {
                 return Err(error);
             }
@@ -1666,6 +1702,63 @@ mod tests {
         }
         assert_eq!(signer.registry.lock().await.next_nonce_floor().unwrap(), 0);
         assert!(!path.exists());
+    }
+
+    #[test]
+    fn external_no_cloid_reduce_only_order_is_allowed_only_when_protective() {
+        let registry = SubmissionRegistry::default();
+        let snapshot_hash = crate::domain::decision::PayloadHash([0; 32]);
+        let protective = ExchangeOpenOrder {
+            cloid: None,
+            exchange_order_id: "541191621726".into(),
+            asset: "AERO".into(),
+            is_buy: true,
+            limit_price: Decimal::from(1),
+            original_quantity: Decimal::from(300),
+            remaining_quantity: Decimal::from(300),
+            reduce_only: true,
+            order_type: "Limit".into(),
+            is_trigger: false,
+            is_position_tpsl: false,
+        };
+        let orders = ExchangeOpenOrdersSnapshot {
+            orders: vec![protective.clone()],
+            source_hash: snapshot_hash,
+        };
+        let short_position = ExchangePositionSnapshot {
+            positions: BTreeMap::from([("AERO".into(), Decimal::from(-300))]),
+            account_equity: Decimal::from(100),
+            observed_at_ms: 1,
+            source_hash: snapshot_hash,
+        };
+        assert_eq!(
+            validate_exchange_open_orders(&orders, &registry, &short_position),
+            Ok(())
+        );
+
+        let flat_position = ExchangePositionSnapshot {
+            positions: BTreeMap::new(),
+            account_equity: Decimal::from(100),
+            observed_at_ms: 1,
+            source_hash: snapshot_hash,
+        };
+        assert!(matches!(
+            validate_exchange_open_orders(&orders, &registry, &flat_position),
+            Err(SignerError::ExchangeTruthMismatch(reason))
+                if reason.contains("has no CLOID")
+        ));
+
+        let mut increasing = protective;
+        increasing.is_buy = false;
+        let increasing_orders = ExchangeOpenOrdersSnapshot {
+            orders: vec![increasing],
+            source_hash: snapshot_hash,
+        };
+        assert!(matches!(
+            validate_exchange_open_orders(&increasing_orders, &registry, &short_position),
+            Err(SignerError::ExchangeTruthMismatch(reason))
+                if reason.contains("has no CLOID")
+        ));
     }
 
     #[test]

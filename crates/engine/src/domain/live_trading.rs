@@ -276,7 +276,15 @@ impl LiveTradingState {
         }
         let mut next = self.clone();
         let episode_id = next.ledger.reduce_external(&fill)?;
-        if next.position(&fill.asset).is_zero() {
+        if fill.position_before.is_zero()
+            || (fill.side == Side::Buy) == fill.position_before.is_sign_positive()
+        {
+            next.open_episode_attribution.remove(&fill.asset);
+        }
+        let closed_previous = !fill.position_before.is_zero()
+            && fill.quantity >= fill.position_before.abs()
+            && (fill.side == Side::Buy) != fill.position_before.is_sign_positive();
+        if closed_previous {
             next.exchange_gross_pnl_by_open_episode.remove(&fill.asset);
             if let Some(attribution) = next.open_episode_attribution.remove(&fill.asset) {
                 next.closed_episode_attribution
@@ -401,6 +409,11 @@ impl LiveTradingState {
                     .last()
                     .map(|funding| funding.occurred_at),
             )
+            .chain(
+                self.external_fills
+                    .last()
+                    .map(|event| event.fill.occurred_at),
+            )
             .max()
     }
 
@@ -410,8 +423,13 @@ impl LiveTradingState {
         attribution: StrategyComponentAttribution,
     ) -> Result<(), LedgerError> {
         attribution.validate()?;
-        self.open_episode_attribution
-            .insert(asset.into(), attribution);
+        let asset = asset.into();
+        if self.ledger.open_episode_unattributed(&asset) {
+            return Err(LedgerError::InvalidLiveEvent(
+                "unattributed episode cannot acquire strategy credit",
+            ));
+        }
+        self.open_episode_attribution.insert(asset, attribution);
         Ok(())
     }
 
@@ -419,7 +437,9 @@ impl LiveTradingState {
         &self,
         episode_id: EpisodeId,
     ) -> Option<&StrategyComponentAttribution> {
-        self.closed_episode_attribution.get(&episode_id)
+        self.closed_episode_attribution
+            .get(&episode_id)
+            .filter(|_| !self.ledger.episode_unattributed(episode_id))
     }
 
     pub fn save_atomic(&self, path: impl AsRef<Path>) -> Result<(), LedgerError> {
@@ -479,8 +499,32 @@ impl LiveTradingState {
         {
             return Err(LedgerError::SchemaMismatch);
         }
+        let migrated_cash = state.ledger.migrate_cash_accounting()?;
+        state.ledger.migrate_ownership(&state.external_fills);
         state.ledger.validate_integrity()?;
-        if state.ledger.migrate_cash_accounting()? {
+        if state.external_fills.iter().any(|event| {
+            (event.fill.position_before.is_zero()
+                || (event.fill.side == Side::Buy) == event.fill.position_before.is_sign_positive())
+                && !state.ledger.episode_unattributed(event.episode_id)
+        }) {
+            return Err(LedgerError::InvalidLiveEvent(
+                "external ownership tombstone missing",
+            ));
+        }
+        if state
+            .open_episode_attribution
+            .keys()
+            .any(|asset| state.ledger.open_episode_unattributed(asset))
+            || state
+                .closed_episode_attribution
+                .keys()
+                .any(|id| state.ledger.episode_unattributed(*id))
+        {
+            return Err(LedgerError::InvalidLiveEvent(
+                "unattributed episode reclaimed",
+            ));
+        }
+        if migrated_cash {
             state.settled_equity = state
                 .starting_equity
                 .checked_add(state.ledger.portfolio_realized_net_pnl()?)
@@ -731,6 +775,256 @@ fn derive_execution_id(identity: &ExchangeFillIdentity) -> [u8; 32] {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn manual_scale_in_and_partial_exit_preserve_cash_without_strategy_credit() {
+        use super::*;
+        for side in [Side::Buy, Side::Sell] {
+            let sign = if side == Side::Buy {
+                Decimal::ONE
+            } else {
+                -Decimal::ONE
+            };
+            let mut live = LiveTradingState::new(Decimal::from(1000), 0).unwrap();
+            let mut opening = fill(
+                "owned",
+                side,
+                if side == Side::Buy { 100 } else { 120 },
+                1000,
+            );
+            opening.reduce_only = false;
+            opening.exchange_closed_pnl = Decimal::ZERO;
+            apply_exchange_fill(&mut live, opening.clone()).unwrap();
+            let addition = ExternalReduction {
+                exchange_order_id: "manual".into(),
+                trade_id: "add".into(),
+                asset: "BTC".into(),
+                side,
+                quantity: Decimal::ONE,
+                price: Decimal::from(if side == Side::Buy { 120 } else { 100 }),
+                fee: Decimal::new(2, 1),
+                fee_asset: "USDC".into(),
+                closed_pnl: Decimal::ZERO,
+                position_before: sign,
+                occurred_at: 30,
+            };
+            assert!(live.apply_external_reduction(addition.clone()).unwrap());
+            assert!(!live.apply_external_reduction(addition.clone()).unwrap());
+            assert_eq!(live.position("BTC"), sign * Decimal::from(2));
+            let mixed_id = live.external_fills()[0].episode_id;
+            let attribution = StrategyComponentAttribution {
+                component: StrategyComponent::SourceOnly,
+                source_fraction: Decimal::ONE,
+                technical_fraction: Decimal::ZERO,
+                archetype: None,
+                regime: None,
+                side,
+            };
+            let root = tempfile::tempdir().unwrap();
+            let path = root.path().join("live.json");
+            live.save_atomic(&path).unwrap();
+            live = LiveTradingState::load(&path).unwrap();
+            assert!(live.ledger().episode_unattributed(mixed_id));
+            assert!(live
+                .set_strategy_attribution("BTC", attribution.clone())
+                .is_err());
+            let mut later = live.clone();
+            let mut engine_add = fill("later-owned", side, 110, 1000);
+            engine_add.reduce_only = false;
+            engine_add.exchange_closed_pnl = Decimal::ZERO;
+            apply_exchange_fill(&mut later, engine_add).unwrap();
+            later.save_atomic(&path).unwrap();
+            later = LiveTradingState::load(&path).unwrap();
+            assert!(later.ledger().episode_unattributed(mixed_id));
+            assert!(later
+                .set_strategy_attribution("BTC", attribution.clone())
+                .is_err());
+            let wire = rmp_serde::to_vec(live.ledger()).unwrap();
+            assert_eq!(
+                rmp_serde::from_slice::<DualLedger>(&wire).unwrap(),
+                *live.ledger()
+            );
+            let mut close = addition.clone();
+            close.side = if side == Side::Buy {
+                Side::Sell
+            } else {
+                Side::Buy
+            };
+            close.price = Decimal::from(if side == Side::Buy { 130 } else { 90 });
+            close.quantity = Decimal::new(5, 1);
+            close.position_before = sign * Decimal::from(2);
+            close.trade_id = "partial".into();
+            close.fee = Decimal::new(1, 1);
+            close.closed_pnl = Decimal::from(10);
+            close.occurred_at = 40;
+            live.apply_external_reduction(close.clone()).unwrap();
+            assert_eq!(live.position("BTC"), sign * Decimal::new(15, 1));
+            close.quantity = Decimal::new(15, 1);
+            close.position_before = sign * close.quantity;
+            close.trade_id = "final".into();
+            close.fee = Decimal::new(3, 1);
+            close.closed_pnl = Decimal::from(30);
+            close.occurred_at = 50;
+            live.apply_external_reduction(close).unwrap();
+            assert!(live.positions().is_empty());
+            assert_eq!(live.settled_equity(), Decimal::new(10393, 1));
+            let episode = &live.ledger().portfolio_closed()[0];
+            assert_eq!(episode.opening_decision_id, DecisionId([0; 32]));
+            assert_eq!(episode.net_pnl, Decimal::new(393, 1));
+            live.save_atomic(&path).unwrap();
+            live = LiveTradingState::load(&path).unwrap();
+            assert!(live.closed_episode_attribution(mixed_id).is_none());
+            // Even a persisted attribution written by a future pass is rejected.
+            live.closed_episode_attribution
+                .insert(mixed_id, attribution);
+            assert!(live.closed_episode_attribution(mixed_id).is_none());
+            live.closed_episode_attribution.clear();
+            let mut corrupted = serde_json::to_value(&live).unwrap();
+            corrupted["ledger"]["portfolio"]["closed"][0]["opening_decision_id"] =
+                serde_json::to_value(DecisionId([1; 32])).unwrap();
+            std::fs::write(&path, serde_json::to_vec(&corrupted).unwrap()).unwrap();
+            assert!(LiveTradingState::load(&path).is_err());
+            corrupted["ledger"]["recovered"]["unattributed_episodes"] = serde_json::json!([]);
+            std::fs::write(&path, serde_json::to_vec(&corrupted).unwrap()).unwrap();
+            assert!(LiveTradingState::load(&path).is_err());
+            let mut replay = DualLedger::default();
+            for _ in 0..2 {
+                replay.recover_engine_fill(&opening, Decimal::ZERO).unwrap();
+                for event in live.external_fills() {
+                    replay.recover_external_fill(event, Decimal::ZERO).unwrap();
+                }
+            }
+            assert_eq!(replay.portfolio_closed(), live.ledger().portfolio_closed());
+            assert!(replay.source_positions_for_asset("BTC").is_empty());
+            let mut attributed = DualLedger::default();
+            let execution = execution_from_verified_fill(&opening, Decimal::ZERO).unwrap();
+            attributed
+                .apply_portfolio_execution(&execution, opening.occurred_at)
+                .unwrap();
+            attributed
+                .apply_source_execution("copied-wallet", &execution, opening.occurred_at)
+                .unwrap();
+            for event in live.external_fills() {
+                attributed
+                    .recover_external_fill(event, Decimal::ZERO)
+                    .unwrap();
+            }
+            assert_eq!(attributed.source_closed_count("copied-wallet"), 0);
+            assert_eq!(attributed.source_closed_count("recovered:unattributed"), 1);
+            attributed.compact_closed_before(100).unwrap();
+            attributed.save_atomic(&path).unwrap();
+            assert!(DualLedger::load(&path)
+                .unwrap()
+                .episode_unattributed(mixed_id));
+            let mut conflicting = addition;
+            conflicting.fee = Decimal::ONE;
+            assert!(live.apply_external_reduction(conflicting).is_err());
+        }
+    }
+
+    #[test]
+    fn external_reversal_closes_strategy_and_opens_manual_once() {
+        use super::*;
+        let mut live = LiveTradingState::new(Decimal::from(1000), 0).unwrap();
+        let opening = fill("open", Side::Buy, 100, 1000);
+        apply_exchange_fill(&mut live, opening).unwrap();
+        let reversal = ExternalReduction {
+            exchange_order_id: "external-flip".into(),
+            trade_id: "flip-1".into(),
+            asset: "BTC".into(),
+            side: Side::Sell,
+            quantity: Decimal::from(2),
+            price: Decimal::from(90),
+            fee: Decimal::new(2, 1),
+            fee_asset: "USDC".into(),
+            closed_pnl: Decimal::from(-10),
+            position_before: Decimal::ONE,
+            occurred_at: 2000,
+        };
+        assert!(live.apply_external_reduction(reversal.clone()).unwrap());
+        assert!(!live.apply_external_reduction(reversal).unwrap());
+        assert_eq!(live.position("BTC"), -Decimal::ONE);
+        assert_eq!(live.ledger().portfolio_closed().len(), 1);
+        assert_eq!(live.ledger().portfolio_closed()[0].fees, Decimal::new(2, 1));
+        assert_eq!(live.settled_equity(), Decimal::new(9898, 1));
+        let mut replay = DualLedger::default();
+        for _ in 0..2 {
+            for fill in live.verified_fills() {
+                replay.recover_engine_fill(fill, Decimal::ZERO).unwrap();
+            }
+            for event in live.external_fills() {
+                replay.recover_external_fill(event, Decimal::ZERO).unwrap();
+            }
+        }
+        assert_eq!(replay.portfolio_position("BTC"), -Decimal::ONE);
+        assert_eq!(replay.portfolio_closed().len(), 1);
+    }
+
+    #[test]
+    fn manual_hip3_round_trip_replays_without_strategy_identity() {
+        use super::*;
+        for side in [Side::Buy, Side::Sell] {
+            let mut live = LiveTradingState::new(Decimal::from(315), 0).unwrap();
+            let open = ExternalReduction {
+                exchange_order_id: "manual-open".into(),
+                trade_id: "1".into(),
+                asset: "xyz:SKHY".into(),
+                side,
+                quantity: Decimal::ONE,
+                price: Decimal::from(100),
+                fee: Decimal::new(1, 2),
+                fee_asset: "USDC".into(),
+                closed_pnl: Decimal::ZERO,
+                position_before: Decimal::ZERO,
+                occurred_at: 1000,
+            };
+            let mut close = open.clone();
+            close.exchange_order_id = "manual-close".into();
+            close.trade_id = "2".into();
+            close.side = if side == Side::Buy {
+                Side::Sell
+            } else {
+                Side::Buy
+            };
+            close.price = if side == Side::Buy {
+                Decimal::from(103)
+            } else {
+                Decimal::from(97)
+            };
+            close.closed_pnl = Decimal::from(3);
+            close.position_before = if side == Side::Buy {
+                Decimal::ONE
+            } else {
+                -Decimal::ONE
+            };
+            close.occurred_at = 2000;
+            assert!(live.apply_external_reduction(open.clone()).unwrap());
+            assert!(live.apply_external_reduction(close.clone()).unwrap());
+            assert!(!live.apply_external_reduction(open).unwrap());
+            assert!(!live.apply_external_reduction(close.clone()).unwrap());
+            assert_eq!(live.settled_equity(), Decimal::new(31798, 2));
+            assert!(live.positions().is_empty());
+            assert!(live.verified_fills().is_empty());
+            assert_eq!(live.latest_exchange_event_timestamp(), Some(2000));
+            let path =
+                std::env::temp_dir().join(format!("hl-manual-replay-{}.json", std::process::id()));
+            live.save_atomic(&path).unwrap();
+            assert_eq!(LiveTradingState::load(&path).unwrap(), live);
+            std::fs::remove_file(path).unwrap();
+            let episode = &live.ledger().portfolio_closed()[0];
+            assert_eq!(episode.opening_decision_id, DecisionId([0; 32]));
+            assert_eq!(episode.net_pnl, Decimal::new(298, 2));
+            let mut replay = DualLedger::default();
+            for _ in 0..2 {
+                for event in live.external_fills() {
+                    replay.recover_external_fill(event, Decimal::ZERO).unwrap();
+                }
+            }
+            assert_eq!(replay.portfolio_closed().len(), 1);
+            close.fee = Decimal::ONE;
+            assert!(live.apply_external_reduction(close).is_err());
+        }
+    }
+
     use super::*;
 
     fn fill(trade: &str, side: Side, price: i64, equity: i64) -> VerifiedExchangeFill {

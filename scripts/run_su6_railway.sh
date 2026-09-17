@@ -26,6 +26,7 @@ readonly FAILURE_ROOT="${DATA_ROOT}/failure"
 readonly PROCESS_STDERR="${FAILURE_ROOT}/process.stderr"
 readonly SOURCE_DB="${DATA_ROOT}/source-state.sqlite"
 readonly BACKFILL_SRC="${SU6_SOURCE_BACKFILL_PATH:-}"
+SOURCE_BACKFILL_NEEDED=0
 
 ENGINE_PID=""
 STOP_REQUESTED=0
@@ -46,8 +47,23 @@ trap stop_engine INT TERM
 readonly BINARY_SHA="$(sha256sum "$ENGINE" | cut -d ' ' -f 1)"
 log "engine_binary_sha256=${BINARY_SHA}"
 # One-time backfill gate: validate before the engine starts so a misconfigured
-# path fails closed instead of silently running with zero baselines.
+# path fails closed instead of silently running with zero baselines. Once the
+# destination source DB exists, a stale SU6_SOURCE_BACKFILL_PATH must not block
+# future restarts.
 if [[ -n "$BACKFILL_SRC" ]]; then
+    for artifact in "$SOURCE_DB" "$SOURCE_DB-wal" "$SOURCE_DB-shm"; do
+        [[ ! -L "$artifact" ]] || {
+            log "invalid_source_state_artifact=${artifact}"
+            exit 1
+        }
+    done
+    if [[ -e "$SOURCE_DB" || -e "$SOURCE_DB-wal" || -e "$SOURCE_DB-shm" ]]; then
+        log "source_backfill_skipped_existing_destination=${SOURCE_DB}"
+    else
+        SOURCE_BACKFILL_NEEDED=1
+    fi
+fi
+if (( SOURCE_BACKFILL_NEEDED == 1 )); then
     [[ "$BACKFILL_SRC" = /* && "$BACKFILL_SRC" != "/" ]] || {
         log "invalid_source_backfill_path=${BACKFILL_SRC}"
         exit 1
@@ -78,7 +94,7 @@ mkdir -p "$STATE_ROOT" "$RUNTIME_ROOT" "$FAILURE_ROOT"
 shopt -s nullglob dotglob
 for artifact in "$FAILURE_ROOT"/*; do
     case "${artifact##*/}" in
-        process.stderr|last-exit.stderr|last-exit.stderr.tmp|last-exit.meta|last-exit.meta.tmp|current-run.meta|current-run.meta.tmp)
+        process.stderr|last-exit.stderr|last-exit.stderr.tmp|last-exit.meta|last-exit.meta.tmp|current-run.meta|current-run.meta.tmp|process-events.jsonl)
             [[ -f "$artifact" && ! -L "$artifact" ]] && continue ;;
     esac
     log "invalid_failure_artifact=${artifact}"
@@ -127,7 +143,7 @@ log "continuous_engine_start=true run_id=${RUN_ID} previous_run_id=${PREVIOUS_RU
 set +e
 # Branch instead of an empty `"${BACKFILL_ARGS[@]}"` expansion: that form fails
 # under `set -u` on bash 3.2 when no backfill flag is set.
-if [[ -n "$BACKFILL_SRC" ]]; then
+if (( SOURCE_BACKFILL_NEEDED == 1 )); then
     "$ENGINE" continuous \
         --config "$CONFIG" \
         --very-profitable-layer "$VERY_PROFITABLE_LAYER" \
@@ -176,5 +192,5 @@ fi
 
 # No in-process or platform respawn. A fatal exit is persisted and remains
 # stopped until an operator diagnoses it and explicitly starts a deployment.
-log "continuous_engine_unexpected_exit=true exit=${engine_exit} operator_restart_required=true"
+log "continuous_engine_unexpected_exit=true exit=${engine_exit} supervisor_restart_required=true"
 exit "$engine_exit"

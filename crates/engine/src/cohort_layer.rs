@@ -508,7 +508,9 @@ mod tests {
         let mut artifact = artifact(existing, new.clone());
         artifact.wallet_quality[1].win_rate_pct = Decimal::from(1);
         let prepared = PreparedVeryProfitableLayer::prepare(&artifact, &config).unwrap();
-        assert!(prepared.qualified_members.contains(&new.to_ascii_lowercase()));
+        assert!(prepared
+            .qualified_members
+            .contains(&new.to_ascii_lowercase()));
         assert!(!prepared.quality_decisions.is_empty());
         assert_eq!(prepared.merge_candidates(&mut config).unwrap(), 1);
     }
@@ -530,6 +532,7 @@ mod tests {
         };
         let states = vec![
             SourceStateResponse {
+                block_number: None,
                 candidate_id: existing,
                 account_value: Decimal::from(1_000),
                 source_time_ms: 2_100,
@@ -537,6 +540,7 @@ mod tests {
                 closed_candles: Vec::new(),
             },
             SourceStateResponse {
+                block_number: None,
                 candidate_id: new,
                 account_value: Decimal::from(1_000),
                 source_time_ms: 2_100,

@@ -31,6 +31,7 @@ __pycache__/
 *.pyc
 
 # Frozen Railway runtime config is part of the release artifact set.
+!railway-frozen/engine.sha256
 !railway-frozen/copytrade.json
 !railway-frozen/very-profitable-layer.json
 !railway-frozen/read-api-policy.json

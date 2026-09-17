@@ -41,6 +41,7 @@ const MFCE_DIRECTION_SHRINKAGE: f64 = 48.0;
 const BPS_PER_UNIT_RETURN: Decimal = Decimal::from_parts(10_000, 0, 0, false, 0);
 // Edge-only: explore pool is unbounded (1.0). Only net_q50 /
 // conservative_edge / net_q10 may gate size.
+#[cfg(test)]
 const MFCE_EXPLORE_POOL_FRACTION: Decimal = Decimal::ONE;
 /// Edge-only: information budget is unbounded (1.0). Cold Explore shares
 /// full portfolio capacity; diagnostics only.
@@ -50,7 +51,7 @@ const MFCE_EXPLORE_CONVICTION_RANGE: Decimal = Decimal::from_parts(10, 0, 0, fal
 const MFCE_EXPLORE_RISK_SCALE_BPS: Decimal = Decimal::from_parts(500, 0, 0, false, 0);
 const MFCE_SCORE_EPSILON_BPS: Decimal = Decimal::ONE;
 // Edge-only bootstrap: q10=0, q50=0, unc=0 so conservative==net_q50 at
-// 0 labels. 0-label state admits Explore on conservative>0.
+// 0 labels. Break-even upper edge admits Explore so cold start can buy labels.
 const MFCE_BOOTSTRAP_Q10_BPS: Decimal = Decimal::ZERO;
 const MFCE_BOOTSTRAP_Q50_BPS: Decimal = Decimal::ZERO;
 const MFCE_BOOTSTRAP_UNCERTAINTY_BPS: Decimal = Decimal::ZERO;
@@ -2106,8 +2107,8 @@ impl MfceEngine {
             < MFCE_MIN_BACKOFF_SAMPLES
         {
             // Edge-only cold start: neutral prior (0/0/0) so
-            // conservative==net_q50 at 0 labels. 0-label admits Explore on
-            // conservative>0; training still runs in background.
+            // conservative==net_q50 at 0 labels. Break-even upper edge admits
+            // Explore; training still runs in background.
             return Ok(MfcePrediction {
                 model_epoch: 0,
                 q10_gross_bps: MFCE_BOOTSTRAP_Q10_BPS,
@@ -2611,9 +2612,9 @@ fn evaluate_distribution(input: &MfceAllocationInput) -> Result<MfceAllocationDe
         .checked_add(input.prediction.uncertainty_bps)
         .ok_or(MfceError::Arithmetic)?;
     // Edge-only: support and model gates collapsed. Exploit iff net_q10>1,
-    // Reject iff upper<=0, regardless of support/model. Only net_q50 /
+    // Reject iff upper<0, regardless of support/model. Only net_q50 /
     // conservative_edge / net_q10 / opportunity / uncertainty gate size.
-    let (policy_state, reason) = if upper_edge_bps <= Decimal::ZERO {
+    let (policy_state, reason) = if upper_edge_bps < Decimal::ZERO {
         (
             MfcePolicyState::Reject,
             Some(MfceRejectionReason::StrongNegativeExpectancy),
@@ -3783,6 +3784,15 @@ mod tests {
         let zero_edge = evaluate(-20, 20, 20, 10, 1_000, 1_000);
         assert_eq!(zero_edge.policy_state, MfcePolicyState::Explore);
         assert_eq!(zero_edge.reason, None);
+        let break_even_upper = evaluate(20, 20, 20, 0, 1_000, 1_000);
+        assert_eq!(break_even_upper.policy_state, MfcePolicyState::Explore);
+        assert_eq!(break_even_upper.reason, None);
+        let negative_upper = evaluate(19, 19, 20, 0, 1_000, 1_000);
+        assert_eq!(negative_upper.policy_state, MfcePolicyState::Reject);
+        assert_eq!(
+            negative_upper.reason,
+            Some(MfceRejectionReason::StrongNegativeExpectancy)
+        );
 
         for (q10, q50, state) in [
             (-120, 90, MfcePolicyState::Explore),
@@ -3871,7 +3881,7 @@ mod tests {
     #[test]
     fn unsupported_direction_explores_with_one_global_information_budget() {
         // Edge-only: negative upper edge Rejects regardless of support/model.
-        // q10=-100,q50=-50,friction=10,unc=20 => net_q50=-60, upper=-40<=0.
+        // q10=-100,q50=-50,friction=10,unc=20 => net_q50=-60, upper=-40<0.
         let mut low_conviction = allocation_candidate("LOW", 1, -100, -50, 10, 20, 1_000);
         low_conviction.input.prediction.used_model = false;
         low_conviction.input.prediction.direction_sample_count = 1;
@@ -4154,30 +4164,15 @@ mod tests {
     fn model_allocation_scales_openings_expansions_and_reversals() {
         // Edge-only: explore pool is 1.0, so full size on positive edge.
         assert_eq!(
-            allocated_target(
-                Decimal::ZERO,
-                Decimal::from(100),
-                Decimal::ONE,
-            )
-            .unwrap(),
+            allocated_target(Decimal::ZERO, Decimal::from(100), Decimal::ONE,).unwrap(),
             Decimal::from(100)
         );
         assert_eq!(
-            allocated_target(
-                Decimal::from(50),
-                Decimal::from(100),
-                Decimal::ONE,
-            )
-            .unwrap(),
+            allocated_target(Decimal::from(50), Decimal::from(100), Decimal::ONE,).unwrap(),
             Decimal::from(100)
         );
         assert_eq!(
-            allocated_target(
-                Decimal::from(50),
-                Decimal::from(-100),
-                Decimal::ONE,
-            )
-            .unwrap(),
+            allocated_target(Decimal::from(50), Decimal::from(-100), Decimal::ONE,).unwrap(),
             Decimal::from(-100)
         );
     }
@@ -4347,7 +4342,7 @@ mod tests {
         assert_eq!(prediction.q50_gross_bps, MFCE_BOOTSTRAP_Q50_BPS);
         assert_eq!(prediction.uncertainty_bps, MFCE_BOOTSTRAP_UNCERTAINTY_BPS);
         // Edge-only bootstrap is neutral (0/0/0). With friction 10, net is
-        // negative so upper<=0 => Reject (don't trade at a loss).
+        // negative so upper<0 => Reject (don't trade at a loss).
         let decision = evaluate_allocation_policy(&MfceAllocationInput {
             prediction,
             friction_bps: Decimal::from(10),

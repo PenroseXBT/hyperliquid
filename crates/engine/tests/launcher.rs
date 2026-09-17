@@ -31,14 +31,18 @@ fn production_start_has_no_offline_model_prerequisite() {
 }
 
 #[test]
-fn production_fatal_exit_requires_an_explicit_operator_restart() {
+fn production_fatal_exit_uses_supervisor_restart_with_railway_backoff() {
     let railway = include_str!("../../../railway.toml");
     let wrapper = include_str!("../../../scripts/run_su6_railway.sh");
-    assert!(railway.contains("restartPolicyType = \"NEVER\""));
-    assert!(railway.contains("restartPolicyMaxRetries = 1"));
-    assert!(!railway.contains("restartPolicyType = \"ALWAYS\""));
-    assert!(wrapper.contains("operator_restart_required=true"));
-    assert!(!wrapper.contains("railway_restart=true"));
+    let bot = include_str!("../../../scripts/hl_bot.py");
+    assert!(railway.contains("startCommand = \"python3 /app/bin/hl_bot.py supervise\""));
+    assert!(railway.contains("restartPolicyType = \"ALWAYS\""));
+    assert!(railway.contains("restartPolicyMaxRetries = 100"));
+    assert!(!railway.contains("restartPolicyType = \"NEVER\""));
+    assert!(wrapper.contains("supervisor_restart_required=true"));
+    assert!(!wrapper.contains("operator_restart_required=true"));
+    assert!(bot.contains("event':'engine_restart'"));
+    assert!(bot.contains("record_process_event(root, str(child.pid), 'restart_scheduled'"));
 }
 
 #[test]

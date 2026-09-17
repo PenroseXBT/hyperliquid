@@ -215,6 +215,7 @@ const fn mfce_indicator(value: bool) -> Decimal {
 /// base friction only (actual live_context.friction_bps). Fee-multiplier
 /// buffers and re-entry penalties are accounting diagnostics only and
 /// never gate size.
+#[cfg(test)]
 fn buffered_policy_friction_bps(
     base_friction_bps: Decimal,
     _taker_fee_bps: Decimal,
@@ -228,6 +229,7 @@ fn buffered_policy_friction_bps(
 /// later. Two buffered fee legs plus two expected slippage legs. EXIT must
 /// clear this unless hard risk invalidation or a true opposite reversal
 /// clears its own full transition cost.
+#[cfg(test)]
 fn same_side_switching_cost_bps(
     taker_fee_bps: Decimal,
     maximum_slippage_bps: Decimal,
@@ -1795,6 +1797,7 @@ pub struct DecisionEngine {
     metadata_received_at: Option<Timestamp>,
     metadata_valid_until: Option<Timestamp>,
     books: BTreeMap<String, (OrderBookResponse, Timestamp)>,
+    stale_book_warning_assets: BTreeSet<String>,
     previous_target: Option<PreviousTargetState>,
     decision_sequence: u64,
     pending: BTreeMap<String, PendingAction>,
@@ -2887,6 +2890,7 @@ impl DecisionEngine {
             metadata_received_at: None,
             metadata_valid_until: None,
             books: BTreeMap::new(),
+            stale_book_warning_assets: BTreeSet::new(),
             previous_target: None,
             decision_sequence: 0,
             pending: BTreeMap::new(),
@@ -4069,6 +4073,7 @@ impl DecisionEngine {
                 let refreshes_active_mfce = self.mfce.has_active_transition(&asset);
                 self.books
                     .insert(asset.clone(), (book.clone(), response.received_at_mono));
+                self.stale_book_warning_assets.remove(&asset);
                 let prepared_intents_before = self.prepared_authorized_intents.len();
                 let mut execution_recompute = if self.pending.contains_key(&asset) {
                     self.try_execute_pending(&book, response.received_at_mono)?
@@ -5866,7 +5871,9 @@ impl DecisionEngine {
                 let book_entry = self.books.get(asset);
                 if let Some((_, received_at)) = book_entry {
                     let age = now.saturating_sub(*received_at);
-                    if age > MFCE_LIVE_BOOK_MAX_AGE_MS {
+                    if age > MFCE_LIVE_BOOK_MAX_AGE_MS
+                        && self.stale_book_warning_assets.insert(asset.clone())
+                    {
                         eprintln!("stale_book_used=true asset={asset} age_ms={age} action=ADMIT_WITH_WIDENED_UNCERTAINTY nonfatal=true");
                     }
                 }
@@ -8111,18 +8118,6 @@ impl DecisionEngine {
                 "unsigned engine cohort-layer identity mismatch".into(),
             ));
         }
-        for asset in state.ledger.portfolio_assets() {
-            if state
-                .last_mids
-                .as_ref()
-                .and_then(|mids| mids.mids.get(&asset))
-                .is_none()
-            {
-                return Err(EngineError::Core(format!(
-                    "unsigned engine state missing mark for open asset {asset}"
-                )));
-            }
-        }
         self.ledger = state.ledger;
         self.strategy_targets_ready = true;
         self.target_ledger = state.target_ledger;
@@ -9244,6 +9239,7 @@ pub(crate) mod tests {
             .ingest(
                 accepted(
                     PublicPayload::SourceState(SourceStateResponse {
+                        block_number: None,
                         candidate_id,
                         account_value: Decimal::from(100),
                         source_time_ms: now,
@@ -9506,6 +9502,7 @@ pub(crate) mod tests {
                     received_at_mono: 1,
                     valid_until_mono: 80_001,
                     payload: PublicPayload::SourceState(SourceStateResponse {
+                        block_number: None,
                         candidate_id: candidate.clone(),
                         account_value: Decimal::from(1_000),
                         source_time_ms: 1,
@@ -9541,6 +9538,7 @@ pub(crate) mod tests {
                     received_at_mono: 4,
                     valid_until_mono: 80_004,
                     payload: PublicPayload::SourceState(SourceStateResponse {
+                        block_number: None,
                         candidate_id: candidate.clone(),
                         account_value: Decimal::from(1_000),
                         source_time_ms: 2,
@@ -9596,6 +9594,7 @@ pub(crate) mod tests {
                         received_at_mono: source_time_ms,
                         valid_until_mono: 80_000 + source_time_ms,
                         payload: PublicPayload::SourceState(SourceStateResponse {
+                            block_number: None,
                             candidate_id: wallet.clone(),
                             account_value: Decimal::from(1_000),
                             source_time_ms,
@@ -9676,6 +9675,7 @@ pub(crate) mod tests {
 
         let source = |candidate: String, account_value: Decimal, notional: Decimal, at| {
             SourceStateResponse {
+                block_number: None,
                 candidate_id: candidate,
                 account_value,
                 source_time_ms: at,
@@ -9818,6 +9818,7 @@ pub(crate) mod tests {
     #[test]
     fn zero_equity_source_is_valid_only_while_it_has_no_position() {
         let empty = SourceStateResponse {
+            block_number: None,
             candidate_id: "0x0000000000000000000000000000000000000001".into(),
             account_value: Decimal::ZERO,
             source_time_ms: 1,
@@ -9855,6 +9856,7 @@ pub(crate) mod tests {
             .ingest(
                 accepted(
                     PublicPayload::SourceState(SourceStateResponse {
+                        block_number: None,
                         candidate_id: candidate.clone(),
                         account_value: Decimal::from(1_000),
                         source_time_ms: 1_000,
@@ -9970,6 +9972,7 @@ pub(crate) mod tests {
                 .ingest(
                     accepted(
                         PublicPayload::SourceState(SourceStateResponse {
+                            block_number: None,
                             candidate_id: wallet.clone(),
                             account_value: Decimal::from(1_000),
                             source_time_ms: 2,
@@ -10044,6 +10047,7 @@ pub(crate) mod tests {
             .ingest(
                 accepted(
                     PublicPayload::SourceState(SourceStateResponse {
+                        block_number: None,
                         candidate_id: candidate.clone(),
                         account_value: Decimal::from(1_000),
                         source_time_ms: 1_000,
@@ -10431,6 +10435,7 @@ pub(crate) mod tests {
             .ingest(
                 accepted(
                     PublicPayload::SourceState(SourceStateResponse {
+                        block_number: None,
                         candidate_id: candidate.clone(),
                         account_value: Decimal::from(1_000),
                         source_time_ms: 10,
@@ -10580,6 +10585,7 @@ pub(crate) mod tests {
             .ingest(
                 accepted(
                     PublicPayload::SourceState(SourceStateResponse {
+                        block_number: None,
                         candidate_id: candidate.clone(),
                         account_value: Decimal::from(1_000),
                         source_time_ms: 10,
@@ -10853,8 +10859,7 @@ pub(crate) mod tests {
             let base_id = state.next_sample_id;
             for offset in 0..8_u64 {
                 let sample_id = base_id + offset;
-                let mut features =
-                    MfceFeatureVector::new([Decimal::ZERO; MFCE_FEATURE_COUNT]);
+                let mut features = MfceFeatureVector::new([Decimal::ZERO; MFCE_FEATURE_COUNT]);
                 let mut context = [Decimal::ZERO; 16];
                 context[11] = Decimal::ONE;
                 context[12] = Decimal::ONE;
@@ -11597,9 +11602,10 @@ pub(crate) mod tests {
     fn source_episode_migrates_to_flow_without_trade_and_survives_restart() {
         let now = 60_000;
         let (mut engine, mut fill) = live_fill_engine("BTC");
-        // The origin migration may expose a larger Flow target, but a denied
-        // marginal-size decision must not turn provenance migration into an
-        // exit or a new execution.
+        // Edge-only cold start: break-even upper (net=0, unc=0) admits
+        // Explore so the Flow migration may expose a larger target as a
+        // same-direction probe. It must never become an exit or reversal;
+        // provenance migration alone authorizes no opposite-side execution.
         fill.filled_quantity = Decimal::new(36, 2);
         // Frozen source opening attribution is a durable decision-time fact.
         let cloid = fill.identity.cloid.to_string();
@@ -11629,17 +11635,25 @@ pub(crate) mod tests {
             Some(AlphaOrigin::Flow)
         );
         let continuation = engine.mfce.delayed().samples.back().unwrap();
+        // Edge-only: break-even upper (net=0, unc=0) admits Explore so cold
+        // start can buy labels. The Flow target may exceed current, yielding
+        // Add kind; the sampled continuation still records zero actual_delta
+        // while any pending probe remains a same-direction risk increase.
         assert!(
             matches!(
                 continuation.kind,
-                DecisionKind::Hold | DecisionKind::Reduce | DecisionKind::BudgetConstrained
+                DecisionKind::Hold
+                    | DecisionKind::Reduce
+                    | DecisionKind::BudgetConstrained
+                    | DecisionKind::Add
             ),
             "unexpected continuation kind: {:?}",
             continuation.kind
         );
         assert_eq!(continuation.origin, AlphaOrigin::Flow);
         // Edge-only: negative upper edge Rejects (Hold) rather than Exploring
-        // at a loss. Old support gate would have given Explore here.
+        // at a loss; break-even upper Explores (Add/Hold with zero sampled
+        // delta). Old support gate would have given Explore here even at a loss.
         assert!(
             matches!(
                 continuation.mode,
@@ -11660,11 +11674,21 @@ pub(crate) mod tests {
             .as_ref()
             .and_then(|position| position.trajectory.as_ref())
             .is_some());
-        assert!(
-            engine.pending.is_empty(),
-            "a justification change is not an execution: {:?}",
-            engine.pending
-        );
+        // Break-even Explore may leave a same-direction probe pending; it
+        // must never be an exit, reversal, or reduce-only flattening.
+        if engine.pending.is_empty() {
+            // Reject/Hold path: no new execution on migration.
+        } else {
+            let pending = engine.pending.get("BTC").expect("BTC probe");
+            assert_eq!(pending.action.side, Side::Buy);
+            assert!(!pending.action.reduce_only);
+            assert!(matches!(
+                pending.mfce_lineage.policy_state,
+                Some(crate::mfce::MfcePolicyState::Explore)
+            ));
+            assert!(pending.mfce_lineage.admitted);
+            assert!(pending.mfce_lineage.risk_increase_authorized);
+        }
         assert_eq!(engine.executions.len(), execution_count);
         assert_eq!(
             engine.ledger.portfolio_position("BTC"),
@@ -11701,7 +11725,16 @@ pub(crate) mod tests {
             restarted.ledger.portfolio_position("BTC"),
             fill.filled_quantity
         );
-        assert!(restarted.pending.is_empty());
+        // Pending Explore probes are durable across restart; Reject/Hold
+        // leaves none. Either way the open episode and attribution survive.
+        if engine.pending.is_empty() {
+            assert!(restarted.pending.is_empty());
+        } else {
+            assert_eq!(restarted.pending.len(), engine.pending.len());
+            let probe = restarted.pending.get("BTC").expect("BTC probe");
+            assert_eq!(probe.action.side, Side::Buy);
+            assert!(!probe.action.reduce_only);
+        }
     }
 
     #[test]
@@ -11753,6 +11786,7 @@ pub(crate) mod tests {
                     .ingest(
                         accepted(
                             PublicPayload::SourceState(SourceStateResponse {
+                                block_number: None,
                                 candidate_id: wallet,
                                 account_value: Decimal::from(1000),
                                 source_time_ms: now,
@@ -12200,6 +12234,7 @@ pub(crate) mod tests {
             .ingest(
                 accepted(
                     PublicPayload::SourceState(SourceStateResponse {
+                        block_number: None,
                         candidate_id: candidate,
                         account_value: Decimal::from(1_000),
                         source_time_ms: 100_000,
@@ -12596,6 +12631,7 @@ pub(crate) mod tests {
             user_fee_state: None,
         };
         let source_state = |address: String, at: u64, notional: Decimal| SourceStateResponse {
+            block_number: None,
             candidate_id: address,
             account_value: Decimal::from(1_000),
             source_time_ms: at,
@@ -13865,6 +13901,7 @@ pub(crate) mod tests {
             .ingest(
                 accepted(
                     PublicPayload::SourceState(SourceStateResponse {
+                        block_number: None,
                         candidate_id: candidate,
                         account_value: Decimal::from(1_000),
                         source_time_ms: 1_000,
@@ -14186,6 +14223,7 @@ pub(crate) mod tests {
             .ingest(
                 accepted(
                     PublicPayload::SourceState(SourceStateResponse {
+                        block_number: None,
                         candidate_id: candidate,
                         account_value: Decimal::from(1_000),
                         source_time_ms: 1_000,
@@ -14336,6 +14374,7 @@ pub(crate) mod tests {
             .ingest(
                 accepted(
                     PublicPayload::SourceState(SourceStateResponse {
+                        block_number: None,
                         candidate_id: candidate,
                         account_value: Decimal::from(1_000),
                         source_time_ms: 1_000,
@@ -14628,6 +14667,44 @@ pub(crate) mod tests {
             restored_equity.deployment_equity,
             expected_deployment_equity.deployment_equity
         );
+    }
+
+    #[test]
+    fn unsigned_snapshot_restore_allows_open_episode_while_marks_rehydrate() {
+        let (mut engine, fill) = live_fill_engine("AERO");
+        engine.apply_live_execution_fill(&fill).unwrap();
+        assert_eq!(engine.ledger.portfolio_open_count(), 1);
+        engine.mids = None;
+        let path = std::env::temp_dir().join(format!(
+            "open-without-mark-{}-{}.msgpack",
+            std::process::id(),
+            engine.decision_sequence
+        ));
+        let identity = StateIdentity {
+            source_tree_sha256: "source".into(),
+            observer_binary_sha256: "observer".into(),
+            configuration_sha256: "configuration".into(),
+            risk_policy_sha256: "risk".into(),
+        };
+        engine.persist_unsigned_state(&path, &identity).unwrap();
+
+        let mut restored = DecisionEngine::new(
+            engine.config.clone(),
+            b"open-without-mark",
+            "restored-run",
+            40_000,
+            80_000,
+        )
+        .unwrap();
+        restored.restore_unsigned_state(&path, &identity).unwrap();
+        assert_eq!(
+            restored.ledger.portfolio_position("AERO"),
+            Decimal::new(25, 2)
+        );
+        assert!(matches!(
+            restored.record_equity_boundary(300_000),
+            Err(EngineError::Core(reason)) if reason == "MissingMarkPrice"
+        ));
     }
 
     #[test]

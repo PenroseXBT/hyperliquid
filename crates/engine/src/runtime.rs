@@ -1,5 +1,5 @@
 use crate::decision::{
-    DecisionEngine, EconomicAttribution, Hip3PipelineStatus, ProductionIntentIdentity,
+    DecisionEngine, EconomicAttribution, EngineError, Hip3PipelineStatus, ProductionIntentIdentity,
     StateIdentity, UnresolvedRootStatus,
 };
 use crate::domain::decision::{derive_config_hash, derive_risk_policy_hash};
@@ -232,6 +232,7 @@ struct ContinuousStatus<'a> {
     rest_weight_consumed_process: u64,
     rest_reserved_weight_consumed_process: u64,
     rate_limited_responses: u64,
+    equity_mark_prices_missing: bool,
     streaming: Option<StreamingRuntimeStatus>,
     unique_source_transitions: u64,
     modeled_executions_retained: usize,
@@ -584,6 +585,7 @@ pub async fn run_continuous_daemon(options: RuntimeOptions) -> Result<PathBuf, B
         .ok_or("bucket overflow")?;
     let mut checkpoint_due = 0;
     let mut counters = Counters::default();
+    let mut equity_mark_prices_missing = false;
     let mut tasks = JoinSet::new();
     let mut source_history_due = start;
     let mut source_history_wallet = 0usize;
@@ -593,8 +595,19 @@ pub async fn run_continuous_daemon(options: RuntimeOptions) -> Result<PathBuf, B
                 last / EQUITY_BUCKET_INTERVAL_MS == wall_ms / EQUITY_BUCKET_INTERVAL_MS
             });
         if !restored_inside_current_wall_bucket {
-            engine.record_equity_boundary(start)?;
-            persist_unsigned_state(&mut engine, &mut state_root)?;
+            match engine.record_equity_boundary(start) {
+                Ok(()) => {
+                    equity_mark_prices_missing = false;
+                    persist_unsigned_state(&mut engine, &mut state_root)?;
+                }
+                Err(error) if is_missing_mark_price(&error) => {
+                    equity_mark_prices_missing = true;
+                    println!(
+                        "equity_boundary_deferred=true reason=missing_mark_price nonfatal=true"
+                    );
+                }
+                Err(error) => return Err(error.into()),
+            }
         }
     }
     loop {
@@ -1299,11 +1312,23 @@ pub async fn run_continuous_daemon(options: RuntimeOptions) -> Result<PathBuf, B
             decision_due = now + 20_000;
         }
         if now >= profitability_bucket_due {
-            engine.record_equity_boundary(profitability_bucket_due)?;
-            persist_unsigned_state(&mut engine, &mut state_root)?;
-            profitability_bucket_due = profitability_bucket_due
-                .checked_add(EQUITY_BUCKET_INTERVAL_MS)
-                .ok_or("bucket deadline overflow")?;
+            match engine.record_equity_boundary(profitability_bucket_due) {
+                Ok(()) => {
+                    equity_mark_prices_missing = false;
+                    persist_unsigned_state(&mut engine, &mut state_root)?;
+                    profitability_bucket_due = profitability_bucket_due
+                        .checked_add(EQUITY_BUCKET_INTERVAL_MS)
+                        .ok_or("bucket deadline overflow")?;
+                }
+                Err(error) if is_missing_mark_price(&error) => {
+                    equity_mark_prices_missing = true;
+                    println!(
+                        "equity_boundary_deferred=true reason=missing_mark_price nonfatal=true"
+                    );
+                    profitability_bucket_due = now.saturating_add(10_000);
+                }
+                Err(error) => return Err(error.into()),
+            }
         }
         if now >= checkpoint_due {
             let h = scheduler.health();
@@ -1325,6 +1350,7 @@ pub async fn run_continuous_daemon(options: RuntimeOptions) -> Result<PathBuf, B
                     &counters,
                     &h,
                     t.rate_limited.load(Ordering::SeqCst),
+                    equity_mark_prices_missing,
                     streaming_runtime_status(
                         streaming.as_ref(),
                         streaming_sources.as_ref(),
@@ -1402,6 +1428,7 @@ pub async fn run_continuous_daemon(options: RuntimeOptions) -> Result<PathBuf, B
             &counters,
             &health,
             transport.metrics().rate_limited.load(Ordering::SeqCst),
+            equity_mark_prices_missing,
             streaming_runtime_status(
                 streaming.as_ref(),
                 streaming_sources.as_ref(),
@@ -1437,6 +1464,7 @@ fn write_continuous_status(
     counters: &Counters,
     scheduler: &SchedulerHealth,
     rate_limited_responses: u64,
+    equity_mark_prices_missing: bool,
     streaming: Option<StreamingRuntimeStatus>,
     hip3_source_activity: Option<crate::source_state::Hip3SourceActivity>,
 ) -> Result<(), Box<dyn Error>> {
@@ -1482,6 +1510,9 @@ fn write_continuous_status(
             "source_persistence_failures={}",
             counters.source_persistence_failures
         ));
+    }
+    if equity_mark_prices_missing {
+        degraded_reasons.push("financial_mark_prices_missing".to_string());
     }
     let elapsed_seconds = now.saturating_sub(start) / 1_000;
     let status = ContinuousStatus {
@@ -1534,6 +1565,7 @@ fn write_continuous_status(
         mfce_policy_reject: mfce.decision_counts.reject,
         source_risk_increases_allocated: mfce.decision_counts.allocated,
         source_risk_increases_rejected_by_mfce: mfce.decision_counts.reject,
+        equity_mark_prices_missing,
         hip3: engine.hip3_pipeline_status(hip3_source_activity.as_ref()),
         marked_equity: deployment_equity.current_equity,
         settled_equity: deployment_equity.settled_equity,
@@ -1561,6 +1593,10 @@ fn write_continuous_status(
     std::fs::write(&journal_temporary, journal_bytes)?;
     std::fs::rename(journal_temporary, journal_path)?;
     Ok(())
+}
+
+fn is_missing_mark_price(error: &EngineError) -> bool {
+    matches!(error, EngineError::Core(reason) if reason == "MissingMarkPrice")
 }
 fn streaming_runtime_status(
     stream: Option<&StreamingHandle>,
@@ -1819,6 +1855,22 @@ fn runtime_economic_status(
     })
 }
 #[cfg(test)]
+mod runtime_error_tests {
+    use super::*;
+
+    #[test]
+    fn missing_mark_price_is_the_only_nonfatal_equity_boundary_gap() {
+        assert!(is_missing_mark_price(&EngineError::Core(
+            "MissingMarkPrice".into()
+        )));
+        assert!(!is_missing_mark_price(&EngineError::Core(
+            "PositionDivergence".into()
+        )));
+        assert!(!is_missing_mark_price(&EngineError::Arithmetic));
+    }
+}
+
+#[cfg(test)]
 fn manifest_stage_matches(production_enabled: bool, stage: &str) -> bool {
     if production_enabled {
         stage == "PRODUCTION_RELEASE"
@@ -2057,8 +2109,8 @@ fn streaming_source_dispatch_plan(
         .get(&ReadRequestKind::ExpandedSourceState)
         .copied()
         .ok_or("expanded source-state endpoint weight missing")?;
-    if expanded_weight < 42 {
-        return Err("streaming reconciliation must reserve 42 REST weight per wallet".into());
+    if expanded_weight != 2 {
+        return Err("streaming source reads require the Multicall scheduling weight of 2".into());
     }
     let source_call_capacity_per_window =
         u64::from(scheduler.api.source_polling_weight_per_window / expanded_weight);
@@ -3600,9 +3652,9 @@ mod tests {
         );
         assert_eq!(
             scheduler.api.endpoint_weights[&ReadRequestKind::ExpandedSourceState],
-            42
+            2
         );
-        assert_eq!(plan.source_call_capacity_per_window, 16);
+        assert_eq!(plan.source_call_capacity_per_window, 350);
         assert_eq!(plan.active_candidate_count, 0);
         assert_eq!(plan.inactive_candidate_count, 375);
         let minimum_sweep_ms = 375_u64

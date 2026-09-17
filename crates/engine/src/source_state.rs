@@ -9,7 +9,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 use std::str::FromStr;
 
-const SCHEMA_VERSION: i64 = 1;
+const SCHEMA_VERSION: i64 = 2;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -107,6 +107,10 @@ pub struct Hip3SourceMarketActivity {
 pub struct SourceStateStore {
     connection: Connection,
     process_generation: i64,
+    wallets: BTreeSet<String>,
+    scan_pending: BTreeMap<String, (SourceStateResponse, bool, bool)>,
+    pub scan_commits: u64,
+    pub last_scan_commit_ms: u128,
 }
 
 impl SourceStateStore {
@@ -148,7 +152,7 @@ impl SourceStateStore {
         transaction
             .execute("UPDATE source_wallet SET enabled = 0", [])
             .map_err(|error| format!("disable prior source cohort: {error}"))?;
-        for wallet in wallets {
+        for wallet in &wallets {
             transaction
                 .execute(
                     "INSERT INTO source_wallet (
@@ -183,6 +187,10 @@ impl SourceStateStore {
         Ok(Self {
             connection,
             process_generation,
+            wallets,
+            scan_pending: BTreeMap::new(),
+            scan_commits: 0,
+            last_scan_commit_ms: 0,
         })
     }
 
@@ -195,7 +203,7 @@ impl SourceStateStore {
             .connection
             .prepare(
                 "SELECT w.wallet_address, w.account_value, w.last_exchange_time_ms,
-                        w.state_hash
+                        w.state_hash, w.block_number
                  FROM source_wallet w
                  JOIN source_recovery r USING(wallet_address)
                  WHERE w.enabled = 1 AND r.durable_baseline = 1
@@ -209,6 +217,7 @@ impl SourceStateStore {
                     row.get::<_, String>(1)?,
                     row.get::<_, i64>(2)?,
                     row.get::<_, Vec<u8>>(3)?,
+                    row.get::<_, Option<i64>>(4)?,
                 ))
             })
             .map_err(|error| format!("query source baselines: {error}"))?
@@ -217,7 +226,7 @@ impl SourceStateStore {
         drop(statement);
 
         let mut restored = Vec::with_capacity(rows.len());
-        for (wallet, account_value, source_time_ms, expected_hash) in rows {
+        for (wallet, account_value, source_time_ms, expected_hash, block_number) in rows {
             let source_time_ms = decode_u64(source_time_ms, "source exchange time")?;
             let mut positions = BTreeMap::new();
             let mut position_statement = self
@@ -251,6 +260,9 @@ impl SourceStateStore {
                 positions.insert(coin, position);
             }
             let state = SourceStateResponse {
+                block_number: block_number
+                    .map(|b| decode_u64(b, "snapshot block"))
+                    .transpose()?,
                 candidate_id: wallet,
                 account_value: parse_decimal(&account_value)?,
                 source_time_ms,
@@ -268,90 +280,67 @@ impl SourceStateStore {
         Ok(restored)
     }
 
+    /// Trade updates and cohort commits share this connection; no second writer task.
     pub fn persist(
         &mut self,
         state: &SourceStateResponse,
         live_confirmed: bool,
         stream_gap: bool,
     ) -> Result<(), String> {
-        let mut canonical = state.clone();
-        canonical.candidate_id = canonical.candidate_id.to_ascii_lowercase();
-        canonical.closed_candles.clear();
-        let state_hash = state_hash(&canonical)?;
-        let source_time_ms = encode_u64(canonical.source_time_ms, "source exchange time")?;
-        let transaction = self
-            .connection
-            .transaction()
-            .map_err(|error| format!("begin source-state commit: {error}"))?;
-        let updated = transaction
-            .execute(
-                "UPDATE source_wallet SET
-                     account_value = ?2,
-                     last_exchange_time_ms = ?3,
-                     last_stream_time_ms = MAX(COALESCE(last_stream_time_ms, 0), ?3),
-                     baseline_generation = baseline_generation + 1,
-                     state_hash = ?4
-                 WHERE wallet_address = ?1 AND enabled = 1",
-                params![
-                    canonical.candidate_id,
-                    canonical.account_value.to_string(),
-                    source_time_ms,
-                    state_hash.as_slice(),
-                ],
-            )
-            .map_err(|error| format!("update durable source wallet: {error}"))?;
-        if updated != 1 {
-            return Err(format!(
-                "durable source wallet is not in the enabled cohort: {}",
-                canonical.candidate_id
-            ));
+        let tx = self.connection.transaction().map_err(|e| e.to_string())?;
+        write_source_state(
+            &tx,
+            self.process_generation,
+            state,
+            live_confirmed,
+            stream_gap,
+        )?;
+        tx.commit().map_err(|e| e.to_string())?;
+        if let Some(staged) = self
+            .scan_pending
+            .get_mut(&state.candidate_id.to_ascii_lowercase())
+        {
+            if state.source_time_ms >= staged.0.source_time_ms {
+                *staged = (state.clone(), live_confirmed, stream_gap);
+            }
         }
-        transaction
-            .execute(
-                "DELETE FROM source_position WHERE wallet_address = ?1",
-                [&canonical.candidate_id],
-            )
-            .map_err(|error| format!("replace durable source positions: {error}"))?;
-        for (coin, position) in &canonical.positions {
-            transaction
-                .execute(
-                    "INSERT INTO source_position (
-                         wallet_address, coin, signed_size, signed_notional,
-                         entry_price, unrealized_pnl, updated_at_ms
-                     ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-                    params![
-                        canonical.candidate_id,
-                        coin,
-                        position.signed_size.to_string(),
-                        position.signed_notional.to_string(),
-                        position.entry_price.map(|value| value.to_string()),
-                        position.unrealized_pnl.map(|value| value.to_string()),
-                        source_time_ms,
-                    ],
-                )
-                .map_err(|error| format!("write durable source position: {error}"))?;
+        Ok(())
+    }
+
+    /// Stage network results without holding a SQLite transaction open. Once
+    /// every enabled wallet is present, commit the entire cohort atomically.
+    /// Intervening trade writes replace staged states, preventing regression.
+    pub fn stage_scan(
+        &mut self,
+        state: &SourceStateResponse,
+        live_confirmed: bool,
+        stream_gap: bool,
+    ) -> Result<(), String> {
+        let wallet = state.candidate_id.to_ascii_lowercase();
+        if !self.wallets.contains(&wallet) {
+            return Err("scan wallet is not enabled".into());
         }
-        transaction
-            .execute(
-                "UPDATE source_recovery SET
-                     durable_baseline = 1,
-                     live_confirmed = ?2,
-                     stream_gap = ?3,
-                     process_generation = ?4,
-                     confirmed_at_ms = CASE WHEN ?2 = 1 THEN ?5 ELSE NULL END
-                 WHERE wallet_address = ?1",
-                params![
-                    canonical.candidate_id,
-                    i64::from(live_confirmed),
-                    i64::from(stream_gap),
-                    self.process_generation,
-                    source_time_ms,
-                ],
-            )
-            .map_err(|error| format!("update source recovery state: {error}"))?;
-        transaction
-            .commit()
-            .map_err(|error| format!("commit durable source state: {error}"))
+        self.scan_pending
+            .insert(wallet, (state.clone(), live_confirmed, stream_gap));
+        if self.scan_pending.len() != self.wallets.len() {
+            return Ok(());
+        }
+        let started = std::time::Instant::now();
+        let tx = self.connection.transaction().map_err(|e| e.to_string())?;
+        for (state, confirmed, gap) in self.scan_pending.values() {
+            write_source_state(&tx, self.process_generation, state, *confirmed, *gap)?;
+        }
+        tx.commit().map_err(|e| e.to_string())?;
+        self.scan_commits += 1;
+        self.last_scan_commit_ms = started.elapsed().as_millis();
+        eprintln!(
+            "event=source_scan_committed wallets={} elapsed_ms={} generation={}",
+            self.scan_pending.len(),
+            self.last_scan_commit_ms,
+            self.scan_commits
+        );
+        self.scan_pending.clear();
+        Ok(())
     }
 
     /// Establishes the first provable boundary for a newly tracked wallet.
@@ -423,6 +412,7 @@ impl SourceStateStore {
     }
 
     pub fn mark_stream_gap(&mut self) -> Result<(), String> {
+        self.scan_pending.clear();
         self.connection
             .execute(
                 "UPDATE source_recovery SET
@@ -549,6 +539,144 @@ impl SourceStateStore {
     }
 }
 
+fn write_source_state(
+    transaction: &Transaction<'_>,
+    process_generation: i64,
+    state: &SourceStateResponse,
+    live_confirmed: bool,
+    stream_gap: bool,
+) -> Result<(), String> {
+    let mut canonical = state.clone();
+    canonical.candidate_id = canonical.candidate_id.to_ascii_lowercase();
+    canonical.closed_candles.clear();
+    let state_hash = state_hash(&canonical)?;
+    let source_time_ms = encode_u64(canonical.source_time_ms, "source exchange time")?;
+    let incoming_block_number = canonical
+        .block_number
+        .map(|block| encode_u64(block, "snapshot block"))
+        .transpose()?;
+    let updated = transaction
+        .execute(
+            "UPDATE source_wallet SET
+                     account_value = ?2,
+                     last_exchange_time_ms = ?3,
+                     last_stream_time_ms = MAX(COALESCE(last_stream_time_ms, 0), ?3),
+                     baseline_generation = baseline_generation + 1,
+                     state_hash = ?4, block_number = ?5
+                 WHERE wallet_address = ?1 AND enabled = 1
+                   AND (last_exchange_time_ms IS NULL OR last_exchange_time_ms <= ?3)
+                   AND (block_number IS NULL OR (?5 IS NOT NULL AND block_number <= ?5))",
+            params![
+                canonical.candidate_id,
+                canonical.account_value.to_string(),
+                source_time_ms,
+                state_hash.as_slice(),
+                incoming_block_number,
+            ],
+        )
+        .map_err(|error| format!("update durable source wallet: {error}"))?;
+    if updated != 1 {
+        let current = transaction
+            .query_row(
+                "SELECT enabled, last_exchange_time_ms, block_number
+                     FROM source_wallet WHERE wallet_address = ?1",
+                params![canonical.candidate_id],
+                |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, Option<i64>>(1)?,
+                        row.get::<_, Option<i64>>(2)?,
+                    ))
+                },
+            )
+            .optional()
+            .map_err(|error| format!("read durable source wallet ordering: {error}"))?;
+        let Some((enabled, last_exchange_time_ms, stored_block_number)) = current else {
+            return Err(format!(
+                "source wallet is not configured: {}",
+                canonical.candidate_id
+            ));
+        };
+        if enabled != 1 {
+            return Err(format!(
+                "source wallet is disabled: {}",
+                canonical.candidate_id
+            ));
+        }
+        let timestamp_regressed =
+            last_exchange_time_ms.is_some_and(|stored| stored > source_time_ms);
+        let block_regressed = match (stored_block_number, incoming_block_number) {
+            (Some(_), None) => true,
+            (Some(stored), Some(incoming)) => stored > incoming,
+            _ => false,
+        };
+        if timestamp_regressed || block_regressed {
+            return Ok(());
+        }
+        return Err(format!(
+            "source wallet ordering update was not applied: {}",
+            canonical.candidate_id
+        ));
+    }
+    transaction
+        .execute(
+            "DELETE FROM source_position WHERE wallet_address = ?1
+                 AND coin NOT IN (SELECT value FROM json_each(?2))",
+            params![
+                canonical.candidate_id,
+                serde_json::to_string(&canonical.positions.keys().collect::<Vec<_>>())
+                    .map_err(|e| e.to_string())?
+            ],
+        )
+        .map_err(|error| format!("replace durable source positions: {error}"))?;
+    for (coin, position) in &canonical.positions {
+        transaction
+            .execute(
+                "INSERT INTO source_position (
+                         wallet_address, coin, signed_size, signed_notional,
+                         entry_price, unrealized_pnl, updated_at_ms
+                     ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+                     ON CONFLICT(wallet_address,coin) DO UPDATE SET
+                         signed_size=excluded.signed_size, signed_notional=excluded.signed_notional,
+                         entry_price=excluded.entry_price, unrealized_pnl=excluded.unrealized_pnl,
+                         updated_at_ms=excluded.updated_at_ms
+                     WHERE source_position.signed_size IS NOT excluded.signed_size
+                        OR source_position.signed_notional IS NOT excluded.signed_notional
+                        OR source_position.entry_price IS NOT excluded.entry_price
+                        OR source_position.unrealized_pnl IS NOT excluded.unrealized_pnl",
+                params![
+                    canonical.candidate_id,
+                    coin,
+                    position.signed_size.to_string(),
+                    position.signed_notional.to_string(),
+                    position.entry_price.map(|value| value.to_string()),
+                    position.unrealized_pnl.map(|value| value.to_string()),
+                    source_time_ms,
+                ],
+            )
+            .map_err(|error| format!("write durable source position: {error}"))?;
+    }
+    transaction
+        .execute(
+            "UPDATE source_recovery SET
+                     durable_baseline = 1,
+                     live_confirmed = ?2,
+                     stream_gap = ?3,
+                     process_generation = ?4,
+                     confirmed_at_ms = CASE WHEN ?2 = 1 THEN ?5 ELSE NULL END
+                 WHERE wallet_address = ?1",
+            params![
+                canonical.candidate_id,
+                i64::from(live_confirmed),
+                i64::from(stream_gap),
+                process_generation,
+                source_time_ms,
+            ],
+        )
+        .map_err(|error| format!("update source recovery state: {error}"))?;
+    Ok(())
+}
+
 /// Summary of a validated one-time SQLite backfill import.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SourceBackfillSummary {
@@ -562,7 +690,7 @@ pub struct SourceBackfillSummary {
 ///
 /// `SkippedDestinationExists` is the idempotent steady state: the destination
 /// already exists, so every restart keeps using its own durable data and never
-/// re-copies the old root (which would wipe fills accrued since the import).
+/// re-copies the old root, which would wipe fills accrued since the import.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SourceBackfillOutcome {
     Imported(SourceBackfillSummary),
@@ -631,12 +759,6 @@ fn dest_sidecar_exists(dest: &Path) -> Result<bool, String> {
 /// schema version and every durable baseline checksum; on validation failure
 /// the partial destination is removed and an error is returned so the caller
 /// fails closed instead of starting with zero baselines silently.
-///
-/// Idempotency: if any destination file (`sqlite`, `-wal`, `-shm`,
-/// `-journal`) already exists, no copy is performed and
-/// `SkippedDestinationExists` is returned. Re-importing on every restart
-/// would wipe fills accrued since the migration. To re-import, stop the
-/// service, wipe the destination root, then restart with the flag set.
 pub fn import_source_backfill(
     dest: impl AsRef<Path>,
     src: impl AsRef<Path>,
@@ -665,8 +787,6 @@ pub fn import_source_backfill(
         ));
     }
 
-    // Open the source with a normal connection so WAL content is visible.
-    // VACUUM INTO only reads the source; it never bumps its generation.
     let src_connection =
         Connection::open(src).map_err(|error| format!("open source backfill file: {error}"))?;
     src_connection
@@ -691,9 +811,6 @@ pub fn import_source_backfill(
         .map_err(|error| format!("copy source backfill snapshot: {error}"))?;
     drop(src_connection);
 
-    // Validate the copied snapshot before the caller opens it for writing:
-    // every durable baseline checksum must verify, regardless of which cohort
-    // is currently enabled. Cohort re-enablement happens in `open()`.
     let validation = (|| -> Result<SourceBackfillSummary, String> {
         let connection = Connection::open_with_flags(dest, OpenFlags::SQLITE_OPEN_READ_ONLY)
             .map_err(|error| format!("open copied source backfill: {error}"))?;
@@ -724,7 +841,7 @@ pub fn import_source_backfill(
             .map_err(|error| format!("count copied source fills: {error}"))?;
         let mut baseline_statement = connection
             .prepare(
-                "SELECT w.wallet_address, w.account_value, w.last_exchange_time_ms, w.state_hash
+                "SELECT w.wallet_address, w.account_value, w.last_exchange_time_ms, w.state_hash, w.block_number
                  FROM source_wallet w
                  JOIN source_recovery r USING(wallet_address)
                  WHERE r.durable_baseline = 1
@@ -738,13 +855,14 @@ pub fn import_source_backfill(
                     row.get::<_, String>(1)?,
                     row.get::<_, i64>(2)?,
                     row.get::<_, Vec<u8>>(3)?,
+                    row.get::<_, Option<i64>>(4)?,
                 ))
             })
             .map_err(|error| format!("query copied baselines: {error}"))?
             .collect::<Result<Vec<_>, _>>()
             .map_err(|error| format!("read copied baselines: {error}"))?;
         drop(baseline_statement);
-        for (wallet, account_value, source_time_ms, expected_hash) in &baseline_rows {
+        for (wallet, account_value, source_time_ms, expected_hash, block_number) in &baseline_rows {
             let source_time_ms = decode_u64(*source_time_ms, "source exchange time")?;
             let mut positions = BTreeMap::new();
             let mut position_statement = connection
@@ -779,6 +897,9 @@ pub fn import_source_backfill(
                 );
             }
             let state = SourceStateResponse {
+                block_number: block_number
+                    .map(|block| decode_u64(block, "snapshot block"))
+                    .transpose()?,
                 candidate_id: wallet.clone(),
                 account_value: parse_decimal(account_value)?,
                 source_time_ms,
@@ -910,13 +1031,17 @@ fn initialize_schema(transaction: &Transaction<'_>) -> Result<(), String> {
 ",
         )
         .map_err(|error| format!("initialize source-state schema: {error}"))?;
-    let version = transaction
+    let mut version = transaction
         .query_row(
             "SELECT schema_version FROM source_meta WHERE singleton = 1",
             [],
             |row| row.get::<_, i64>(0),
         )
         .map_err(|error| format!("read source-state schema version: {error}"))?;
+    if version == 1 {
+        transaction.execute_batch("ALTER TABLE source_wallet ADD COLUMN block_number INTEGER; UPDATE source_meta SET schema_version=2 WHERE singleton=1;").map_err(|e|e.to_string())?;
+        version = 2;
+    }
     if version != SCHEMA_VERSION {
         return Err(format!(
             "source-state schema mismatch: expected {SCHEMA_VERSION}, found {version}"
@@ -952,7 +1077,13 @@ fn state_hash(state: &SourceStateResponse) -> Result<[u8; 32], String> {
 }
 
 fn parse_decimal(value: &str) -> Result<Decimal, String> {
-    Decimal::from_str(value).map_err(|error| format!("invalid durable source decimal: {error}"))
+    let mut parsed = Decimal::from_str(value)
+        .map_err(|error| format!("invalid durable source decimal: {error}"))?;
+    // Decimal parsing drops the sign of zero; preserve the exact durable hash.
+    if parsed.is_zero() && value.starts_with('-') {
+        parsed.set_sign_negative(true);
+    }
+    Ok(parsed)
 }
 
 fn encode_u64(value: u64, field: &str) -> Result<i64, String> {
@@ -1308,6 +1439,7 @@ mod tests {
         let path = root.path().join("source-state.sqlite");
         let wallet = wallet('3');
         let expected = SourceStateResponse {
+            block_number: None,
             candidate_id: wallet.clone(),
             account_value: Decimal::from_str("123456789012345.1234567890123").unwrap(),
             source_time_ms: 1_725_123_456_789,
@@ -1465,6 +1597,158 @@ mod tests {
     }
 
     #[test]
+    fn cohort_commit_is_atomic_and_preserves_intervening_trades() {
+        let root = tempfile::tempdir().unwrap();
+        let wallets: Vec<_> = (0..375).map(|i| format!("0x{i:040x}")).collect();
+        let mut store =
+            SourceStateStore::open(root.path().join("source.sqlite"), "test", wallets.clone())
+                .unwrap();
+        for wallet in &wallets[..374] {
+            store
+                .stage_scan(&state(wallet.clone(), 100), true, false)
+                .unwrap();
+        }
+        assert_eq!(store.scan_commits, 0);
+        assert!(store.load_baselines().unwrap().is_empty());
+        let mut trade = state(wallets[0].clone(), 200);
+        trade.positions.get_mut("BTC").unwrap().signed_size = Decimal::ONE;
+        store.persist(&trade, true, false).unwrap();
+        // A failure at the last wallet must roll back the other 374 scan writes.
+        store.connection.execute_batch(&format!(
+            "CREATE TRIGGER reject_last BEFORE UPDATE ON source_wallet WHEN NEW.wallet_address='{}' BEGIN SELECT RAISE(ABORT,'injected scan failure'); END;",wallets[374]
+        )).unwrap();
+        let last = state(wallets[374].clone(), 100);
+        assert!(store
+            .stage_scan(&last, true, false)
+            .unwrap_err()
+            .contains("injected scan failure"));
+        assert_eq!(store.load_baselines().unwrap(), vec![trade.clone()]);
+        assert_eq!(store.scan_commits, 0);
+        store
+            .connection
+            .execute_batch("DROP TRIGGER reject_last")
+            .unwrap();
+        store.stage_scan(&last, true, false).unwrap();
+        let restored = store.load_baselines().unwrap();
+        assert_eq!(restored.len(), 375);
+        assert_eq!(restored[0], trade);
+        assert_eq!(store.scan_commits, 1);
+        assert_eq!(store.continuity_status().unwrap().live_state_confirmed, 375);
+        let rows: (i64, i64, i64) = store
+            .connection
+            .query_row(
+                "SELECT COUNT(*),MIN(updated_at_ms),MAX(updated_at_ms) FROM source_position",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(rows, (375, 100, 200));
+        store
+            .stage_scan(&state(wallets[0].clone(), 300), true, false)
+            .unwrap();
+        store.mark_stream_gap().unwrap();
+        assert!(store.scan_pending.is_empty());
+    }
+
+    #[test]
+    fn cohort_commit_waits_for_competing_writer_without_blocking_wal_reader() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("source.sqlite");
+        let wallets: Vec<_> = (0..375).map(|i| format!("0x{i:040x}")).collect();
+        let mut store = SourceStateStore::open(&path, "test", wallets.clone()).unwrap();
+        let timeout: i64 = store
+            .connection
+            .query_row("PRAGMA busy_timeout", [], |r| r.get(0))
+            .unwrap();
+        let mode: String = store
+            .connection
+            .query_row("PRAGMA journal_mode", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!((timeout, mode.as_str()), (5000, "wal"));
+        for wallet in &wallets[..374] {
+            store
+                .stage_scan(&state(wallet.clone(), 100), true, false)
+                .unwrap();
+        }
+        let contender = Connection::open(&path).unwrap();
+        contender
+            .execute_batch(
+                "BEGIN IMMEDIATE; UPDATE source_meta SET process_generation=process_generation;",
+            )
+            .unwrap();
+        // This is a genuinely separate connection holding SQLite's write lock.
+        let reader = Connection::open(&path).unwrap();
+        let count: i64 = reader
+            .query_row("SELECT COUNT(*) FROM source_wallet", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(count, 375);
+        let release = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(150));
+            contender.execute_batch("COMMIT").unwrap();
+        });
+        let started = std::time::Instant::now();
+        store
+            .stage_scan(&state(wallets[374].clone(), 100), true, false)
+            .unwrap();
+        release.join().unwrap();
+        assert!(started.elapsed() >= std::time::Duration::from_millis(100));
+        assert!(started.elapsed() < std::time::Duration::from_secs(5));
+        assert_eq!(store.scan_commits, 1);
+        assert_eq!(store.load_baselines().unwrap().len(), 375);
+    }
+
+    #[test]
+    fn unchanged_position_rows_are_not_rewritten_and_closures_remove_rows() {
+        for scale in 0..=28 {
+            for negative in [false, true] {
+                let mut value = Decimal::new(0, scale);
+                value.set_sign_negative(negative);
+                let wire = value.to_string();
+                assert_eq!(parse_decimal(&wire).unwrap().to_string(), wire);
+            }
+        }
+        let root = tempfile::tempdir().unwrap();
+        let wallet = wallet('a');
+        let mut store =
+            SourceStateStore::open(root.path().join("source.sqlite"), "test", [wallet.clone()])
+                .unwrap();
+        let mut snapshot = state(wallet, 100);
+        snapshot.block_number = Some(10);
+        snapshot.positions.get_mut("BTC").unwrap().unrealized_pnl = Some(-Decimal::new(0, 6));
+        store.persist(&snapshot, true, false).unwrap();
+        assert!(!snapshot.positions.is_empty());
+        snapshot.source_time_ms = 200;
+        snapshot.block_number = Some(11);
+        store.persist(&snapshot, true, false).unwrap();
+        for (time, block) in [(199, 12), (201, 9)] {
+            let mut stale = snapshot.clone();
+            stale.source_time_ms = time;
+            stale.block_number = Some(block);
+            store.persist(&stale, true, false).unwrap();
+        }
+        let mut missing_block = snapshot.clone();
+        missing_block.source_time_ms = 201;
+        missing_block.block_number = None;
+        store.persist(&missing_block, true, false).unwrap();
+        assert_eq!(store.load_baselines().unwrap()[0], snapshot);
+        let updated: i64 = store
+            .connection
+            .query_row("SELECT MAX(updated_at_ms) FROM source_position", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(updated, 100);
+        assert_eq!(store.load_baselines().unwrap()[0].source_time_ms, 200);
+        snapshot.positions.clear();
+        store.persist(&snapshot, true, false).unwrap();
+        let count: i64 = store
+            .connection
+            .query_row("SELECT COUNT(*) FROM source_position", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(count, 0);
+    }
+
+    #[test]
     fn source_sql_transaction_rolls_back_and_schema_cannot_become_accounting_authority() {
         let root = tempfile::tempdir().unwrap();
         let wallet = wallet('5');
@@ -1542,6 +1826,7 @@ mod tests {
 
     fn state(wallet: String, source_time_ms: u64) -> SourceStateResponse {
         SourceStateResponse {
+            block_number: None,
             candidate_id: wallet,
             account_value: Decimal::from(100),
             source_time_ms,
@@ -1589,6 +1874,8 @@ mod tests {
         store
             .persist(&state(first.clone(), 1234), true, false)
             .unwrap();
+        // Reopening a v1 database must preserve its old canonical state hashes.
+        store.connection.execute_batch("ALTER TABLE source_wallet DROP COLUMN block_number; UPDATE source_meta SET schema_version=1").unwrap();
         drop(store);
 
         let store = SourceStateStore::open(&path, "375", [first.clone(), second]).unwrap();
@@ -1627,144 +1914,5 @@ mod tests {
             .contains("checksum mismatch"));
         drop(store);
         std::fs::remove_dir_all(root).unwrap();
-    }
-
-    #[test]
-    fn backfill_imports_fresh_root_then_skips_on_every_restart() {
-        let old_root = tempfile::tempdir().unwrap();
-        let old_path = old_root.path().join("source-state.sqlite");
-        let first = wallet('a');
-        let second = wallet('b');
-        let mut old =
-            SourceStateStore::open(&old_path, "2-wallet", [first.clone(), second.clone()]).unwrap();
-        old.persist(&state(first.clone(), 1000), true, false)
-            .unwrap();
-        old.persist_history(
-            &page(&first, 100, 200, serde_json::json!([fill(150, 7, "B")])),
-            201,
-        )
-        .unwrap();
-        let expected_baselines = old.load_baselines().unwrap();
-        assert_eq!(expected_baselines.len(), 1);
-        let expected_history: String = old
-            .connection
-            .query_row(
-                "SELECT group_concat(wallet_address||':'||COALESCE(last_fill_time_ms,0)||':'||COALESCE(contiguous_through_ms,0)||':'||history_state,'|') FROM (SELECT * FROM source_history_cursor ORDER BY wallet_address)",
-                [],
-                |row| row.get(0),
-            )
-            .unwrap();
-        drop(old);
-
-        let new_root = tempfile::tempdir().unwrap();
-        let new_path = new_root.path().join("nested").join("source-state.sqlite");
-        match import_source_backfill(&new_path, &old_path).unwrap() {
-            SourceBackfillOutcome::Imported(summary) => {
-                assert_eq!(summary.durable_baselines, 1);
-                assert_eq!(summary.fill_events, 1);
-                assert_eq!(summary.wallets, 2);
-            }
-            SourceBackfillOutcome::SkippedDestinationExists => {
-                panic!("fresh destination must be imported, not skipped")
-            }
-        }
-
-        // Normal open after import bumps the generation, re-enables the cohort,
-        // preserves fills/history, and resets live confirmation (recovery barrier).
-        let store =
-            SourceStateStore::open(&new_path, "2-wallet", [first.clone(), second.clone()]).unwrap();
-        assert_eq!(store.process_generation(), 2);
-        assert_eq!(store.load_baselines().unwrap(), expected_baselines);
-        let history_after: String = store
-            .connection
-            .query_row(
-                "SELECT group_concat(wallet_address||':'||COALESCE(last_fill_time_ms,0)||':'||COALESCE(contiguous_through_ms,0)||':'||history_state,'|') FROM (SELECT * FROM source_history_cursor ORDER BY wallet_address)",
-                [],
-                |row| row.get(0),
-            )
-            .unwrap();
-        assert_eq!(history_after, expected_history);
-        let live_confirmed: i64 = store
-            .connection
-            .query_row(
-                "SELECT live_confirmed FROM source_recovery WHERE durable_baseline = 1",
-                [],
-                |row| row.get(0),
-            )
-            .unwrap();
-        assert_eq!(live_confirmed, 0);
-        drop(store);
-
-        // Every later restart with the flag still set must keep the destination
-        // file and never re-copy (which would wipe fills accrued since import).
-        assert_eq!(
-            import_source_backfill(&new_path, &old_path).unwrap(),
-            SourceBackfillOutcome::SkippedDestinationExists
-        );
-        let store =
-            SourceStateStore::open(&new_path, "2-wallet", [first.clone(), second.clone()]).unwrap();
-        assert_eq!(store.load_baselines().unwrap(), expected_baselines);
-    }
-
-    #[test]
-    fn backfill_rejects_corrupt_snapshot_and_removes_partial_copy() {
-        let old_root = tempfile::tempdir().unwrap();
-        let old_path = old_root.path().join("source-state.sqlite");
-        let first = wallet('c');
-        let mut old = SourceStateStore::open(&old_path, "test", [first.clone()]).unwrap();
-        old.persist(&state(first, 100), true, false).unwrap();
-        old.connection
-            .execute("UPDATE source_wallet SET state_hash = X'00'", [])
-            .unwrap();
-        drop(old);
-
-        let new_root = tempfile::tempdir().unwrap();
-        let new_path = new_root.path().join("source-state.sqlite");
-        assert!(import_source_backfill(&new_path, &old_path)
-            .unwrap_err()
-            .contains("checksum mismatch"));
-        assert!(!new_path.exists());
-    }
-
-    #[test]
-    fn backfill_rejects_missing_source_and_existing_destination() {
-        let root = tempfile::tempdir().unwrap();
-        let missing = root.path().join("missing.sqlite");
-        let dest = root.path().join("dest.sqlite");
-        assert!(import_source_backfill(&dest, &missing).is_err());
-        std::fs::write(&dest, b"existing").unwrap();
-        let src = root.path().join("src.sqlite");
-        let wallet = wallet('d');
-        let store = SourceStateStore::open(&src, "test", [wallet]).unwrap();
-        drop(store);
-        assert_eq!(
-            import_source_backfill(&dest, &src).unwrap(),
-            SourceBackfillOutcome::SkippedDestinationExists
-        );
-        assert_eq!(std::fs::read(&dest).unwrap(), b"existing");
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn backfill_never_follows_symlinks() {
-        let root = tempfile::tempdir().unwrap();
-        let outside = root.path().join("outside.sqlite");
-        std::fs::write(&outside, b"untouched").unwrap();
-        let link = root.path().join("link.sqlite");
-        std::os::unix::fs::symlink(&outside, &link).unwrap();
-        let dest = root.path().join("dest.sqlite");
-        assert!(import_source_backfill(&dest, &link).is_err());
-        assert!(!dest.exists());
-        assert_eq!(std::fs::read(&outside).unwrap(), b"untouched");
-
-        let real_dest = root.path().join("real.sqlite");
-        std::fs::write(&real_dest, b"real").unwrap();
-        let dest_link = root.path().join("dest-link.sqlite");
-        std::os::unix::fs::symlink(&real_dest, &dest_link).unwrap();
-        let src = root.path().join("src.sqlite");
-        let store = SourceStateStore::open(&src, "test", [wallet('e')]).unwrap();
-        drop(store);
-        assert!(import_source_backfill(&dest_link, &src).is_err());
-        assert_eq!(std::fs::read(&real_dest).unwrap(), b"real");
     }
 }

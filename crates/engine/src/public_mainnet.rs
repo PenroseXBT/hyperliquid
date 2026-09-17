@@ -109,6 +109,8 @@ pub struct SourceAssetPosition {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SourceStateResponse {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub block_number: Option<u64>,
     pub candidate_id: String,
     pub account_value: Decimal,
     pub source_time_ms: u64,
@@ -1388,6 +1390,7 @@ fn parse_source_state_with_metadata(
         ));
     }
     Ok(SourceStateResponse {
+        block_number: None,
         candidate_id: candidate.to_ascii_lowercase(),
         account_value,
         source_time_ms: wire.time,
