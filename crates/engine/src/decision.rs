@@ -6809,7 +6809,7 @@ impl DecisionEngine {
                     .portfolio_position(&asset)
                     .checked_add(signed_order_quantity)
                     .ok_or(EngineError::Arithmetic)?;
-                let component_allocation = partition_component_fill(
+                let component_allocation = match partition_component_fill(
                     &self.ledger.source_positions_for_asset(&asset),
                     action.side,
                     remaining_order_quantity,
@@ -6817,7 +6817,40 @@ impl DecisionEngine {
                     rules.mark_price,
                     portfolio_position_after,
                     rules.size_step,
-                )?;
+                ) {
+                    Ok(allocation) => allocation,
+                    Err(EngineError::Core(message))
+                        if message
+                            == "filled portfolio delta has no matching component target delta" =>
+                    {
+                        eprintln!(
+                            "component_attribution_unavailable=true asset={asset} \
+                             decision_id={} planned_cloid={} requested_notional={} \
+                             remaining_quantity={} side={:?} action=REJECT_ORDER \
+                             alert=true nonfatal=true reason=missing_component_target_delta",
+                            action.decision_id,
+                            action.planned_cloid,
+                            action.rounded_notional,
+                            remaining_order_quantity,
+                            action.side
+                        );
+                        self.action_lifecycle_events.push(ActionLifecycleEvent {
+                            asset,
+                            decision_id: action.decision_id.to_string(),
+                            planned_cloid: action.planned_cloid.to_string(),
+                            root_planned_cloid,
+                            parent_planned_cloid,
+                            retry_generation: action.retry_generation,
+                            observed_at_mono: now,
+                            requested_notional: action.rounded_notional,
+                            filled_quantity: None,
+                            unfilled_quantity: None,
+                            outcome: ActionAttemptOutcome::BlockedByCurrentRisk,
+                        });
+                        continue;
+                    }
+                    Err(error) => return Err(error),
+                };
                 let mut component_remaining = component_allocation.total_quantities;
                 canonicalize_allocation_total(&mut component_remaining, remaining_order_quantity)?;
                 let component_remaining = component_remaining
@@ -11442,6 +11475,48 @@ pub(crate) mod tests {
         assert!(!engine.action_lifecycle_events.iter().any(|event| {
             event.planned_cloid == selected.planned_cloid.to_string()
                 && event.outcome == ActionAttemptOutcome::SupersededByNewTarget
+        }));
+    }
+
+    #[test]
+    fn unattributable_manual_portfolio_delta_rejects_order_without_killing_engine() {
+        let now = 60_000;
+        let mut engine = flow_engine(now);
+        engine.enable_production_intents(ProductionIntentIdentity {
+            observer_release_hash: [1; 32],
+            signer_release_hash: [1; 32],
+            release_manifest_hash: [2; 32],
+            market_rules_hash: [3; 32],
+            dynamic_floor_policy_hash: [4; 32],
+            ioc_policy_hash: [5; 32],
+            expires_after_ms: 10_000,
+        });
+
+        let manual_open = crossing_test_execution(
+            "BTC",
+            Side::Buy,
+            Decimal::ONE,
+            Decimal::from(100),
+            Decimal::ZERO,
+            Decimal::ZERO,
+            Decimal::ZERO,
+            Decimal::ZERO,
+        );
+        engine
+            .ledger
+            .apply_portfolio_execution(&manual_open, 1)
+            .unwrap();
+        assert_eq!(engine.ledger.portfolio_position("BTC"), Decimal::ONE);
+        assert!(engine.ledger.source_positions_for_asset("BTC").is_empty());
+
+        let decision = engine.construct_next_decision(now).unwrap().unwrap();
+
+        assert!(decision.projection.constrained_targets.contains_key("BTC"));
+        assert!(engine.pending.is_empty());
+        assert!(engine.take_prepared_authorized_intents().is_empty());
+        assert!(engine.strategy_target_execution_enabled());
+        assert!(engine.action_lifecycle_events.iter().any(|event| {
+            event.asset == "BTC" && event.outcome == ActionAttemptOutcome::BlockedByCurrentRisk
         }));
     }
 
