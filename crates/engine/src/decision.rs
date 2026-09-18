@@ -4991,6 +4991,7 @@ impl DecisionEngine {
         let mut members = Vec::new();
         let mut consensus_inputs: BTreeMap<String, Vec<ConsensusInput>> = BTreeMap::new();
         let mut source_contributions: BTreeMap<String, BTreeMap<String, Decimal>> = BTreeMap::new();
+        let mut unavailable_hold_assets = BTreeSet::<String>::new();
         let mut existing_wallet_consensus = BTreeMap::new();
         let mut fresh_source_states = Vec::new();
         let mut source_received_at = BTreeMap::new();
@@ -5374,6 +5375,7 @@ impl DecisionEngine {
                 .checked_mul(mark)
                 .ok_or(EngineError::Arithmetic)?;
             if unavailable {
+                unavailable_hold_assets.insert(asset.clone());
                 self.metrics.target_readiness_rejections =
                     self.metrics.target_readiness_rejections.saturating_add(1);
                 eprintln!(
@@ -6302,6 +6304,12 @@ impl DecisionEngine {
                     .filter(|asset| !retained_selected_increase_assets.contains(asset.as_str()))
                     .cloned(),
             )
+            .chain(
+                unavailable_hold_assets
+                    .iter()
+                    .filter(|asset| self.pending.contains_key(asset.as_str()))
+                    .cloned(),
+            )
             .filter(|asset| !self.waiting_market_rules.contains(asset))
             .collect::<BTreeSet<_>>();
         let projection_filled_positions = filled_positions.clone();
@@ -6445,6 +6453,7 @@ impl DecisionEngine {
         actions.retain(|action| {
             !in_flight_pending_assets.contains(&action.asset)
                 && !retained_selected_increase_assets.contains(&action.asset)
+                && !unavailable_hold_assets.contains(&action.asset)
         });
         let proposed_action_notionals = actions
             .iter()
@@ -6515,6 +6524,11 @@ impl DecisionEngine {
                 continue;
             }
             if let Some(previous) = self.pending.remove(asset) {
+                let outcome = if unavailable_hold_assets.contains(asset) {
+                    ActionAttemptOutcome::BlockedByCurrentRisk
+                } else {
+                    ActionAttemptOutcome::SupersededByNewTarget
+                };
                 self.action_lifecycle_events.push(ActionLifecycleEvent {
                     asset: asset.clone(),
                     decision_id: previous.action.decision_id.to_string(),
@@ -6529,7 +6543,7 @@ impl DecisionEngine {
                     requested_notional: previous.action.rounded_notional,
                     filled_quantity: None,
                     unfilled_quantity: None,
-                    outcome: ActionAttemptOutcome::SupersededByNewTarget,
+                    outcome,
                 });
             }
         }
@@ -11078,6 +11092,39 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn unavailable_manual_hold_retires_existing_pending_root() {
+        let now = 60_000;
+        let mut engine = flow_engine(now);
+        engine.enable_production_intents(ProductionIntentIdentity {
+            observer_release_hash: [1; 32],
+            signer_release_hash: [1; 32],
+            release_manifest_hash: [2; 32],
+            market_rules_hash: [3; 32],
+            dynamic_floor_policy_hash: [4; 32],
+            ioc_policy_hash: [5; 32],
+            expires_after_ms: 10_000,
+        });
+        engine.construct_next_decision(now).unwrap().unwrap();
+        let selected = engine.pending["BTC"].action.clone();
+
+        engine.production_positions = Some(BTreeMap::from([("BTC".into(), Decimal::new(-6, 2))]));
+        engine.learning_stream_gap();
+        engine
+            .construct_next_decision(now + 1_000)
+            .unwrap()
+            .unwrap();
+
+        assert!(engine.pending.is_empty());
+        assert!(engine.pending_book.is_empty());
+        assert!(engine.take_prepared_authorized_intents().is_empty());
+        assert!(engine.strategy_target_execution_enabled());
+        assert!(engine.action_lifecycle_events.iter().any(|event| {
+            event.planned_cloid == selected.planned_cloid.to_string()
+                && event.outcome == ActionAttemptOutcome::BlockedByCurrentRisk
+        }));
+    }
+
+    #[test]
     fn malformed_nonzero_target_without_same_side_component_is_unavailable() {
         let opposite = BTreeMap::from([("source:wallet".into(), Decimal::from(-1))]);
         assert_eq!(
@@ -11516,6 +11563,84 @@ pub(crate) mod tests {
         assert!(engine.action_lifecycle_events.iter().any(|event| {
             event.asset == "BTC" && event.outcome == ActionAttemptOutcome::BlockedByCurrentRisk
         }));
+    }
+
+    #[test]
+    fn partition_component_core_failures_are_attribution_integrity() {
+        struct Case {
+            name: &'static str,
+            current: BTreeMap<String, Decimal>,
+            side: Side,
+            filled: Decimal,
+            targets: BTreeMap<String, Decimal>,
+            after: Decimal,
+            reason: &'static str,
+        }
+
+        let cases = [
+            Case {
+                name: "flatten_same_side_component",
+                current: BTreeMap::from([("source:manual".into(), Decimal::ONE)]),
+                side: Side::Buy,
+                filled: Decimal::ONE,
+                targets: BTreeMap::new(),
+                after: Decimal::ZERO,
+                reason: "portfolio flatten does not exclusively close component positions",
+            },
+            Case {
+                name: "flatten_quantity_mismatch",
+                current: BTreeMap::from([("source:manual".into(), -Decimal::ONE)]),
+                side: Side::Buy,
+                filled: Decimal::from(2),
+                targets: BTreeMap::new(),
+                after: Decimal::ZERO,
+                reason: "portfolio flatten component quantities do not reconcile",
+            },
+            Case {
+                name: "crossing_missing_old_side_close",
+                current: BTreeMap::new(),
+                side: Side::Sell,
+                filled: Decimal::from(2),
+                targets: BTreeMap::from([("source:probe".into(), -Decimal::ONE)]),
+                after: -Decimal::ONE,
+                reason: "crossing fill old-side component close quantity does not reconcile",
+            },
+            Case {
+                name: "crossing_no_new_side_target",
+                current: BTreeMap::from([("source:long".into(), Decimal::ONE)]),
+                side: Side::Sell,
+                filled: Decimal::from(2),
+                targets: BTreeMap::new(),
+                after: -Decimal::ONE,
+                reason: "crossing fill has no matching new-side component target",
+            },
+            Case {
+                name: "missing_directional_delta",
+                current: BTreeMap::new(),
+                side: Side::Buy,
+                filled: Decimal::ONE,
+                targets: BTreeMap::new(),
+                after: Decimal::ONE,
+                reason: "filled portfolio delta has no matching component target delta",
+            },
+        ];
+
+        for case in cases {
+            let error = partition_component_fill(
+                &case.current,
+                case.side,
+                case.filled,
+                &case.targets,
+                Decimal::ONE,
+                case.after,
+                Decimal::new(1, 6),
+            )
+            .expect_err(case.name);
+            match error {
+                EngineError::Core(reason) => assert_eq!(reason, case.reason, "{}", case.name),
+                other => panic!("{} returned non-Core error: {other:?}", case.name),
+            }
+        }
     }
 
     #[test]
