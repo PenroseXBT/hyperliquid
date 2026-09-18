@@ -1835,6 +1835,7 @@ pub struct DecisionEngine {
     mfce: MfceEngine,
     last_delayed_service: u64,
     mfce_authorized_assets: BTreeMap<String, Timestamp>,
+    component_attribution_hold_assets: BTreeSet<String>,
     /// Maps process-local monotonic timestamps into one restart-comparable
     /// durable timeline. The anchor is reconstructed from wall time once at
     /// process startup and advances only with the process monotonic clock.
@@ -2927,6 +2928,7 @@ impl DecisionEngine {
             mfce: MfceEngine::default(),
             last_delayed_service: 0,
             mfce_authorized_assets: BTreeMap::new(),
+            component_attribution_hold_assets: BTreeSet::new(),
             durable_time_offset: 0,
             mfce_time_high_watermark: 0,
             ledger_time_high_watermark: 0,
@@ -5365,6 +5367,8 @@ impl DecisionEngine {
                 && !self.authoritative_position(&asset).is_zero()
                 && !source_known
                 && !flow_known;
+            let component_attribution_hold =
+                self.component_attribution_hold_assets.contains(&asset);
             let mark = mids
                 .mids
                 .get(&asset)
@@ -5374,29 +5378,21 @@ impl DecisionEngine {
                 .authoritative_position(&asset)
                 .checked_mul(mark)
                 .ok_or(EngineError::Arithmetic)?;
-            if unavailable {
+            if unavailable || component_attribution_hold {
                 unavailable_hold_assets.insert(asset.clone());
                 self.metrics.target_readiness_rejections =
                     self.metrics.target_readiness_rejections.saturating_add(1);
                 eprintln!(
-                    "asset_target_hold_unavailable=true asset={asset} observed_at={now} action=ASSET_HOLD nonfatal=true"
+                    "asset_target_hold_unavailable=true asset={asset} observed_at={now} action=ASSET_HOLD nonfatal=true reason={}",
+                    if component_attribution_hold {
+                        "component_attribution_unavailable_latched"
+                    } else {
+                        "source_and_flow_unavailable"
+                    }
                 );
-                let exposure = held_notional
-                    .checked_div(available_gross)
-                    .ok_or(EngineError::Arithmetic)?
-                    .clamp(-Decimal::ONE, Decimal::ONE);
-                consensus_inputs.insert(
-                    asset.clone(),
-                    vec![ConsensusInput {
-                        candidate_id: "source:unavailable-hold".into(),
-                        allocation_weight: 1.0,
-                        confidence_modifier: 1.0,
-                        source_exposure: exposure.to_f64().ok_or(EngineError::Arithmetic)?,
-                        enabled: true,
-                        quarantined: false,
-                        snapshot_age_ms: 0,
-                    }],
-                );
+                consensus_inputs.remove(&asset);
+                source_contributions.remove(&asset);
+                continue;
             }
 
             // A continuation may preserve exposure after the source target has
@@ -5416,7 +5412,7 @@ impl DecisionEngine {
                     self.ledger.source_positions_for_asset(&asset),
                     mark,
                 )?;
-                if components.is_empty() && unavailable {
+                if components.is_empty() && (unavailable || component_attribution_hold) {
                     components.insert("source:unavailable-hold".into(), held_notional);
                 }
                 if !components.is_empty() {
@@ -5482,6 +5478,11 @@ impl DecisionEngine {
                     origins.remove(&asset);
                 }
             }
+        }
+        for asset in &unavailable_hold_assets {
+            consensus_inputs.remove(asset);
+            source_contributions.remove(asset);
+            origins.remove(asset);
         }
         // Authoritative per-asset taker fees (single fee path). Assets
         // without refreshed fee state keep the previous pending semantics
@@ -6834,6 +6835,7 @@ impl DecisionEngine {
                 ) {
                     Ok(allocation) => allocation,
                     Err(EngineError::Core(message)) => {
+                        self.component_attribution_hold_assets.insert(asset.clone());
                         let reason = message.replace(|c: char| !c.is_ascii_alphanumeric(), "_");
                         eprintln!(
                             "component_attribution_unavailable=true asset={asset} \
@@ -11072,8 +11074,13 @@ pub(crate) mod tests {
             let decision = engine.construct_next_decision(at).unwrap().unwrap();
             assert_eq!(engine.authoritative_position("BTC"), Decimal::new(-6, 2));
             assert_eq!(
-                decision.projection.constrained_targets["BTC"],
-                Decimal::from(-6)
+                decision
+                    .projection
+                    .constrained_targets
+                    .get("BTC")
+                    .copied()
+                    .unwrap_or_default(),
+                Decimal::ZERO
             );
             assert!(engine.strategy_target_execution_enabled());
             assert!(engine.take_prepared_authorized_intents().is_empty());
@@ -11095,6 +11102,65 @@ pub(crate) mod tests {
     fn unavailable_manual_hold_retires_existing_pending_root() {
         let now = 60_000;
         let mut engine = flow_engine(now);
+        engine
+            .mids
+            .as_mut()
+            .unwrap()
+            .0
+            .mids
+            .insert("ETH".into(), Decimal::from(100));
+        let metadata = engine.metadata.as_mut().unwrap();
+        metadata.universe.push(MarketMetadataAsset {
+            name: "ETH".into(),
+            size_decimals: 3,
+            growth_mode: false,
+        });
+        metadata.contexts.insert(
+            "ETH".into(),
+            crate::public_mainnet::MarketAssetContext {
+                funding_rate_hourly: Decimal::ZERO,
+            },
+        );
+        engine.books.insert(
+            "ETH".into(),
+            (
+                mfce_test_book(
+                    "ETH",
+                    now,
+                    Decimal::new(9_999, 2),
+                    Decimal::new(10_001, 2),
+                    Decimal::from(100),
+                ),
+                now,
+            ),
+        );
+        let durable = engine.durable_timestamp(now).unwrap();
+        let mut eth_flow = MarketFlow::default();
+        eth_flow.trade(durable, 2, Decimal::from(10_000), true);
+        eth_flow.last_sent_ms = durable;
+        engine.ingest_market_flow("ETH".into(), eth_flow, now);
+        {
+            let mut state = engine.mfce.state().clone();
+            let base_id = state.next_sample_id;
+            for offset in 0..8_u64 {
+                let sample_id = base_id + offset;
+                state.samples.push_back(crate::mfce::MfceTrainingSample {
+                    sample_id,
+                    asset: "ETH".to_string(),
+                    direction: MfceDirection::Long,
+                    transition_kind: crate::mfce::MfceTransitionKind::Opening,
+                    opened_at_mono: sample_id * 1_000,
+                    completed_at_mono: sample_id * 1_000 + 500,
+                    features: MfceFeatureVector::new([Decimal::ZERO; MFCE_FEATURE_COUNT]),
+                    objective: crate::mfce::LearningObjective::EntryQuality,
+                    remaining_net_edge_bps: Decimal::from(100),
+                    lifetime_seconds: Decimal::new(5, 1),
+                    admitted: false,
+                });
+            }
+            state.next_sample_id = base_id + 8;
+            engine.mfce.replace_state(state).unwrap();
+        }
         engine.enable_production_intents(ProductionIntentIdentity {
             observer_release_hash: [1; 32],
             signer_release_hash: [1; 32],
@@ -11122,6 +11188,64 @@ pub(crate) mod tests {
             event.planned_cloid == selected.planned_cloid.to_string()
                 && event.outcome == ActionAttemptOutcome::BlockedByCurrentRisk
         }));
+    }
+
+    #[test]
+    fn unavailable_manual_hold_does_not_block_other_asset_intent() {
+        let now = 60_000;
+        let mut engine = flow_engine(now);
+        engine
+            .mids
+            .as_mut()
+            .unwrap()
+            .0
+            .mids
+            .insert("ETH".into(), Decimal::from(100));
+        let metadata = engine.metadata.as_mut().unwrap();
+        metadata.universe.push(MarketMetadataAsset {
+            name: "ETH".into(),
+            size_decimals: 3,
+            growth_mode: false,
+        });
+        metadata.contexts.insert(
+            "ETH".into(),
+            crate::public_mainnet::MarketAssetContext {
+                funding_rate_hourly: Decimal::ZERO,
+            },
+        );
+        engine.enable_production_intents(ProductionIntentIdentity {
+            observer_release_hash: [1; 32],
+            signer_release_hash: [1; 32],
+            release_manifest_hash: [2; 32],
+            market_rules_hash: [3; 32],
+            dynamic_floor_policy_hash: [4; 32],
+            ioc_policy_hash: [5; 32],
+            expires_after_ms: 10_000,
+        });
+        engine.construct_next_decision(now).unwrap().unwrap();
+        assert!(engine.pending.contains_key("BTC"));
+        let btc_action = engine.pending["BTC"].action.clone();
+
+        engine.production_positions = Some(BTreeMap::from([("ETH".into(), Decimal::new(-6, 2))]));
+        engine
+            .construct_next_decision(now + 1_000)
+            .unwrap()
+            .unwrap();
+
+        assert!(engine.strategy_target_execution_enabled());
+        assert!(!engine.pending.contains_key("ETH"));
+        let mut intents = engine.take_prepared_authorized_intents();
+        if intents.is_empty() {
+            assert!(engine.pending.contains_key("BTC"));
+            let btc_book = engine.books["BTC"].0.clone();
+            engine
+                .try_execute_pending(&btc_book, now + engine.config.latency_timeout_ms)
+                .unwrap();
+            intents = engine.take_prepared_authorized_intents();
+            assert_eq!(intents.len(), 1);
+            assert_eq!(intents[0].planned_cloid, btc_action.planned_cloid);
+        }
+        assert!(intents.iter().any(|intent| intent.asset == "BTC"));
     }
 
     #[test]
@@ -11563,6 +11687,16 @@ pub(crate) mod tests {
         assert!(engine.action_lifecycle_events.iter().any(|event| {
             event.asset == "BTC" && event.outcome == ActionAttemptOutcome::BlockedByCurrentRisk
         }));
+
+        let lifecycle_count = engine.action_lifecycle_events.len();
+        engine
+            .construct_next_decision(now + 1_000)
+            .unwrap()
+            .unwrap();
+        assert!(engine.pending.is_empty());
+        assert!(engine.pending_book.is_empty());
+        assert!(engine.take_prepared_authorized_intents().is_empty());
+        assert_eq!(engine.action_lifecycle_events.len(), lifecycle_count);
     }
 
     #[test]
