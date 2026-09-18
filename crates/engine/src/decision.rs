@@ -6819,15 +6819,13 @@ impl DecisionEngine {
                     rules.size_step,
                 ) {
                     Ok(allocation) => allocation,
-                    Err(EngineError::Core(message))
-                        if message
-                            == "filled portfolio delta has no matching component target delta" =>
-                    {
+                    Err(EngineError::Core(message)) => {
+                        let reason = message.replace(|c: char| !c.is_ascii_alphanumeric(), "_");
                         eprintln!(
                             "component_attribution_unavailable=true asset={asset} \
                              decision_id={} planned_cloid={} requested_notional={} \
                              remaining_quantity={} side={:?} action=REJECT_ORDER \
-                             alert=true nonfatal=true reason=missing_component_target_delta",
+                             alert=true nonfatal=true reason={reason}",
                             action.decision_id,
                             action.planned_cloid,
                             action.rounded_notional,
