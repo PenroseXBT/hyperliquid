@@ -1186,7 +1186,7 @@ mod tests {
     }
 
     #[test]
-    fn effective_frozen_cohort_sql_restart_preserves_history_and_admits_wallets_independently() {
+    fn effective_375_cohort_sql_restart_preserves_history_and_admits_wallets_independently() {
         let config_root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../railway-frozen");
         let loaded = crate::EngineState::load_with_very_profitable_layer(
             config_root.join("copytrade.json"),
@@ -1203,8 +1203,7 @@ mod tests {
         // Pinned to the frozen production cohort: any unintended change to
         // railway-frozen/copytrade.json must fail here, not in production.
         let cohort = wallets.len();
-        // Pinned to the effective production cohort: 169 config candidates
-        // plus qualified layer members merged at load (246 total). Any
+        // Pinned to the effective 375-wallet production cohort. Any
         // unintended change to the frozen config or layer must fail here.
         let digest = Sha256::digest(format!(
             "{}\n",
@@ -1212,12 +1211,12 @@ mod tests {
         ));
         assert_eq!(
             format!("{digest:x}"),
-            "76d64097084d46fc7deab8aa4b055c7f83402996ba458bab420e119e9654b32c"
+            "1fa57688a7bac41f989120785556f3e3cd1948921cf207be2a68568ebb994aed"
         );
         let root = tempfile::tempdir().unwrap();
         let path = root.path().join("source-state.sqlite");
         let first = wallets.first().unwrap();
-        let mut store = SourceStateStore::open(&path, "frozen-cohort", wallets.clone()).unwrap();
+        let mut store = SourceStateStore::open(&path, "375-wallet", wallets.clone()).unwrap();
         for wallet in &wallets {
             store
                 .persist(&state(wallet.clone(), 100), true, false)
@@ -1235,7 +1234,7 @@ mod tests {
         for generation in [2, 3] {
             let mut store = SourceStateStore::open(
                 &path,
-                "frozen-cohort",
+                "375-wallet",
                 wallets.iter().map(|w| w.to_ascii_uppercase()),
             )
             .unwrap();

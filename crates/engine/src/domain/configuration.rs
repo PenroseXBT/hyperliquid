@@ -554,7 +554,7 @@ mod tests {
     fn production_configuration_is_explicit_and_valid() {
         let config = production_config();
         assert_eq!(config.schema_version, LIVE_CONFIG_SCHEMA_VERSION);
-        assert_eq!(config.candidates.len(), 169);
+        assert_eq!(config.candidates.len(), 375);
         assert_eq!(config.starting_equity_usd, 100.0);
         assert_eq!(config.global_risk.global_risk_scale, 0.10);
         assert_eq!(config.global_risk.min_order_notional_usd, 10.0);

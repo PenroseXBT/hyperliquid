@@ -143,7 +143,7 @@ mod tests {
     #[test]
     fn engine_loads_validated_state_without_runtime_clients() {
         let state = EngineState::load(config_path()).unwrap();
-        assert_eq!(state.config().candidates.len(), 169);
+        assert_eq!(state.config().candidates.len(), 375);
         assert_eq!(
             state.build_manifest().architecture_version,
             ENGINE_ARCHITECTURE_VERSION

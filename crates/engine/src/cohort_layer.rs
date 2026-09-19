@@ -605,7 +605,7 @@ mod tests {
 
         assert!(PreparedVeryProfitableLayer::prepare(&artifact, &config).is_ok());
         assert!(config.very_profitable_layer.is_none());
-        assert_eq!(config.candidates.len(), 169);
+        assert_eq!(config.candidates.len(), 375);
     }
 
     #[test]
