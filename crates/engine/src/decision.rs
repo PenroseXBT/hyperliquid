@@ -1686,6 +1686,8 @@ pub struct DecisionTraceAsset {
     pub constrained: Decimal,
     pub proposed: Decimal,
     pub executable: Decimal,
+    pub rounded: Decimal,
+    pub filled: Decimal,
     pub components_empty: bool,
     pub in_pending: bool,
     pub mfce_admitted: bool,
@@ -7317,6 +7319,16 @@ impl DecisionEngine {
                             .copied()
                             .unwrap_or_default(),
                         executable: executable_action_notionals
+                            .get(&asset)
+                            .copied()
+                            .unwrap_or_default(),
+                        rounded: decision
+                            .projection
+                            .rounded_deltas
+                            .get(&asset)
+                            .copied()
+                            .unwrap_or_default(),
+                        filled: projection_filled_positions
                             .get(&asset)
                             .copied()
                             .unwrap_or_default(),
