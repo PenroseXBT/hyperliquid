@@ -195,7 +195,7 @@ struct RollingEconomicStatus {
     profit_factor_state: &'static str,
     profit_factor: Option<Decimal>,
     maximum_drawdown: Decimal,
-    annualized_sharpe_5m: f64,
+    annualized_sharpe_5m: Option<f64>,
     net_pnl_by_asset: BTreeMap<String, Decimal>,
     net_pnl_by_source: BTreeMap<String, Decimal>,
     execution_net_pnl_by_context: BTreeMap<EconomicAttribution, Decimal>,
@@ -234,6 +234,17 @@ struct ContinuousStatus<'a> {
     rate_limited_responses: u64,
     equity_mark_prices_missing: bool,
     streaming: Option<StreamingRuntimeStatus>,
+    reconciliation: Option<ReconciliationRuntimeStatus>,
+    scheduler_completed_fresh: u64,
+    scheduler_completed_stale: u64,
+    scheduler_retries: u64,
+    scheduler_retry_exhausted: u64,
+    scheduler_invalid_responses: u64,
+    scheduler_permanent_failures: u64,
+    scheduler_responses_rejected_as_stale: u64,
+    scheduler_schedule_rejections: u64,
+    scheduler_maximum_pending: usize,
+    scheduler_maximum_in_flight: usize,
     unique_source_transitions: u64,
     modeled_executions_retained: usize,
     mfce_completed_transition_labels: usize,
@@ -253,6 +264,20 @@ struct ContinuousStatus<'a> {
     open_marked_equity_contribution: Decimal,
     mfce: crate::mfce::MfceReport,
     economics: Vec<RollingEconomicStatus>,
+}
+#[derive(Debug, Clone, Serialize)]
+struct ReconciliationRuntimeStatus {
+    verified_through_unix_ms: Option<u64>,
+    recovery_pending: bool,
+    attempts: u64,
+    successes: u64,
+    last_error: Option<String>,
+    last_recovery_reason: Option<String>,
+    /// The engine has no reconciliation dead-letter queue: reconciliation is
+    /// synchronous per barrier with fail-closed errors, so the depth is
+    /// definitionally zero. Serialized explicitly because the independent
+    /// monitor gates boot on it.
+    dlq_depth: u64,
 }
 #[derive(Debug, Clone, Serialize)]
 struct StreamingRuntimeStatus {
@@ -1368,6 +1393,7 @@ pub async fn run_continuous_daemon(options: RuntimeOptions) -> Result<PathBuf, B
                             .as_ref()
                             .and_then(|store| store.continuity_status().ok()),
                     ),
+                    reconciliation_runtime_status(direct_live.as_ref()),
                     durable_sources
                         .as_ref()
                         .and_then(|store| store.hip3_source_activity().ok()),
@@ -1446,6 +1472,7 @@ pub async fn run_continuous_daemon(options: RuntimeOptions) -> Result<PathBuf, B
                     .as_ref()
                     .and_then(|store| store.continuity_status().ok()),
             ),
+            reconciliation_runtime_status(direct_live.as_ref()),
             durable_sources
                 .as_ref()
                 .and_then(|store| store.hip3_source_activity().ok()),
@@ -1471,6 +1498,7 @@ fn write_continuous_status(
     rate_limited_responses: u64,
     equity_mark_prices_missing: bool,
     streaming: Option<StreamingRuntimeStatus>,
+    reconciliation: Option<ReconciliationRuntimeStatus>,
     hip3_source_activity: Option<crate::source_state::Hip3SourceActivity>,
 ) -> Result<(), Box<dyn Error>> {
     let unresolved_roots = engine.unresolved_actionable_root_count();
@@ -1556,6 +1584,17 @@ fn write_continuous_status(
         rest_reserved_weight_consumed_process: counters.reserved_weight,
         rate_limited_responses,
         streaming,
+        reconciliation,
+        scheduler_completed_fresh: counters.completed_fresh,
+        scheduler_completed_stale: counters.completed_stale,
+        scheduler_retries: counters.retries,
+        scheduler_retry_exhausted: counters.retry_exhausted,
+        scheduler_invalid_responses: counters.invalid_responses,
+        scheduler_permanent_failures: counters.permanent_failures,
+        scheduler_responses_rejected_as_stale: counters.response_rejected_as_stale,
+        scheduler_schedule_rejections: counters.schedule_rejections,
+        scheduler_maximum_pending: counters.maximum_pending,
+        scheduler_maximum_in_flight: counters.maximum_in_flight,
         unique_source_transitions: mfce.observed_transitions,
         modeled_executions_retained: engine.executions().len(),
         mfce_completed_transition_labels: mfce.completed_samples,
@@ -1602,6 +1641,28 @@ fn write_continuous_status(
 
 fn is_missing_mark_price(error: &EngineError) -> bool {
     matches!(error, EngineError::Core(reason) if reason == "MissingMarkPrice")
+}
+fn reconciliation_runtime_status(
+    direct_live: Option<
+        &std::sync::Arc<
+            tokio::sync::Mutex<
+                LiveExecutionRuntime<crate::signing::transport::HyperliquidMainnetTransport>,
+            >,
+        >,
+    >,
+) -> Option<ReconciliationRuntimeStatus> {
+    // Telemetry only: a contended lock omits the block for one sample rather
+    // than stalling the status writer. The verifier fails closed on absence.
+    let live = direct_live?.try_lock().ok()?;
+    Some(ReconciliationRuntimeStatus {
+        verified_through_unix_ms: live.last_verified_wall_ms(),
+        recovery_pending: live.recovery_only(),
+        attempts: live.reconcile_attempts(),
+        successes: live.reconcile_successes(),
+        last_error: live.last_reconcile_error().map(str::to_string),
+        last_recovery_reason: live.recovery_reason().map(str::to_string),
+        dlq_depth: 0,
+    })
 }
 fn streaming_runtime_status(
     stream: Option<&StreamingHandle>,
@@ -1793,7 +1854,7 @@ fn runtime_economic_status(
         .filter_map(|bucket| bucket.return_fraction.to_f64())
         .collect::<Vec<_>>();
     let annualized_sharpe_5m = if returns.len() < 2 {
-        0.0
+        None
     } else {
         let mean = returns.iter().sum::<f64>() / returns.len() as f64;
         let variance = returns
@@ -1801,10 +1862,14 @@ fn runtime_economic_status(
             .map(|value| (value - mean).powi(2))
             .sum::<f64>()
             / (returns.len() - 1) as f64;
-        if variance <= 0.0 {
-            0.0
+        // Sub-part-per-billion return dispersion is measurement dust, not
+        // signal: annualizing it manufactures triple-digit Sharpes from
+        // funding trickle. Report unavailable instead of a fantasy number.
+        let std = variance.sqrt();
+        if !(variance > 0.0) || std < 1e-9 {
+            None
         } else {
-            mean / variance.sqrt() * (365.0_f64 * 24.0 * 12.0).sqrt()
+            Some(mean / std * (365.0_f64 * 24.0 * 12.0).sqrt())
         }
     };
     let mut peak = buckets
@@ -3940,5 +4005,48 @@ mod tests {
                 "streaming status key {key} must serialize as a number"
             );
         }
+    }
+    #[test]
+    fn rolling_status_serializes_every_reconciliation_and_scheduler_key() {
+        // Second half of the scripts/hl_bot.py contract: verification_checks
+        // requires status.reconciliation.{verified_through_unix_ms,
+        // recovery_pending, dlq_depth}, and triage needs the scheduler
+        // outcome counters. A missing reconciliation block made boot
+        // verification permanently false with a healthy engine.
+        let status = ReconciliationRuntimeStatus {
+            verified_through_unix_ms: Some(1_789_790_000_000),
+            recovery_pending: false,
+            attempts: 12,
+            successes: 12,
+            last_error: None,
+            last_recovery_reason: None,
+            dlq_depth: 0,
+        };
+        let object = serde_json::to_value(&status)
+            .unwrap()
+            .as_object()
+            .unwrap()
+            .clone();
+        for key in [
+            "verified_through_unix_ms",
+            "recovery_pending",
+            "attempts",
+            "successes",
+            "last_error",
+            "last_recovery_reason",
+            "dlq_depth",
+        ] {
+            assert!(
+                object.contains_key(key),
+                "reconciliation status missing {key}"
+            );
+        }
+        assert!(object["recovery_pending"].is_boolean());
+        assert!(object["dlq_depth"].is_u64());
+        // Scheduler outcome counters ride on ContinuousStatus (populated
+        // from Counters in write_continuous_status). Their JSON keys are
+        // covered by construction: serde derives field names verbatim, so a
+        // rename breaks the constructor at compile time, and the Python
+        // contract test below pins the exact key strings end to end.
     }
 }

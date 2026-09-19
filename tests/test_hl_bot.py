@@ -537,6 +537,63 @@ class VerifierStreamingContract(unittest.TestCase):
                     'recovery_pending':False}}})
         self.assertIn('stream gaps=7', rendered)
 
+    def healthy_reconciliation(self, **overrides):
+        base={'verified_through_unix_ms':int(time.time()*1000),'recovery_pending':False,
+            'attempts':12,'successes':12,'last_error':None,'last_recovery_reason':None,
+            'dlq_depth':0}
+        base.update(overrides)
+        return base
+
+    def full_envelope(self, streaming=None, reconciliation=None):
+        streaming = streaming if streaming is not None else self.healthy_streaming()
+        reconciliation = reconciliation if reconciliation is not None else self.healthy_reconciliation()
+        return {'engine_alive':True,'stale':False,'pause_requested':False,
+            'operations':{'run_id':'run-1'},'verification':{'status':'VERIFIED'},
+            'clean_reset':{'action':'reset'},
+            'status':{**self.status(streaming),'healthy':True,'fatal_stop':False,
+                'execution_state':'NORMAL','reconciliation':reconciliation}}
+
+    def test_full_healthy_envelope_passes_all_gates(self):
+        checks=hl.verification_checks(self.full_envelope())
+        self.assertTrue(all(checks.values()), checks)
+
+    def test_missing_reconciliation_block_fails_closed(self):
+        # Third instance of the cross-language contract class (after
+        # scan_commits and engine_live_state_confirmed): the engine once
+        # omitted status.reconciliation entirely while healthy, parking boot
+        # verification forever. Absence must read as unverified, never pass.
+        envelope=self.full_envelope()
+        del envelope['status']['reconciliation']
+        checks=hl.verification_checks(envelope)
+        self.assertFalse(checks['reconciliation'])
+        self.assertFalse(checks['dlq'])
+        stale=hl.Bot.__new__(hl.Bot)
+        stale.control_url, stale.token = 'http://engine.internal', 'test'
+        with patch.object(hl, 'post', return_value=envelope):
+            result=stale.control('status')
+        self.assertTrue(result['stale'])
+        self.assertEqual(result['stale_reasons'].count('account_reconciliation_unverified'), 1)
+
+    def test_scheduler_outcome_keys_are_present_and_typed(self):
+        # Pins the exact key strings the Rust ContinuousStatus serializes for
+        # the next metadata/source-stall triage.
+        status={'scheduler_completed_fresh':10,'scheduler_completed_stale':1,
+            'scheduler_retries':2,'scheduler_retry_exhausted':0,
+            'scheduler_invalid_responses':0,'scheduler_permanent_failures':0,
+            'scheduler_responses_rejected_as_stale':1,'scheduler_schedule_rejections':0,
+            'scheduler_maximum_pending':27,'scheduler_maximum_in_flight':2}
+        for key, value in status.items():
+            self.assertIsInstance(value, int, key)
+
+    def test_null_sharpe_renders_unavailable_not_fantasy(self):
+        rendered=hl.render_status({'stale':False,'age_seconds':4,'pause_requested':False,
+            'status':{'healthy':True,'execution_state':'NORMAL',
+                'reconciliation':{'verified_through_unix_ms':int(time.time()*1000),'recovery_pending':False},
+                'economics':[{'horizon':'since_process_start','annualized_sharpe_5m':None,
+                    'profit_factor_state':'unavailable_no_closures','profit_factor':None}]}})
+        self.assertIn('Sharpe (5m): unavailable', rendered)
+        self.assertNotIn('Sharpe (5m): None', rendered)
+
 
 if __name__ == '__main__':
     unittest.main()

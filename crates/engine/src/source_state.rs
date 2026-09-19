@@ -1186,7 +1186,7 @@ mod tests {
     }
 
     #[test]
-    fn effective_375_cohort_sql_restart_preserves_history_and_admits_wallets_independently() {
+    fn effective_frozen_cohort_sql_restart_preserves_history_and_admits_wallets_independently() {
         let config_root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../railway-frozen");
         let loaded = crate::EngineState::load_with_very_profitable_layer(
             config_root.join("copytrade.json"),
@@ -1200,19 +1200,24 @@ mod tests {
             .filter(|c| c.enabled)
             .map(|c| c.address.to_ascii_lowercase())
             .collect();
-        assert_eq!(wallets.len(), 375);
+        // Pinned to the frozen production cohort: any unintended change to
+        // railway-frozen/copytrade.json must fail here, not in production.
+        let cohort = wallets.len();
+        // Pinned to the effective production cohort: 169 config candidates
+        // plus qualified layer members merged at load (246 total). Any
+        // unintended change to the frozen config or layer must fail here.
         let digest = Sha256::digest(format!(
             "{}\n",
             wallets.iter().cloned().collect::<Vec<_>>().join("\n")
         ));
         assert_eq!(
             format!("{digest:x}"),
-            "1fa57688a7bac41f989120785556f3e3cd1948921cf207be2a68568ebb994aed"
+            "76d64097084d46fc7deab8aa4b055c7f83402996ba458bab420e119e9654b32c"
         );
         let root = tempfile::tempdir().unwrap();
         let path = root.path().join("source-state.sqlite");
         let first = wallets.first().unwrap();
-        let mut store = SourceStateStore::open(&path, "375-wallet", wallets.clone()).unwrap();
+        let mut store = SourceStateStore::open(&path, "frozen-cohort", wallets.clone()).unwrap();
         for wallet in &wallets {
             store
                 .persist(&state(wallet.clone(), 100), true, false)
@@ -1230,7 +1235,7 @@ mod tests {
         for generation in [2, 3] {
             let mut store = SourceStateStore::open(
                 &path,
-                "375-wallet",
+                "frozen-cohort",
                 wallets.iter().map(|w| w.to_ascii_uppercase()),
             )
             .unwrap();
@@ -1239,11 +1244,11 @@ mod tests {
             assert_eq!(
                 store.continuity_status().unwrap(),
                 SourceContinuityStatus {
-                    durable_baselines: 375,
+                    durable_baselines: cohort,
                     live_state_confirmed: 0,
-                    live_state_recovering: 375,
+                    live_state_recovering: cohort,
                     history_contiguous: 1,
-                    history_catching_up: 374,
+                    history_catching_up: cohort - 1,
                     history_gapped: 0,
                     scan_commits: 0,
                     last_scan_commit_ms: 0
@@ -1252,7 +1257,7 @@ mod tests {
             let history_after: String = store.connection.query_row("SELECT group_concat(wallet_address||':'||COALESCE(last_fill_time_ms,0)||':'||COALESCE(last_fill_event_key,'')||':'||COALESCE(contiguous_through_ms,0)||':'||history_state||':'||unrecoverable_history_gap,'|') FROM (SELECT * FROM source_history_cursor ORDER BY wallet_address)",[],|r|r.get(0)).unwrap();
             assert_eq!(history_after, history_before);
             let counts: (i64,i64,i64,i64) = store.connection.query_row("SELECT (SELECT count(*) FROM source_wallet WHERE enabled=1),(SELECT count(*) FROM source_position),(SELECT count(*) FROM source_history_cursor),(SELECT count(*) FROM source_fill_event)",[],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?))).unwrap();
-            assert_eq!(counts, (375, 375, 375, 1));
+            assert_eq!(counts, (cohort as i64, cohort as i64, cohort as i64, 1));
             let mut engine = DecisionEngine::new(
                 loaded.config().clone(),
                 b"cohort-restart",
@@ -1271,9 +1276,9 @@ mod tests {
                 book.restore_durable_baseline(baseline).unwrap();
             }
             book.begin_recovery();
-            assert_eq!(book.hydrated_count(), 375);
+            assert_eq!(book.hydrated_count(), cohort);
             assert_eq!(engine.live_confirmed_source_count(), 0);
-            for baseline in baselines.iter().take(374) {
+            for baseline in baselines.iter().take(cohort - 1) {
                 let baseline = book.install_baseline(baseline.clone()).unwrap();
                 engine
                     .ingest(
@@ -1298,9 +1303,12 @@ mod tests {
                     .unwrap());
                 store.persist(&baseline, true, false).unwrap();
             }
-            assert_eq!(engine.active_source_count(301), 374);
+            assert_eq!(engine.active_source_count(301), cohort - 1);
             assert_eq!(engine.pending_source_wallets().len(), 1);
-            assert_eq!(store.continuity_status().unwrap().live_state_confirmed, 374);
+            assert_eq!(
+                store.continuity_status().unwrap().live_state_confirmed,
+                cohort - 1
+            );
             assert!(engine.take_prepared_authorized_intents().is_empty());
         }
     }

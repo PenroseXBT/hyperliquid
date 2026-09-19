@@ -505,8 +505,11 @@ def render_status(envelope, horizon="since_process_start"):
         ('Net PnL','net_pnl'), ('Fees','fees'), ('Slippage','slippage'), ('Funding','funding'),
         ('Profit factor','profit_factor'), ('Sharpe (5m)','annualized_sharpe_5m'),
         ('Drawdown','maximum_drawdown'), ('Strategy win rate','strategy_net_win_rate')]:
-        lines.append(f"{label}: {economy.get(key, 'unavailable')}")
-    lines.append(f"PF state={economy.get('profit_factor_state', 'unavailable')}; Sharpe samples={economy.get('sharpe_sample_count')}; strategy closures={economy.get('strategy_closures')}; manual closures={economy.get('manual_closures')}")
+        value = economy.get(key, 'unavailable')
+        lines.append(f"{label}: {'unavailable' if value is None else value}")
+    pf_state = economy.get('profit_factor_state', 'unavailable')
+    samples = economy.get('sharpe_sample_count')
+    lines.append(f"PF state={pf_state}; Sharpe samples={'unavailable' if samples is None else samples}; strategy closures={economy.get('strategy_closures', 'unavailable')}; manual closures={economy.get('manual_closures', 'unavailable')}")
     return "\n".join(lines)
 
 
@@ -640,7 +643,9 @@ class Bot:
             if (watermark is None or not 0 <= time.time()-watermark/1000 < STATUS_MAX_AGE
                     or reconciliation.get("recovery_pending") is not False):
                 envelope["stale"] = True
-                envelope.setdefault("stale_reasons", []).append("account_reconciliation_unverified")
+                reasons = envelope.setdefault("stale_reasons", [])
+                if "account_reconciliation_unverified" not in reasons:
+                    reasons.append("account_reconciliation_unverified")
         return envelope
 
     def monitor_status(self):

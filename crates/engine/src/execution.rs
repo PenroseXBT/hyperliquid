@@ -63,6 +63,13 @@ pub struct LiveExecutionRuntime<T: AuthenticatedExchangeTransport> {
     mode: ReconciliationMode,
     exchange_snapshot: Option<ExchangePositionSnapshot>,
     recovery_reason: Option<String>,
+    /// Wall-clock ms of the last successful authenticated reconciliation.
+    /// Serialized into rolling status so the independent monitor can verify
+    /// exchange truth is fresh; absent until the first success.
+    last_verified_wall_ms: Option<u64>,
+    reconcile_attempts: u64,
+    reconcile_successes: u64,
+    last_reconcile_error: Option<String>,
     /// Builder DEXes with live involvement, pushed to the signer before
     /// every reconciliation barrier so HIP-3 lifecycle stays venue-aware.
     active_dexes: BTreeSet<String>,
@@ -222,6 +229,10 @@ impl<T: AuthenticatedExchangeTransport + Clone> LiveExecutionRuntime<T> {
             mode: ReconciliationMode::RiskOnly,
             exchange_snapshot: None,
             recovery_reason: None,
+            last_verified_wall_ms: None,
+            reconcile_attempts: 0,
+            reconcile_successes: 0,
+            last_reconcile_error: None,
             active_dexes: BTreeSet::new(),
         };
         runtime.refresh_active_dexes().await;
@@ -350,7 +361,19 @@ impl<T: AuthenticatedExchangeTransport + Clone> LiveExecutionRuntime<T> {
     }
 
     async fn reconcile_update(&mut self, now_ms: u64) -> Result<LiveExecutionUpdate, SignerError> {
-        let newly_applied = self.reconcile(now_ms).await?;
+        self.reconcile_attempts = self.reconcile_attempts.saturating_add(1);
+        let result = self.reconcile(now_ms).await;
+        match &result {
+            Ok(_) => {
+                self.reconcile_successes = self.reconcile_successes.saturating_add(1);
+                self.last_verified_wall_ms = Some(now_ms);
+                self.last_reconcile_error = None;
+            }
+            Err(error) => {
+                self.last_reconcile_error = Some(error.to_string());
+            }
+        }
+        let newly_applied = result?;
         let applied = if self.recovery_only() {
             AppliedExchangeBatch {
                 fills: self.state.verified_fills().to_vec(),
@@ -436,6 +459,26 @@ impl<T: AuthenticatedExchangeTransport + Clone> LiveExecutionRuntime<T> {
 
     pub fn recovery_only(&self) -> bool {
         self.mode == ReconciliationMode::RiskOnly
+    }
+
+    pub fn last_verified_wall_ms(&self) -> Option<u64> {
+        self.last_verified_wall_ms
+    }
+
+    pub fn reconcile_attempts(&self) -> u64 {
+        self.reconcile_attempts
+    }
+
+    pub fn reconcile_successes(&self) -> u64 {
+        self.reconcile_successes
+    }
+
+    pub fn last_reconcile_error(&self) -> Option<&str> {
+        self.last_reconcile_error.as_deref()
+    }
+
+    pub fn recovery_reason(&self) -> Option<&str> {
+        self.recovery_reason.as_deref()
     }
 }
 
