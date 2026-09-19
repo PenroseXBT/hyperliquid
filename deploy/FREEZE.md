@@ -2,11 +2,11 @@
 
 How to cut a new frozen release artifact set. For first boot see
 [DEPLOY.md](./DEPLOY.md). For ops, monitoring, and recovery,
-[rail_up.md](../rail_up.md) is canonical.
+[rail_up.md](rail_up.md) is canonical.
 
 Source of truth: `scripts/build_production_release.sh:10-18`,
 `Dockerfile.railway:13-14,23-29`, `.gitignore:34-37`,
-[rail_up.md](../rail_up.md) §4A.
+[rail_up.md](rail_up.md) §4A.
 
 ## Frozen set (6 files)
 
@@ -109,4 +109,4 @@ Commit the six frozen files together. The container only trusts what is in
 | Image build fails on `--print-persistence-schema-hash` | Frozen JSONs incompatible with binary | All four JSONs must be from the same commit as the binary; re-freeze |
 
 Next: first boot in [DEPLOY.md](./DEPLOY.md); daily ops in
-[rail_up.md](../rail_up.md).
+[rail_up.md](rail_up.md).

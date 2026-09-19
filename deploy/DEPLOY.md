@@ -2,10 +2,10 @@
 
 Creates the Railway service once. For freezing a release see
 [FREEZE.md](./FREEZE.md). For ops, monitoring, and recovery,
-[rail_up.md](../rail_up.md) is canonical — nothing here duplicates it.
+[rail_up.md](rail_up.md) is canonical — nothing here duplicates it.
 
 Source of truth: `railway.toml:1-17`,
-`scripts/run_su6_railway.sh:18-28`, [rail_up.md](../rail_up.md) §§2-4B.
+`scripts/run_su6_railway.sh:18-28`, [rail_up.md](rail_up.md) §§2-4B.
 
 ## Prereqs
 
@@ -55,7 +55,7 @@ railway run cat /data/system-v1/failure/current-run.meta
 # run_id=… previous_run_id=… started_at=… wrapper_pid=… engine_pid=… binary_sha256=…
 ```
 
-Healthy-start log lines (see [rail_up.md](../rail_up.md) §4C for the full
+Healthy-start log lines (see [rail_up.md](rail_up.md) §4C for the full
 sequence):
 
 ```text
@@ -67,4 +67,4 @@ continuous_engine_start=true run_id=… previous_run_id=none data_root=/data/sys
 
 - Config changes → [FREEZE.md](./FREEZE.md) (never edit `/app/config` or
   `/app/policy` live).
-- Stop / redeploy / monitor / recovery → [rail_up.md](../rail_up.md).
+- Stop / redeploy / monitor / recovery → [rail_up.md](rail_up.md).
