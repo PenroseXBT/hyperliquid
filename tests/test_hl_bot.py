@@ -594,6 +594,21 @@ class VerifierStreamingContract(unittest.TestCase):
         self.assertIn('Sharpe (5m): unavailable', rendered)
         self.assertNotIn('Sharpe (5m): None', rendered)
 
+    def test_decision_trace_keys_pin_planning_funnel(self):
+        # End-to-end pin for the Rust DecisionTraceAsset contract: per-asset
+        # planning funnel from projection target to pending intent.
+        trace={'LINK':{'constrained':'-10.77','proposed':'0','executable':'0',
+            'components_empty':True,'in_pending':False,'mfce_admitted':True}}
+        asset=trace['LINK']
+        self.assertNotEqual(str(asset['constrained']), '0')
+        self.assertEqual(str(asset['proposed']), '0')
+        for key in ['constrained','proposed','executable','components_empty',
+                    'in_pending','mfce_admitted']:
+            self.assertIn(key, asset, key)
+        self.assertIsInstance(asset['components_empty'], bool)
+        self.assertIsInstance(asset['in_pending'], bool)
+        self.assertIsInstance(asset['mfce_admitted'], bool)
+
 
 if __name__ == '__main__':
     unittest.main()

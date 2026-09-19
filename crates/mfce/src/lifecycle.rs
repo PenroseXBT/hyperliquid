@@ -1279,6 +1279,10 @@ impl MfceEngine {
     pub fn policy_output(&self, asset: &str) -> Option<&MfcePolicyOutput> {
         self.policy_outputs.get(asset)
     }
+
+    pub fn policy_output_assets(&self) -> Vec<String> {
+        self.policy_outputs.keys().cloned().collect()
+    }
     pub fn delayed(&self) -> &crate::delayed::DelayedLearning {
         &self.state.delayed
     }

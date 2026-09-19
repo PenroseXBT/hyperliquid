@@ -1,6 +1,6 @@
 use crate::decision::{
-    DecisionEngine, EconomicAttribution, EngineError, Hip3PipelineStatus, ProductionIntentIdentity,
-    StateIdentity, UnresolvedRootStatus,
+    DecisionEngine, DecisionTraceAsset, EconomicAttribution, EngineError, Hip3PipelineStatus,
+    ProductionIntentIdentity, StateIdentity, UnresolvedRootStatus,
 };
 use crate::domain::decision::{derive_config_hash, derive_risk_policy_hash};
 use crate::domain::scheduler::{
@@ -245,6 +245,8 @@ struct ContinuousStatus<'a> {
     scheduler_schedule_rejections: u64,
     scheduler_maximum_pending: usize,
     scheduler_maximum_in_flight: usize,
+    decisions_total: u64,
+    last_decision_trace: BTreeMap<String, DecisionTraceAsset>,
     unique_source_transitions: u64,
     modeled_executions_retained: usize,
     mfce_completed_transition_labels: usize,
@@ -1595,6 +1597,8 @@ fn write_continuous_status(
         scheduler_schedule_rejections: counters.schedule_rejections,
         scheduler_maximum_pending: counters.maximum_pending,
         scheduler_maximum_in_flight: counters.maximum_in_flight,
+        decisions_total: engine.metrics().decisions,
+        last_decision_trace: engine.last_decision_trace().clone(),
         unique_source_transitions: mfce.observed_transitions,
         modeled_executions_retained: engine.executions().len(),
         mfce_completed_transition_labels: mfce.completed_samples,
@@ -4048,5 +4052,37 @@ mod tests {
         // covered by construction: serde derives field names verbatim, so a
         // rename breaks the constructor at compile time, and the Python
         // contract test below pins the exact key strings end to end.
+    }
+    #[test]
+    fn decision_trace_serializes_the_full_planning_funnel() {
+        use rust_decimal::Decimal;
+        let mut trace = BTreeMap::new();
+        trace.insert(
+            "LINK".to_string(),
+            DecisionTraceAsset {
+                constrained: Decimal::new(-1071, 2),
+                proposed: Decimal::new(-1071, 2),
+                executable: Decimal::ZERO,
+                components_empty: false,
+                in_pending: false,
+                mfce_admitted: true,
+            },
+        );
+        let object = serde_json::to_value(&trace)
+            .unwrap()
+            .as_object()
+            .unwrap()
+            .clone();
+        let asset = object["LINK"].as_object().unwrap();
+        for key in [
+            "constrained",
+            "proposed",
+            "executable",
+            "components_empty",
+            "in_pending",
+            "mfce_admitted",
+        ] {
+            assert!(asset.contains_key(key), "decision trace missing {key}");
+        }
     }
 }

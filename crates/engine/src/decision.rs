@@ -1678,6 +1678,19 @@ pub struct UnresolvedRootStatus {
     pub retry_generation: Option<u32>,
 }
 
+/// Per-asset planning trace for the latest decision: where each candidate
+/// died on the way from projection target to submitted intent. A silent
+/// no-trade regime is diagnosed from one snapshot instead of code archaeology.
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct DecisionTraceAsset {
+    pub constrained: Decimal,
+    pub proposed: Decimal,
+    pub executable: Decimal,
+    pub components_empty: bool,
+    pub in_pending: bool,
+    pub mfce_admitted: bool,
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct ExecutableDensitySummary {
     pub global_risk_scale: f64,
@@ -1824,6 +1837,7 @@ pub struct DecisionEngine {
     mfce_time_high_watermark: Timestamp,
     ledger_time_high_watermark: Timestamp,
     snapshot_generation: Option<u64>,
+    last_decision_trace: BTreeMap<String, DecisionTraceAsset>,
 }
 
 #[derive(Clone)]
@@ -2914,6 +2928,7 @@ impl DecisionEngine {
             mfce_time_high_watermark: 0,
             ledger_time_high_watermark: 0,
             snapshot_generation: None,
+            last_decision_trace: BTreeMap::new(),
         })
     }
 
@@ -6504,7 +6519,7 @@ impl DecisionEngine {
             deployment_equity: deployment.deployment_equity,
             micro_slots: decision.micro_slots.clone(),
             proposed_action_notionals: proposed_action_notionals.clone(),
-            executable_action_notionals,
+            executable_action_notionals: executable_action_notionals.clone(),
         });
         let executable_by_asset = executable_actions
             .into_iter()
@@ -7270,6 +7285,52 @@ impl DecisionEngine {
             self.mfce
                 .delayed_mut()
                 .observe_episode_origin(&id, &asset, opened_at, mfce_now, origin);
+        }
+        // Per-asset planning trace for the latest decision: where each
+        // candidate died between projection target and submitted intent.
+        {
+            let mut trace_keys = BTreeSet::new();
+            for asset in decision
+                .projection
+                .constrained_targets
+                .keys()
+                .chain(proposed_action_notionals.keys())
+                .chain(executable_action_notionals.keys())
+                .chain(self.pending.keys())
+                .chain(self.mfce.policy_output_assets().iter())
+            {
+                trace_keys.insert(asset.clone());
+            }
+            let mut trace = BTreeMap::new();
+            for asset in trace_keys.into_iter().take(64) {
+                trace.insert(
+                    asset.clone(),
+                    DecisionTraceAsset {
+                        constrained: decision
+                            .projection
+                            .constrained_targets
+                            .get(&asset)
+                            .copied()
+                            .unwrap_or_default(),
+                        proposed: proposed_action_notionals
+                            .get(&asset)
+                            .copied()
+                            .unwrap_or_default(),
+                        executable: executable_action_notionals
+                            .get(&asset)
+                            .copied()
+                            .unwrap_or_default(),
+                        components_empty: component_targets_by_asset
+                            .get(&asset)
+                            .is_some_and(|targets| targets.is_empty()),
+                        in_pending: self.pending.contains_key(&asset),
+                        mfce_admitted: self
+                            .fresh_mfce_policy_output_at(&asset, mfce_now)
+                            .is_some_and(|output| output.admitted),
+                    },
+                );
+            }
+            self.last_decision_trace = trace;
         }
         self.refresh_desired_books();
 
@@ -8238,6 +8299,10 @@ impl DecisionEngine {
 
     pub fn metrics(&self) -> &EngineMetrics {
         &self.metrics
+    }
+
+    pub fn last_decision_trace(&self) -> &BTreeMap<String, DecisionTraceAsset> {
+        &self.last_decision_trace
     }
 
     pub fn unresolved_actionable_root_count(&self) -> usize {
@@ -11131,6 +11196,19 @@ pub(crate) mod tests {
 
     #[test]
     fn unavailable_manual_hold_does_not_block_other_asset_intent() {
+        unavailable_manual_hold_scenario(Decimal::new(-6, 2));
+    }
+
+    #[test]
+    fn production_scale_manual_book_does_not_silence_other_asset_decisions() {
+        // Production mirror: the operator book is hundreds of units and
+        // deeply underwater, not dust. If projection sizing or validation
+        // fails closed on that scale, every admitted output dies silently
+        // with zero lifecycle events, exactly the live symptom.
+        unavailable_manual_hold_scenario(Decimal::from(-300));
+    }
+
+    fn unavailable_manual_hold_scenario(manual_quantity: Decimal) {
         let now = 60_000;
         let mut engine = flow_engine(now);
         engine
@@ -11165,7 +11243,7 @@ pub(crate) mod tests {
         assert!(engine.pending.contains_key("BTC"));
         let btc_action = engine.pending["BTC"].action.clone();
 
-        engine.production_positions = Some(BTreeMap::from([("ETH".into(), Decimal::new(-6, 2))]));
+        engine.production_positions = Some(BTreeMap::from([("ETH".into(), manual_quantity)]));
         engine
             .construct_next_decision(now + 1_000)
             .unwrap()
@@ -11185,6 +11263,11 @@ pub(crate) mod tests {
             assert_eq!(intents[0].planned_cloid, btc_action.planned_cloid);
         }
         assert!(intents.iter().any(|intent| intent.asset == "BTC"));
+        let trace = engine.last_decision_trace();
+        assert!(!trace.is_empty());
+        if let Some(btc) = trace.get("BTC") {
+            assert!(!btc.executable.is_zero() || btc.in_pending);
+        }
     }
 
     #[test]
