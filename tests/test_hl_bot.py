@@ -609,6 +609,21 @@ class VerifierStreamingContract(unittest.TestCase):
         self.assertIsInstance(asset['in_pending'], bool)
         self.assertIsInstance(asset['mfce_admitted'], bool)
 
+    def test_dispatch_telemetry_keys_pin_per_kind_evidence(self):
+        # Per-kind dispatch evidence for the next scheduler stall triage:
+        # which request kinds complete and how long they wait.
+        status={'decisions_total': 1385,
+            'transport_latency_ms_by_kind': {'exchange_metadata': {'samples': 1, 'total_ms': 900, 'maximum_ms': 900}},
+            'queue_wait_ms_by_tier': {'inactive': {'samples': 100, 'total_ms': 5000, 'maximum_ms': 200}},
+            'accepted_count_by_tier': {'inactive': 100}}
+        self.assertIsInstance(status['decisions_total'], int)
+        for key in ['transport_latency_ms_by_kind', 'queue_wait_ms_by_tier',
+                    'accepted_count_by_tier']:
+            self.assertIn(key, status, key)
+        for summary in status['transport_latency_ms_by_kind'].values():
+            for field in ['samples', 'total_ms', 'maximum_ms']:
+                self.assertIn(field, summary, field)
+
 
 if __name__ == '__main__':
     unittest.main()

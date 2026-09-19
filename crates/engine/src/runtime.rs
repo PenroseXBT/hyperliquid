@@ -247,6 +247,10 @@ struct ContinuousStatus<'a> {
     scheduler_maximum_in_flight: usize,
     decisions_total: u64,
     last_decision_trace: BTreeMap<String, DecisionTraceAsset>,
+    transport_latency_ms_by_kind:
+        BTreeMap<crate::domain::scheduler::ReadRequestKind, LatencySummary>,
+    queue_wait_ms_by_tier: BTreeMap<crate::domain::scheduler::SourceTier, LatencySummary>,
+    accepted_count_by_tier: BTreeMap<crate::domain::scheduler::SourceTier, u64>,
     unique_source_transitions: u64,
     modeled_executions_retained: usize,
     mfce_completed_transition_labels: usize,
@@ -845,11 +849,10 @@ pub async fn run_continuous_daemon(options: RuntimeOptions) -> Result<PathBuf, B
                 120_000,
                 &mut counters,
             )?;
-            metadata_due = if streaming_enabled {
-                now + 6 * 60 * 60_000
-            } else {
-                now + 60_000
-            };
+            metadata_due = now.saturating_add(metadata_rearm_interval_ms(
+                streaming_enabled,
+                market_directory.is_some(),
+            ));
         }
         if !streaming_enabled && now >= book_enqueue_due {
             let urgent_assets = engine.urgent_book_assets().into_iter().collect::<Vec<_>>();
@@ -1599,6 +1602,9 @@ fn write_continuous_status(
         scheduler_maximum_in_flight: counters.maximum_in_flight,
         decisions_total: engine.metrics().decisions,
         last_decision_trace: engine.last_decision_trace().clone(),
+        transport_latency_ms_by_kind: counters.transport_latency_ms_by_kind.clone(),
+        queue_wait_ms_by_tier: counters.queue_wait_ms_by_tier.clone(),
+        accepted_count_by_tier: counters.accepted_count_by_tier.clone(),
         unique_source_transitions: mfce.observed_transitions,
         modeled_executions_retained: engine.executions().len(),
         mfce_completed_transition_labels: mfce.completed_samples,
@@ -2376,6 +2382,19 @@ fn assign_source_tiers(
             )
         })
         .collect()
+}
+/// Exchange-metadata re-request cadence. The market directory gates trade
+/// subscriptions and therefore every source baseline: a single metadata
+/// attempt that expires out of the scheduler queue must not silence the
+/// daemon for six hours. Retry aggressively until the directory exists.
+fn metadata_rearm_interval_ms(streaming_enabled: bool, directory_present: bool) -> u64 {
+    if streaming_enabled && directory_present {
+        6 * 60 * 60_000
+    } else if streaming_enabled {
+        30_000
+    } else {
+        60_000
+    }
 }
 fn phase_staggered_source_due(
     config: &CopyTradeConfig,
@@ -3931,6 +3950,13 @@ mod tests {
         assert_eq!(phase_deadline(1_000, 20_000, 50, 100).unwrap(), 11_000);
         assert_eq!(phase_deadline(1_000, 20_000, 99, 100).unwrap(), 20_800);
         assert!(phase_deadline(0, 20_000, 0, 0).is_err());
+    }
+    #[test]
+    fn metadata_rearm_is_aggressive_until_the_directory_exists() {
+        assert_eq!(metadata_rearm_interval_ms(true, true), 6 * 60 * 60_000);
+        assert_eq!(metadata_rearm_interval_ms(true, false), 30_000);
+        assert_eq!(metadata_rearm_interval_ms(false, true), 60_000);
+        assert_eq!(metadata_rearm_interval_ms(false, false), 60_000);
     }
     #[test]
     fn streaming_status_serializes_every_verifier_required_key() {
