@@ -402,7 +402,7 @@ class IncidentMonitoring(unittest.TestCase):
         db=sqlite3.connect(':memory:');db.execute('CREATE TABLE state(key TEXT PRIMARY KEY,value TEXT)')
         envelope={'engine_alive':True,'stale':False,'pause_requested':False,'operations':{'run_id':'run-1'},'verification':{'status':'VERIFIED','verified_at':100,'deadline':900},
             'clean_reset':{'action':'reset'},'status':{'healthy':True,'fatal_stop':False,'execution_state':'NORMAL','strategy_target_execution_enabled':True,
-            'candidate_count':375,'streaming':{'source_healthy':True,'live_state_confirmed':375,'scan_commits':1},'persistence_failures':0,'source_persistence_failures':0,
+            'candidate_count':375,'streaming':{'source_healthy':True,'live_state_confirmed':375,'engine_live_state_confirmed':375,'durable_baselines':375,'hydrated_source_count':375,'live_state_recovering':0,'source_history_contiguous':375,'source_history_catching_up':0,'source_history_gapped':0,'coverage_reconciliation_wallets_pending':0,'coverage_reconciliation_wallets_pending_sample':[],'source_degraded_coverage_eligible':True,'scan_commits':1,'last_scan_commit_ms':1,'gaps':0},'persistence_failures':0,'source_persistence_failures':0,
             'reconciliation':{'recovery_pending':False,'verified_through_unix_ms':100_000,'dlq_depth':0}}}
         hl.record_observation(db,envelope,100)
         self.assertIsNone(db.execute('SELECT started FROM acceptance_runs').fetchone())
@@ -421,7 +421,7 @@ class IncidentMonitoring(unittest.TestCase):
         db.execute("INSERT INTO acceptance_runs VALUES ('run-1',100,'FAILED','old',120)")
         envelope={'engine_alive':True,'stale':False,'pause_requested':False,'operations':{'run_id':'run-1'},'verification':{'status':'VERIFIED','verified_at':100,'deadline':900},
             'clean_reset':{'action':'reset'},'status':{'healthy':True,'fatal_stop':False,'execution_state':'NORMAL','candidate_count':375,
-            'streaming':{'source_healthy':True,'live_state_confirmed':375,'scan_commits':1},'persistence_failures':0,'source_persistence_failures':0,
+            'streaming':{'source_healthy':True,'live_state_confirmed':375,'engine_live_state_confirmed':375,'durable_baselines':375,'hydrated_source_count':375,'live_state_recovering':0,'source_history_contiguous':375,'source_history_catching_up':0,'source_history_gapped':0,'coverage_reconciliation_wallets_pending':0,'coverage_reconciliation_wallets_pending_sample':[],'source_degraded_coverage_eligible':True,'scan_commits':1,'last_scan_commit_ms':1,'gaps':0},'persistence_failures':0,'source_persistence_failures':0,
             'reconciliation':{'recovery_pending':False,'verified_through_unix_ms':100_000,'dlq_depth':0}}}
         hl.record_observation(db,envelope,130)
         hl.record_observation(db,envelope,145)
@@ -442,6 +442,74 @@ class IncidentMonitoring(unittest.TestCase):
             self.assertIn('status',bot.monitor_status())
         sleep.assert_called_once_with(1)
         self.assertEqual(len(calls),2)
+
+
+class VerifierStreamingContract(unittest.TestCase):
+    """Cross-language contract: every streaming key the verifier reads must be
+    present and typed. scan_commits was once required by Python but never
+    serialized by Rust, making the gate permanently false with no CI signal."""
+
+    def healthy_streaming(self, **overrides):
+        base={'source_healthy':True,'live_state_confirmed':375,'engine_live_state_confirmed':375,
+            'durable_baselines':375,'hydrated_source_count':375,'live_state_recovering':0,
+            'source_history_contiguous':375,'source_history_catching_up':0,'source_history_gapped':0,
+            'coverage_reconciliation_wallets_pending':0,'coverage_reconciliation_wallets_pending_sample':[],
+            'source_degraded_coverage_eligible':True,'scan_commits':1,'last_scan_commit_ms':1,'gaps':0}
+        base.update(overrides)
+        return base
+
+    def status(self, streaming):
+        return {'candidate_count':375,'persistence_failures':0,'source_persistence_failures':0,
+            'streaming':streaming}
+
+    def test_strict_healthy_cohort_passes(self):
+        streaming=self.healthy_streaming()
+        self.assertTrue(hl.source_coverage_gate(self.status(streaming), streaming))
+        self.assertTrue(hl.cohort_committed_gate(self.status(streaming), streaming))
+
+    def test_missing_coverage_keys_fail_closed_not_open(self):
+        # A dropped count key must never read as healthy; .get defaults keep this
+        # fail-closed, and this test pins that behavior.
+        for key in ['durable_baselines','hydrated_source_count']:
+            streaming=self.healthy_streaming()
+            del streaming[key]
+            sources=hl.source_coverage_gate(self.status(streaming), streaming)
+            self.assertFalse(sources, f'missing {key} must fail sources gate')
+        # Missing both confirmed counters fails even when the cohort is loaded.
+        streaming=self.healthy_streaming(live_state_confirmed=0,
+            engine_live_state_confirmed=0)
+        self.assertFalse(hl.source_coverage_gate(self.status(streaming), streaming))
+        # Missing scan_commits does not fail: streaming recovery persists
+        # per-wallet state rather than the cohort scan transaction, so the
+        # fully restored durable cohort still counts as committed when
+        # persistence is clean. Strict source coverage is unaffected.
+        streaming=self.healthy_streaming()
+        del streaming['scan_commits']
+        self.assertTrue(hl.cohort_committed_gate(self.status(streaming), streaming))
+        self.assertTrue(hl.source_coverage_gate(self.status(streaming), streaming))
+
+    def test_degraded_two_stragglers_pass_but_zero_confirmed_does_not(self):
+        degraded=self.healthy_streaming(source_healthy=False, live_state_confirmed=373,
+            engine_live_state_confirmed=373, durable_baselines=373, hydrated_source_count=373,
+            live_state_recovering=2, source_history_catching_up=2,
+            coverage_reconciliation_wallets_pending=2,
+            coverage_reconciliation_wallets_pending_sample=['a','b'],
+            source_degraded_coverage_eligible=True, scan_commits=1)
+        self.assertTrue(hl.source_coverage_gate(self.status(degraded), degraded))
+        rubber=self.healthy_streaming(source_healthy=False, live_state_confirmed=0,
+            engine_live_state_confirmed=0, durable_baselines=373, hydrated_source_count=373,
+            coverage_reconciliation_wallets_pending=2,
+            source_degraded_coverage_eligible=True, scan_commits=1)
+        self.assertFalse(hl.source_coverage_gate(self.status(rubber), rubber))
+
+    def test_gap_counters_are_observable_for_acceptance(self):
+        streaming=self.healthy_streaming(gaps=7, source_history_gapped=3,
+            source_history_catching_up=2)
+        rendered=hl.render_status({'stale':False,'age_seconds':4,'pause_requested':False,
+            'status':{**self.status(streaming),'healthy':True,'execution_state':'NORMAL',
+                'reconciliation':{'verified_through_unix_ms':int(time.time()*1000),
+                    'recovery_pending':False}}})
+        self.assertIn('stream gaps=7', rendered)
 
 
 if __name__ == '__main__':

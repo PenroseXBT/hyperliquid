@@ -23,7 +23,9 @@ remain internal and future persistence bumps keep using `/data/system-v1`.
 Runtime command (do not change without a new frozen build):
 
 ```sh
-/app/bin/run_su6_railway.sh
+python3 /app/bin/hl_bot.py supervise
+# which supervises:
+# /app/bin/run_su6_railway.sh
 # which execs:
 # /app/bin/engine continuous \
 #   --config /app/config/copytrade.json \
@@ -49,8 +51,8 @@ Key service semantics from `railway.toml`:
 
 - `builder = "DOCKERFILE"`, `dockerfilePath = "Dockerfile.railway"`
 - `region = "asia-southeast1-eqsg3a"`, `numReplicas = 1` — never scale to >1. Two writers corrupt the volume.
-- `restartPolicyType = "NEVER"`, `restartPolicyMaxRetries = 1` — a fatal engine exit is a **capital-safety latch**. It stays stopped until you diagnose and explicitly redeploy/restart.
-- `drainingSeconds = 300`, `overlapSeconds = 0` — Railway sends `SIGTERM`, `tini` forwards it, the wrapper forwards `SIGINT` to the engine for a graceful drain (up to 5 min). No zero-downtime overlap.
+- `restartPolicyType = "ALWAYS"`, `restartPolicyMaxRetries = 100` — the supervisor keeps telemetry online while the engine restarts under a pause. A fatal engine exit logs `supervisor_restart_required=true` and the supervisor re-verifies before unpausing; boot verification (not a stopped container) is the capital-safety latch.
+- `drainingSeconds = 90`, `overlapSeconds = 0` — Railway sends `SIGTERM`, `tini` forwards it, the wrapper forwards `SIGINT` to the engine for a graceful drain (up to 90 s). No zero-downtime overlap.
 
 ## 2. Prerequisites
 
@@ -119,12 +121,22 @@ bash scripts/build_production_release.sh
 #       git diff --check, cargo build --locked --release -p engine
 # writes: target/production-release/{test-report.txt,isolation-report.txt,engine.sha256}
 
-cp target/release/engine railway-frozen/engine
+```sh
+bash scripts/build_production_release.sh
+# runs: fmt --check, check, test, boundary check, git diff --check,
+#       musl release build → target/x86_64-unknown-linux-musl/release/engine
+# writes: target/production-release/{test-report.txt,isolation-report.txt,engine.sha256}
+
+cp target/x86_64-unknown-linux-musl/release/engine railway-frozen/engine
 cp target/production-release/engine.sha256 railway-frozen/engine.sha256
 cp config/copytrade.json railway-frozen/copytrade.json
 # + very-profitable-layer.json, read-api-policy.json, public-mainnet-transport.json
-sha256sum -c railway-frozen/engine.sha256
-./target/release/engine --config railway-frozen/copytrade.json \
+# The .sha256 line references /app/bin/engine (container path), so compare
+# hashes explicitly locally; `sha256sum -c` only passes inside the image:
+shasum -a 256 railway-frozen/engine | cut -d ' ' -f 1
+cut -d ' ' -f 1 railway-frozen/engine.sha256
+# the two hashes must match
+./target/x86_64-unknown-linux-musl/release/engine --config railway-frozen/copytrade.json \
   --very-profitable-layer railway-frozen/very-profitable-layer.json \
   --print-persistence-schema-hash
 ```
@@ -137,7 +149,7 @@ Dashboard path:
 
 1. New Project → Deploy from GitHub repo → select this repo/branch.
 2. Service Settings → Build → Builder: `Dockerfile`, Path: `Dockerfile.railway`.
-3. Settings → Deploy → Start Command: `/app/bin/run_su6_railway.sh`, Region: `asia-southeast1-eqsg3a` (or keep `railway.toml` as source of truth).
+3. Settings → Deploy → Start Command: `python3 /app/bin/hl_bot.py supervise`, Region: `asia-southeast1-eqsg3a` (or keep `railway.toml` as source of truth).
 4. Add a Volume (e.g. 5–10 GB) mounted at `/data`. This provides the permanent `/data/system-v1` root.
 5. Variables → add `SU6_DATA_ROOT=/data/system-v1`, `HYPERLIQUID_EXECUTION_ACCOUNT`, `HYPERLIQUID_API_WALLET_SECRET` (secret).
 6. Deploy.
@@ -175,19 +187,21 @@ railway run cat /data/system-v1/failure/current-run.meta
 
 ### D. Normal operations
 
-- **Graceful stop:** Stop / Redeploy from dashboard (sends `SIGTERM`). Expect `continuous_engine_stopped_by_operator=true exit=…` and exit 0. Wait for drain (≤300 s) before wiping the volume.
+- **Graceful stop:** Stop / Redeploy from dashboard (sends `SIGTERM`). Expect `continuous_engine_stopped_by_operator=true exit=…` and exit 0. Wait for drain (≤90 s) before wiping the volume.
 - **Config change:** never edit `/app/config` or `/app/policy` live. Edit repo source → re-freeze (`§4A`) → commit → redeploy. The new image re-verifies sha + schema hash at build.
 - **One replica only.** Do not add replicas, doublers, or a second service sharing the same `SU6_DATA_ROOT` (`/data/system-v1`).
 
 ## 5. When it stops (expected behavior)
 
-`restartPolicyType = NEVER` means **any unexpected engine exit stays stopped**. Logs will show one of:
+`restartPolicyType = ALWAYS` with Railway backoff means an unexpected engine exit is supervised, not silent. Logs will show one of:
 
 ```
-continuous_engine_unexpected_exit=true exit=<code> operator_restart_required=true
+continuous_engine_unexpected_exit=true exit=<code> supervisor_restart_required=true
 continuous_engine_exited_without_operator_request=true   # exit 0 without SIGINT/SIGTERM → normalized to 1
 predecessor_diagnostic_persistence_failed=true
 ```
+
+The supervisor pauses the engine, keeps telemetry online, and requires boot verification before unpausing — that gate (not a stopped container) is the capital-safety latch.
 
 Recovery procedure:
 
@@ -269,7 +283,10 @@ bash scripts/live_watch.sh logs
 
 # local preflight (before pushing)
 bash scripts/build_production_release.sh
-sha256sum -c railway-frozen/engine.sha256
+shasum -a 256 railway-frozen/engine | cut -d ' ' -f 1
+cut -d ' ' -f 1 railway-frozen/engine.sha256
+# the two hashes must match (`sha256sum -c` only passes inside the image,
+# where the /app/bin/engine path exists)
 ```
 
 Files of record: `railway.toml`, `Dockerfile.railway`, `scripts/run_su6_railway.sh`, `railway-frozen/*`, `crates/engine/src/execution.rs` (`HYPERLIQUID_*`), `crates/engine/src/main.rs` + `runtime.rs` (`continuous --state-root`).

@@ -27,6 +27,48 @@ RAILWAY_API = "https://backboard.railway.com/graphql/v2"
 AUTO_ALERT_INTERVAL = 14 * 60
 STATUS_MAX_AGE = 120
 BOOT_TIMEOUT = 900
+SOURCE_DEGRADED_PENDING_MAX = 2
+SOURCE_DEGRADED_CONFIRMED_FLOOR = 370
+
+
+def source_coverage_gate(status, streaming):
+    candidate_count = int(status.get('candidate_count') or 0)
+    if candidate_count <= 0:
+        return False
+    pending = int(streaming.get('coverage_reconciliation_wallets_pending') or 0)
+    confirmed = max(int(streaming.get('live_state_confirmed') or 0),
+                    int(streaming.get('engine_live_state_confirmed') or 0))
+    durable = int(streaming.get('durable_baselines') or 0)
+    hydrated = int(streaming.get('hydrated_source_count') or 0)
+    strict = (streaming.get('source_healthy') is True
+              and confirmed == candidate_count
+              and durable == candidate_count
+              and hydrated == candidate_count)
+    if strict:
+        return True
+    # Documented degraded mode: the cohort is structurally loaded and clean,
+    # but at most two wallets are trailing current-generation confirmation.
+    # The engine excludes unconfirmed wallets from source targeting; this gate
+    # only prevents a single straggler from parking an otherwise live service.
+    return (streaming.get('source_degraded_coverage_eligible') is True
+            and pending <= SOURCE_DEGRADED_PENDING_MAX
+            and durable >= candidate_count - SOURCE_DEGRADED_PENDING_MAX
+            and hydrated >= candidate_count - SOURCE_DEGRADED_PENDING_MAX
+            and confirmed >= SOURCE_DEGRADED_CONFIRMED_FLOOR)
+
+
+def cohort_committed_gate(status, streaming):
+    candidate_count = int(status.get('candidate_count') or 0)
+    if int(streaming.get('scan_commits') or 0) > 0:
+        return True
+    # Streaming recovery persists per-wallet source state rather than using the
+    # cohort scan transaction on every boot. Treat the fully restored durable
+    # cohort as committed only when persistence is clean; source_coverage_gate
+    # still controls whether live targeting is eligible.
+    return (candidate_count > 0
+            and int(streaming.get('durable_baselines') or 0) >= candidate_count
+            and int(streaming.get('hydrated_source_count') or 0) >= candidate_count
+            and status.get('source_persistence_failures') == 0)
 
 
 def verification_checks(envelope):
@@ -38,8 +80,8 @@ def verification_checks(envelope):
             'execution': status.get('execution_state') == 'NORMAL',
             'reconciliation': recon.get('recovery_pending') is False and recon.get('verified_through_unix_ms') is not None,
             'dlq': recon.get('dlq_depth') == 0,
-            'sources': streaming.get('source_healthy') is True and streaming.get('live_state_confirmed') == status.get('candidate_count') and bool(status.get('candidate_count')),
-            'cohort_committed': streaming.get('scan_commits',0) > 0,
+            'sources': source_coverage_gate(status, streaming),
+            'cohort_committed': cohort_committed_gate(status, streaming),
             'persistence': status.get('persistence_failures') == 0 and status.get('source_persistence_failures') == 0}
 
 
@@ -450,7 +492,7 @@ def render_status(envelope, horizon="since_process_start"):
         f"Edge-only: blockers_removed={status.get('blockers_removed', (status.get('mfce') or {}).get('blockers_removed', True))}; degraded={status.get('degraded_reasons', [])}; uptime_s={status.get('uptime_seconds', status.get('elapsed_seconds'))}; solvency_floor=RISK_ONLY+reconciliation+projection",
         f"SQLite prior: diagnostics only, never enters state.samples/LightGBM matrix; sqlite_prior_performance=separate",
         f"Positions (last observed; account validity={not stale and recon.get('recovery_pending') is False}): {status.get('exchange_risk_positions')}",
-        f"Signals: confirmed={stream.get('live_state_confirmed')}/{status.get('candidate_count')}; pending={stream.get('coverage_reconciliation_wallets_pending')}; stream gaps={stream.get('gaps')}",
+        f"Signals: confirmed={stream.get('live_state_confirmed')}/{status.get('candidate_count')}; pending={stream.get('coverage_reconciliation_wallets_pending')}; recovering={stream.get('live_state_recovering')}; history_gapped={stream.get('source_history_gapped')}; stream gaps={stream.get('gaps')}; scan_commits={stream.get('scan_commits')}",
         f"Model epoch={status.get('mfce_model_epoch')}; last evaluated outputs={len((status.get('mfce') or {}).get('policy_outputs', []))}"]
     lines += operational_lines(envelope)
     lines.append(f"Boot verification: {envelope.get('verification', {'status':'UNVERIFIED'})}; acceptance: {envelope.get('acceptance', 'clock not started')}")

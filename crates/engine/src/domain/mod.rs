@@ -14,8 +14,6 @@ pub mod ioc;
 pub mod ledger;
 pub mod lifecycle;
 pub mod live_trading;
-#[cfg(test)]
-pub mod planning_fixture;
 pub mod portfolio_risk;
 pub mod release;
 pub mod scheduler;

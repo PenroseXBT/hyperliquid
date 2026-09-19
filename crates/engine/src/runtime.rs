@@ -254,12 +254,13 @@ struct ContinuousStatus<'a> {
     mfce: crate::mfce::MfceReport,
     economics: Vec<RollingEconomicStatus>,
 }
-#[derive(Debug, Clone, Copy, Serialize)]
+#[derive(Debug, Clone, Serialize)]
 struct StreamingRuntimeStatus {
     source_healthy: bool,
     hydrated_source_count: usize,
     durable_baselines: usize,
     live_state_confirmed: usize,
+    engine_live_state_confirmed: usize,
     live_state_recovering: usize,
     source_history_contiguous: usize,
     source_history_catching_up: usize,
@@ -269,6 +270,10 @@ struct StreamingRuntimeStatus {
     coverage_ready_markets: usize,
     coverage_stale_markets: usize,
     coverage_reconciliation_wallets_pending: usize,
+    coverage_reconciliation_wallets_pending_sample: Vec<String>,
+    source_degraded_coverage_eligible: bool,
+    scan_commits: u64,
+    last_scan_commit_ms: u128,
     coverage_reconciliations: u64,
     subscribed_hot_books: usize,
     connections: u64,
@@ -1616,6 +1621,7 @@ fn streaming_runtime_status(
         hydrated_source_count: sources.map_or(0, StreamingSourceBook::hydrated_count),
         durable_baselines: continuity.durable_baselines,
         live_state_confirmed: continuity.live_state_confirmed,
+        engine_live_state_confirmed: engine.live_confirmed_source_count(),
         live_state_recovering: continuity.live_state_recovering,
         source_history_contiguous: continuity.history_contiguous,
         source_history_catching_up: continuity.history_catching_up,
@@ -1626,6 +1632,14 @@ fn streaming_runtime_status(
         coverage_stale_markets: discovered_markets
             .saturating_sub(engine.source_market_coverage_count()),
         coverage_reconciliation_wallets_pending: engine.pending_source_wallets().len(),
+        coverage_reconciliation_wallets_pending_sample: engine
+            .pending_source_wallets()
+            .into_iter()
+            .take(8)
+            .collect(),
+        source_degraded_coverage_eligible: engine.pending_source_wallets().len() <= 2,
+        scan_commits: continuity.scan_commits,
+        last_scan_commit_ms: continuity.last_scan_commit_ms,
         coverage_reconciliations,
         subscribed_hot_books: subscribed_hot_books.len(),
         connections: metrics.connections.load(Ordering::SeqCst),
@@ -3848,5 +3862,83 @@ mod tests {
         assert_eq!(phase_deadline(1_000, 20_000, 50, 100).unwrap(), 11_000);
         assert_eq!(phase_deadline(1_000, 20_000, 99, 100).unwrap(), 20_800);
         assert!(phase_deadline(0, 20_000, 0, 0).is_err());
+    }
+    #[test]
+    fn streaming_status_serializes_every_verifier_required_key() {
+        // Contract with scripts/hl_bot.py: source_coverage_gate,
+        // cohort_committed_gate, verification_checks, and render_status read
+        // these streaming keys. A missing or mistyped key previously made the
+        // source gate permanently false (scan_commits) without any CI signal.
+        let status = StreamingRuntimeStatus {
+            source_healthy: true,
+            hydrated_source_count: 375,
+            durable_baselines: 375,
+            live_state_confirmed: 375,
+            engine_live_state_confirmed: 375,
+            live_state_recovering: 0,
+            source_history_contiguous: 375,
+            source_history_catching_up: 0,
+            source_history_gapped: 0,
+            discovered_markets: 10,
+            subscribed_trade_markets: 10,
+            coverage_ready_markets: 10,
+            coverage_stale_markets: 0,
+            coverage_reconciliation_wallets_pending: 0,
+            coverage_reconciliation_wallets_pending_sample: Vec::new(),
+            source_degraded_coverage_eligible: true,
+            scan_commits: 1,
+            last_scan_commit_ms: 1,
+            coverage_reconciliations: 2,
+            subscribed_hot_books: 1,
+            connections: 1,
+            gaps: 0,
+            public_trades_seen: 3,
+            tracked_trade_updates: 3,
+            book_updates: 3,
+            invalid_messages: 0,
+        };
+        let value = serde_json::to_value(&status).unwrap();
+        let object = value.as_object().unwrap();
+        for key in [
+            "source_healthy",
+            "hydrated_source_count",
+            "durable_baselines",
+            "live_state_confirmed",
+            "engine_live_state_confirmed",
+            "live_state_recovering",
+            "source_history_contiguous",
+            "source_history_catching_up",
+            "source_history_gapped",
+            "coverage_reconciliation_wallets_pending",
+            "coverage_reconciliation_wallets_pending_sample",
+            "source_degraded_coverage_eligible",
+            "scan_commits",
+            "last_scan_commit_ms",
+            "gaps",
+        ] {
+            assert!(object.contains_key(key), "streaming status missing {key}");
+        }
+        assert!(object["source_healthy"].is_boolean());
+        assert!(object["source_degraded_coverage_eligible"].is_boolean());
+        assert!(object["coverage_reconciliation_wallets_pending_sample"].is_array());
+        for key in [
+            "hydrated_source_count",
+            "durable_baselines",
+            "live_state_confirmed",
+            "engine_live_state_confirmed",
+            "live_state_recovering",
+            "source_history_contiguous",
+            "source_history_catching_up",
+            "source_history_gapped",
+            "coverage_reconciliation_wallets_pending",
+            "scan_commits",
+            "last_scan_commit_ms",
+            "gaps",
+        ] {
+            assert!(
+                object[key].is_u64(),
+                "streaming status key {key} must serialize as a number"
+            );
+        }
     }
 }

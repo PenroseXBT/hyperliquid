@@ -12,7 +12,7 @@ Source of truth: `scripts/build_production_release.sh:10-18`,
 
 | Source in repo | Frozen path | Path in container (`Dockerfile.railway:13-19`) |
 |---|---|---|
-| `target/release/engine` (from `cargo build --locked --release -p engine`) | `railway-frozen/engine` | `/app/bin/engine` |
+| `target/x86_64-unknown-linux-musl/release/engine` (from `cargo build --locked --release -p engine --target x86_64-unknown-linux-musl`) | `railway-frozen/engine` | `/app/bin/engine` |
 | `target/production-release/engine.sha256` (rewritten to container path, see below) | `railway-frozen/engine.sha256` | `/app/bin/engine.sha256` |
 | `config/copytrade.json` | `railway-frozen/copytrade.json` | `/app/config/copytrade.json` |
 | Reviewed layer file, copied by hand (no generator) | `railway-frozen/very-profitable-layer.json` | `/app/config/very-profitable-layer.json` |
@@ -35,9 +35,10 @@ Only the six files above are trusted inside the container.
 bash scripts/build_production_release.sh
 # runs: cargo fmt --check, cargo check, cargo test, boundary check,
 #       git diff --check, cargo build --locked --release -p engine
+#       (default target x86_64-unknown-linux-musl; override with ENGINE_RELEASE_TARGET)
 # writes: target/production-release/{test-report.txt,isolation-report.txt,engine.sha256}
 
-cp target/release/engine railway-frozen/engine
+cp target/x86_64-unknown-linux-musl/release/engine railway-frozen/engine
 cp target/production-release/engine.sha256 railway-frozen/engine.sha256
 cp config/copytrade.json railway-frozen/copytrade.json
 cp <reviewed-layer-path> railway-frozen/very-profitable-layer.json  # manual copy, see below
@@ -62,7 +63,7 @@ Local smoke test (the `-c` form only passes inside the image where
 shasum -a 256 railway-frozen/engine | cut -d ' ' -f 1
 cut -d ' ' -f 1 railway-frozen/engine.sha256
 # the two hashes must match
-./target/release/engine --config railway-frozen/copytrade.json \
+./target/x86_64-unknown-linux-musl/release/engine --config railway-frozen/copytrade.json \
   --very-profitable-layer railway-frozen/very-profitable-layer.json \
   --print-persistence-schema-hash
 # same check Dockerfile.railway:25-29 runs at build time; a failure there never ships

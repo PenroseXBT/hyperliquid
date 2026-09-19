@@ -3,7 +3,7 @@ use crate::domain::authorized_intent::{
     AuthorizedExecutionIntent, PreSigningContext, TimeInForce, AUTHORIZED_INTENT_SCHEMA_VERSION,
 };
 use crate::domain::cohort::{
-    aggregate_authoritative_positions, classify_attribution, AttributionTag, CohortAssetAggregate,
+    aggregate_authoritative_positions, classify_attribution, CohortAssetAggregate,
     CohortDecisionReason, CohortIndicatorRecord, CohortPenalties, CohortRiskFlags,
     CohortSignalInput, VeryProfitableCohortEngine,
 };
@@ -1283,26 +1283,6 @@ pub struct DecisionPlanningAccounting {
     pub settled_equity: Decimal,
     pub deployment_equity: Decimal,
     pub micro_slots: BTreeMap<String, crate::domain::decision::MicroPositionSlot>,
-}
-
-#[derive(Debug, Clone, Serialize)]
-pub struct DecisionPlanCompactSummary {
-    pub observed_plan_count: usize,
-    pub raw_target_change_count: usize,
-    pub constrained_target_change_count: usize,
-    pub proposed_action_change_count: usize,
-    pub executable_action_change_count: usize,
-    pub below_minimum_action_count: usize,
-    pub first_decision_id: Option<String>,
-    pub last_decision_id: Option<String>,
-}
-
-#[derive(Debug, Clone, Serialize)]
-pub struct CohortDecisionCompactSummary {
-    pub observed_record_count: usize,
-    pub independent_execution_root_count: usize,
-    pub reason_occurrence_counts: BTreeMap<CohortDecisionReason, usize>,
-    pub attribution_occurrence_counts: BTreeMap<AttributionTag, usize>,
 }
 
 /// Why a new per-asset technical target version was created.
@@ -4434,11 +4414,6 @@ impl DecisionEngine {
         (now.saturating_sub(snapshot.received_at) <= deadline).then_some(snapshot)
     }
 
-    pub fn source_ever_accepted(&self, candidate: &str) -> bool {
-        self.source_sequences
-            .contains_key(&candidate.to_ascii_lowercase())
-    }
-
     fn record_cohort_runtime_rejection(
         &mut self,
         layer: &PreparedVeryProfitableLayer,
@@ -5363,10 +5338,14 @@ impl DecisionEngine {
                 .get(&asset)
                 .and_then(|flow| flow.features(mfce_now))
                 .is_some();
+            let authoritative_quantity = self.authoritative_position(&asset);
+            let has_source_component = !self.ledger.source_positions_for_asset(&asset).is_empty();
+            let unattributed_authoritative_position = self.production_identity.is_some()
+                && !authoritative_quantity.is_zero()
+                && !has_source_component;
             let unavailable = self.production_identity.is_some()
-                && !self.authoritative_position(&asset).is_zero()
-                && !source_known
-                && !flow_known;
+                && !authoritative_quantity.is_zero()
+                && (!source_known && !flow_known || unattributed_authoritative_position);
             let component_attribution_hold =
                 self.component_attribution_hold_assets.contains(&asset);
             let mark = mids
@@ -5567,17 +5546,24 @@ impl DecisionEngine {
                 .collect::<Result<BTreeMap<_, _>, _>>()?;
             let current_source_target = if self.production_positions.is_some() {
                 // Production fills live in the durable LiveTradingState, not
-                // the production DualLedger. Position-aware MFCE admission must
-                // therefore use the reconciled authoritative quantity.
+                // the production DualLedger. Position-aware MFCE admission may
+                // use the reconciled authoritative quantity only when the
+                // ledger already proves strategy/source ownership. A manual
+                // exchange position with no source component remains under
+                // risk authority and is held before reaching this path.
                 let authoritative = self
                     .authoritative_position(asset)
                     .checked_mul(mark)
                     .ok_or(EngineError::Arithmetic)?;
-                current_source_targets.clear();
-                if !authoritative.is_zero() {
-                    current_source_targets.insert("source:aggregate".into(), authoritative);
+                if current_source_targets.is_empty() && !authoritative.is_zero() {
+                    Decimal::ZERO
+                } else {
+                    current_source_targets.clear();
+                    if !authoritative.is_zero() {
+                        current_source_targets.insert("source:aggregate".into(), authoritative);
+                    }
+                    authoritative
                 }
-                authoritative
             } else {
                 current_source_targets
                     .values()
@@ -7984,31 +7970,8 @@ impl DecisionEngine {
             core(error)
         })
     }
-    pub fn persist_target_state(
-        &mut self,
-        path: impl AsRef<std::path::Path>,
-    ) -> Result<(), EngineError> {
-        self.target_ledger.save_atomic(path).map_err(|error| {
-            self.metrics.persistence_failures += 1;
-            core(error)
-        })
-    }
     pub fn target_ledger(&self) -> &VirtualTargetLedger {
         &self.target_ledger
-    }
-    pub fn restore_target_state(
-        &mut self,
-        path: impl AsRef<std::path::Path>,
-    ) -> Result<(), EngineError> {
-        let ledger = VirtualTargetLedger::load(path).map_err(core)?;
-        if let Some(version) = ledger.latest_target_version() {
-            self.previous_target = Some(PreviousTargetState {
-                version,
-                target_hash: canonical_target_hash(&ledger.admitted_targets()).map_err(core)?,
-            });
-        }
-        self.target_ledger = ledger;
-        Ok(())
     }
     pub fn ledger(&self) -> &DualLedger {
         &self.ledger
@@ -8349,102 +8312,6 @@ impl DecisionEngine {
 
     pub fn equity_buckets(&self) -> &[EquityReturnBucket] {
         &self.equity_buckets
-    }
-
-    pub fn plans(&self) -> &[DecisionPlanningAccounting] {
-        &self.plans
-    }
-
-    pub fn compact_decision_plan_summary(&self) -> DecisionPlanCompactSummary {
-        let pair_changes =
-            |field: fn(&DecisionPlanningAccounting) -> &BTreeMap<String, Decimal>| {
-                self.plans
-                    .windows(2)
-                    .filter(|pair| field(&pair[0]) != field(&pair[1]))
-                    .count()
-                    .saturating_add(usize::from(!self.plans.is_empty()))
-            };
-        DecisionPlanCompactSummary {
-            observed_plan_count: self.plans.len(),
-            raw_target_change_count: pair_changes(|plan| &plan.raw_desired_targets),
-            constrained_target_change_count: pair_changes(|plan| &plan.constrained_targets),
-            proposed_action_change_count: pair_changes(|plan| &plan.proposed_action_notionals),
-            executable_action_change_count: pair_changes(|plan| &plan.executable_action_notionals),
-            below_minimum_action_count: self
-                .plans
-                .iter()
-                .map(|plan| plan.below_minimum_action_count)
-                .sum(),
-            first_decision_id: self.plans.first().map(|plan| plan.decision_id.clone()),
-            last_decision_id: self.plans.last().map(|plan| plan.decision_id.clone()),
-        }
-    }
-
-    /// Retain exact material cohort decisions without retaining one repeated
-    /// evaluation record per scheduler tick. A failed window keeps the raw
-    /// replay journal, which remains the complete diagnostic source.
-    pub fn compact_cohort_decision_records(&self) -> Vec<&CohortIndicatorRecord> {
-        let mut material = BTreeMap::<(String, u64), &CohortIndicatorRecord>::new();
-        let mut rejection_classes =
-            BTreeMap::<(String, BTreeSet<CohortDecisionReason>), &CohortIndicatorRecord>::new();
-        for record in &self.cohort_indicator_records {
-            if record.independent_execution_root
-                || !record.very_profitable_cohort_target.is_zero()
-                || record.target_version > 0
-            {
-                material.insert((record.asset.clone(), record.target_version), record);
-            } else {
-                rejection_classes.insert((record.asset.clone(), record.reasons.clone()), record);
-            }
-        }
-        let mut compact = material
-            .into_values()
-            .chain(rejection_classes.into_values())
-            .collect::<Vec<_>>();
-        compact.sort_by(|left, right| {
-            left.cohort_snapshot_timestamp_ms
-                .cmp(&right.cohort_snapshot_timestamp_ms)
-                .then_with(|| left.asset.cmp(&right.asset))
-                .then_with(|| left.target_version.cmp(&right.target_version))
-        });
-        compact
-    }
-
-    pub fn compact_cohort_decision_summary(&self) -> CohortDecisionCompactSummary {
-        let mut reason_occurrence_counts = BTreeMap::new();
-        let mut attribution_occurrence_counts = BTreeMap::new();
-        for record in &self.cohort_indicator_records {
-            for reason in &record.reasons {
-                *reason_occurrence_counts.entry(*reason).or_default() += 1;
-            }
-            for attribution in &record.attribution {
-                *attribution_occurrence_counts
-                    .entry(*attribution)
-                    .or_default() += 1;
-            }
-        }
-        CohortDecisionCompactSummary {
-            observed_record_count: self.cohort_indicator_records.len(),
-            independent_execution_root_count: self
-                .cohort_indicator_records
-                .iter()
-                .filter(|record| record.independent_execution_root)
-                .count(),
-            reason_occurrence_counts,
-            attribution_occurrence_counts,
-        }
-    }
-
-    pub fn cohort_indicator_records(&self) -> &[CohortIndicatorRecord] {
-        &self.cohort_indicator_records
-    }
-
-    pub fn technical_decision_records(&self) -> &[TechnicalDecisionRecord] {
-        &self.technical_decision_records
-    }
-
-    pub fn book_evaluation_events(&self) -> &[BookEvaluationEvent] {
-        &self.book_evaluation_events
     }
 
     pub fn action_lifecycle_events(&self) -> &[ActionLifecycleEvent] {
@@ -11648,7 +11515,7 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn unattributable_manual_portfolio_delta_rejects_order_without_killing_engine() {
+    fn unattributable_manual_portfolio_delta_holds_before_order_boundary() {
         let now = 60_000;
         let mut engine = flow_engine(now);
         engine.enable_production_intents(ProductionIntentIdentity {
@@ -11680,13 +11547,19 @@ pub(crate) mod tests {
 
         let decision = engine.construct_next_decision(now).unwrap().unwrap();
 
-        assert!(decision.projection.constrained_targets.contains_key("BTC"));
+        assert_eq!(
+            decision
+                .projection
+                .constrained_targets
+                .get("BTC")
+                .copied()
+                .unwrap_or_default(),
+            Decimal::ZERO
+        );
         assert!(engine.pending.is_empty());
         assert!(engine.take_prepared_authorized_intents().is_empty());
         assert!(engine.strategy_target_execution_enabled());
-        assert!(engine.action_lifecycle_events.iter().any(|event| {
-            event.asset == "BTC" && event.outcome == ActionAttemptOutcome::BlockedByCurrentRisk
-        }));
+        assert!(engine.action_lifecycle_events.is_empty());
 
         let lifecycle_count = engine.action_lifecycle_events.len();
         engine

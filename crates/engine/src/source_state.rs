@@ -89,6 +89,8 @@ pub struct SourceContinuityStatus {
     pub history_contiguous: usize,
     pub history_catching_up: usize,
     pub history_gapped: usize,
+    pub scan_commits: u64,
+    pub last_scan_commit_ms: u128,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
@@ -368,6 +370,8 @@ impl SourceStateStore {
                         history_contiguous: row.get::<_, i64>(3)?.max(0) as usize,
                         history_catching_up: row.get::<_, i64>(4)?.max(0) as usize,
                         history_gapped: row.get::<_, i64>(5)?.max(0) as usize,
+                        scan_commits: self.scan_commits,
+                        last_scan_commit_ms: self.last_scan_commit_ms,
                     })
                 },
             )
@@ -1240,7 +1244,9 @@ mod tests {
                     live_state_recovering: 375,
                     history_contiguous: 1,
                     history_catching_up: 374,
-                    history_gapped: 0
+                    history_gapped: 0,
+                    scan_commits: 0,
+                    last_scan_commit_ms: 0
                 }
             );
             let history_after: String = store.connection.query_row("SELECT group_concat(wallet_address||':'||COALESCE(last_fill_time_ms,0)||':'||COALESCE(last_fill_event_key,'')||':'||COALESCE(contiguous_through_ms,0)||':'||history_state||':'||unrecoverable_history_gap,'|') FROM (SELECT * FROM source_history_cursor ORDER BY wallet_address)",[],|r|r.get(0)).unwrap();
@@ -1492,6 +1498,8 @@ mod tests {
                 history_contiguous: 0,
                 history_catching_up: 1,
                 history_gapped: 0,
+                scan_commits: 0,
+                last_scan_commit_ms: 0,
             }
         );
         assert!(matches!(

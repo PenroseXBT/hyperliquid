@@ -20,7 +20,7 @@ Dashboard path:
 
 1. New Project → Deploy from GitHub repo → select this repo/branch.
 2. Service Settings → Build → Builder: `DOCKERFILE`, Path: `Dockerfile.railway`.
-3. Settings → Deploy → Start Command: `/app/bin/run_su6_railway.sh`,
+3. Settings → Deploy → Start Command: `python3 /app/bin/hl_bot.py supervise`,
    Region: `asia-southeast1-eqsg3a` (or keep `railway.toml` as source of truth).
    Keep 1 replica — never scale to >1.
 4. Add a Volume (e.g. 5–10 GB) mounted at `/data`. This provides the

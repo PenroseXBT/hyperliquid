@@ -230,12 +230,6 @@ pub trait AuthenticatedExchangeTransport: Send + Sync {
             })
         }
     }
-
-    /// DEXes this transport will reconcile. `[""]` preserves native-only
-    /// behavior unless the signer is told about active builder DEXes.
-    fn reconciled_dexes(&self) -> Vec<String> {
-        vec![String::new()]
-    }
 }
 
 /// Merge per-DEX position snapshots. Wire keys are canonical (`GOLD` vs

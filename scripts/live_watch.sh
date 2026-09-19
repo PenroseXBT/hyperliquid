@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # live_watch.sh — SU6 Railway session terminal interface.
 #
-# Only two commands. No extra monitoring stack.
+# Only three commands. No extra monitoring stack.
 #
 #   bash scripts/live_watch.sh watch   # live filtered tail (default)
 #   bash scripts/live_watch.sh fail    # failure dump from persisted volume artifacts
@@ -11,6 +11,7 @@
 #   source scripts/live_watch.sh
 #   hlwatch
 #   hlfail
+#   hllogs
 #
 # Canonical production generation SYSTEM_V1. Override only for local testing:
 #   SU6_DATA_ROOT=/data/system-v1 bash scripts/live_watch.sh fail
@@ -33,8 +34,9 @@ hlwatch() {
 
 hlfail() {
     # Persisted diagnostics maintained by scripts/run_su6_railway.sh.
-    # Safe to run when the service is stopped: unexpected exits stay stopped
-    # (restartPolicyType=NEVER) precisely so you can inspect these first.
+    # Safe to run when the service is stopped: the supervisor pauses the
+    # engine under verification failure (restartPolicyType=ALWAYS with
+    # Railway backoff) precisely so you can inspect these first.
     local root="${1:-$SU6_DATA_ROOT}"
     echo "=== CURRENT RUN ==="
     railway run cat "$root/failure/current-run.meta"
