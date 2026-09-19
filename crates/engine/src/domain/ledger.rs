@@ -8,6 +8,11 @@ use std::error::Error;
 use std::fmt::{Display, Formatter};
 use std::path::Path;
 
+/// Ledger component carrying operator-owned exposure the strategy must never
+/// trade. Exchange authority proves the position exists; this label
+/// explicitly disclaims it as a strategy decision (see `reduce_external`).
+pub const RECOVERED_UNATTRIBUTED_COMPONENT: &str = "recovered:unattributed";
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct EpisodeId(pub [u8; 32]);
 
@@ -269,7 +274,7 @@ impl DualLedger {
         execution.decision_timestamp_mono = fill.occurred_at;
         // A missing allocation cannot be blended into a previously attributed
         // position. Preserve that case as reconciliation-required.
-        let unknown = "recovered:unattributed";
+        let unknown = RECOVERED_UNATTRIBUTED_COMPONENT;
         if next
             .source_positions_for_asset(&fill.asset)
             .keys()
@@ -386,7 +391,7 @@ impl DualLedger {
                 }
                 let book = next
                     .sources
-                    .entry("recovered:unattributed".into())
+                    .entry(RECOVERED_UNATTRIBUTED_COMPONENT.into())
                     .or_default();
                 let open = next.portfolio.open[&fill.asset].clone();
                 book.positions
@@ -550,7 +555,7 @@ impl DualLedger {
                     && episode.closed_at == closed_at
                     && self.episode_unattributed(episode.episode_id)
             });
-        if mixed && candidate_id != "recovered:unattributed" {
+        if mixed && candidate_id != RECOVERED_UNATTRIBUTED_COMPONENT {
             return Err(LedgerError::InvalidLiveEvent(
                 "unattributed episode cannot acquire source credit",
             ));

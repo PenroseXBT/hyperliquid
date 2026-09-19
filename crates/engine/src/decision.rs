@@ -31,6 +31,7 @@ use crate::domain::ioc::{
 };
 use crate::domain::ioc::{plan_marketable_ioc, DepthLevel, ExecutableBook, ExecutionFill};
 use crate::domain::ledger::DualLedger;
+use crate::domain::ledger::RECOVERED_UNATTRIBUTED_COMPONENT;
 use crate::domain::live_trading::{
     execution_from_verified_fill, FundingEventId, VerifiedExchangeFill, VerifiedFundingEvent,
 };
@@ -627,7 +628,7 @@ fn classify_economic_attribution(
     let mut positive = false;
     let mut negative = false;
     for (component, value) in contributions {
-        if component == "recovered:unattributed" {
+        if component == RECOVERED_UNATTRIBUTED_COMPONENT {
             return EconomicAttribution::UnattributedRecovered;
         }
         has_technical |= component.starts_with("technical:");
@@ -3879,15 +3880,24 @@ impl DecisionEngine {
     }
 
     /// Operator-owned exposure the strategy must never trade: an
-    /// authoritative reconciled position with no ledger source component.
-    /// Exchange authority proves the position exists; only the ledger proves
-    /// strategy ownership. Held assets keep no pending roots, emit no
-    /// intents, and never gate engine health, regardless of which planning
-    /// path admitted them.
+    /// authoritative reconciled position with no ledger source component
+    /// proving strategy ownership. Exchange authority proves the position
+    /// exists; only genuine strategy components prove ownership. A position
+    /// carried solely under `recovered:unattributed` is explicitly
+    /// disclaimed operator exposure. Held assets keep no pending roots,
+    /// emit no intents, and never gate engine health, regardless of which
+    /// planning path admitted them.
+    fn strategy_attributed_asset(&self, asset: &str) -> bool {
+        self.ledger
+            .source_positions_for_asset(asset)
+            .keys()
+            .any(|component| component != RECOVERED_UNATTRIBUTED_COMPONENT)
+    }
+
     fn production_manual_hold_blocks_asset(&self, asset: &str) -> bool {
         self.production_identity.is_some()
             && !self.authoritative_position(asset).is_zero()
-            && self.ledger.source_positions_for_asset(asset).is_empty()
+            && !self.strategy_attributed_asset(asset)
     }
 
     fn authoritative_assets(&self) -> Vec<String> {
@@ -5351,10 +5361,9 @@ impl DecisionEngine {
                 .and_then(|flow| flow.features(mfce_now))
                 .is_some();
             let authoritative_quantity = self.authoritative_position(&asset);
-            let has_source_component = !self.ledger.source_positions_for_asset(&asset).is_empty();
             let unattributed_authoritative_position = self.production_identity.is_some()
                 && !authoritative_quantity.is_zero()
-                && !has_source_component;
+                && !self.strategy_attributed_asset(&asset);
             let unavailable = self.production_identity.is_some()
                 && !authoritative_quantity.is_zero()
                 && (!source_known && !flow_known || unattributed_authoritative_position);
@@ -11673,6 +11682,52 @@ pub(crate) mod tests {
         );
         engine.production_positions = Some(BTreeMap::from([("AERO".into(), Decimal::from(-300))]));
         assert!(engine.ledger.source_positions_for_asset("AERO").is_empty());
+        // Production shape: the ledger carries the operator short solely
+        // under the recovered component, exactly as external reconciliation
+        // records it. That component explicitly disclaims strategy
+        // ownership, so the hold must still apply.
+        engine
+            .ledger
+            .apply_source_execution(
+                RECOVERED_UNATTRIBUTED_COMPONENT,
+                &crate::domain::ioc::ExecutionFill {
+                    execution_id: crate::domain::ioc::ExecutionFillId([9; 32]),
+                    action: PlannedAction {
+                        decision_id: DecisionId([9; 32]),
+                        target_version: TargetVersion(1),
+                        asset: "AERO".into(),
+                        side: Side::Sell,
+                        rounded_notional: Decimal::from(171),
+                        reduce_only: false,
+                        action_ordinal: 0,
+                        retry_generation: 0,
+                        planned_cloid: PlannedCloid([9; 16]),
+                    },
+                    decision_timestamp_mono: now,
+                    decision_market_snapshot_id: crate::domain::decision::MarketSnapshotId([9; 32]),
+                    evaluation_market_snapshot_id: crate::domain::decision::MarketSnapshotId(
+                        [9; 32],
+                    ),
+                    latency_scenario: crate::domain::ioc::LatencyScenario::Expected,
+                    configured_latency_ms: 0,
+                    proposed_limit_price: Decimal::new(5717, 4),
+                    rounded_quantity: Decimal::from(300),
+                    modeled_filled_quantity: Decimal::from(300),
+                    modeled_average_fill_price: Some(Decimal::new(5717, 4)),
+                    unfilled_ioc_remainder: Decimal::ZERO,
+                    modeled_filled_notional: Decimal::from(171),
+                    fees: Decimal::ZERO,
+                    funding: Decimal::ZERO,
+                    slippage: Decimal::ZERO,
+                    position_before: Decimal::ZERO,
+                    position_after: Decimal::from(-300),
+                },
+                now,
+            )
+            .unwrap();
+        assert!(!engine.ledger.source_positions_for_asset("AERO").is_empty());
+        assert!(!engine.strategy_attributed_asset("AERO"));
+        assert!(engine.production_manual_hold_blocks_asset("AERO"));
 
         for cycle in 0..12_u64 {
             let at = now + cycle * 1_000;
