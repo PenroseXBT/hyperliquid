@@ -3878,6 +3878,18 @@ impl DecisionEngine {
             .unwrap_or_else(|| self.ledger.portfolio_position(asset))
     }
 
+    /// Operator-owned exposure the strategy must never trade: an
+    /// authoritative reconciled position with no ledger source component.
+    /// Exchange authority proves the position exists; only the ledger proves
+    /// strategy ownership. Held assets keep no pending roots, emit no
+    /// intents, and never gate engine health, regardless of which planning
+    /// path admitted them.
+    fn production_manual_hold_blocks_asset(&self, asset: &str) -> bool {
+        self.production_identity.is_some()
+            && !self.authoritative_position(asset).is_zero()
+            && self.ledger.source_positions_for_asset(asset).is_empty()
+    }
+
     fn authoritative_assets(&self) -> Vec<String> {
         self.production_positions
             .as_ref()
@@ -6534,6 +6546,34 @@ impl DecisionEngine {
                 });
             }
         }
+        // Operator-owned exposure keeps no pending roots: purge any live
+        // root or book wait left by a flickering attribution before it can
+        // gate health or reach submission. Strategy assets (ledger source
+        // components present) are never touched here.
+        let held_pending: Vec<String> = self
+            .pending
+            .keys()
+            .chain(self.pending_book.keys())
+            .filter(|asset| self.production_manual_hold_blocks_asset(asset))
+            .cloned()
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect();
+        let mut purged_hold_root = false;
+        for asset in held_pending {
+            if self.pending.remove(&asset).is_some() {
+                purged_hold_root = true;
+                eprintln!(
+                    "manual_hold_pending_purged=true asset={asset} observed_at={now} action=ASSET_HOLD nonfatal=true"
+                );
+            }
+            if self.pending_book.remove(&asset).is_some() {
+                purged_hold_root = true;
+            }
+        }
+        if purged_hold_root {
+            self.refresh_desired_books();
+        }
         let waiting_assets = self.pending_book.keys().cloned().collect::<Vec<_>>();
         for asset in waiting_assets {
             let fresh_book = self
@@ -6597,6 +6637,21 @@ impl DecisionEngine {
             });
         }
         for (asset, action) in executable_by_asset {
+            if self.production_manual_hold_blocks_asset(&asset) {
+                // Defense in depth: the planning filter above should already
+                // have removed held assets, but a flickering attribution must
+                // never leave a live root (or a submittable reduce-only
+                // intent) on operator-owned exposure. Log-only on refusal:
+                // lifecycle events stay reserved for real attempts.
+                if self.pending.remove(&asset).is_some() {
+                    eprintln!(
+                        "manual_hold_pending_refused=true asset={asset} observed_at={now} action=ASSET_HOLD nonfatal=true"
+                    );
+                }
+                self.pending_book.remove(&asset);
+                self.refresh_desired_books();
+                continue;
+            }
             let fresh_book = self
                 .books
                 .get(&asset)
@@ -8178,12 +8233,14 @@ impl DecisionEngine {
 
     pub fn unresolved_actionable_root_count(&self) -> usize {
         self.pending
-            .values()
-            .map(|pending| pending.root_planned_cloid.as_str())
+            .iter()
+            .filter(|(asset, _)| !self.production_manual_hold_blocks_asset(asset))
+            .map(|(_, pending)| pending.root_planned_cloid.as_str())
             .chain(
                 self.pending_book
-                    .values()
-                    .map(|pending| pending.original_planned_cloid.as_str()),
+                    .iter()
+                    .filter(|(asset, _)| !self.production_manual_hold_blocks_asset(asset))
+                    .map(|(_, pending)| pending.original_planned_cloid.as_str()),
             )
             .chain(
                 self.continuations
@@ -8197,6 +8254,9 @@ impl DecisionEngine {
     pub fn unresolved_actionable_roots(&self) -> Vec<UnresolvedRootStatus> {
         let mut roots = Vec::new();
         for (asset, pending) in &self.pending {
+            if self.production_manual_hold_blocks_asset(asset) {
+                continue;
+            }
             roots.push(UnresolvedRootStatus {
                 asset: asset.clone(),
                 root_planned_cloid: pending.root_planned_cloid.clone(),
@@ -8215,6 +8275,9 @@ impl DecisionEngine {
             });
         }
         for (asset, pending) in &self.pending_book {
+            if self.production_manual_hold_blocks_asset(asset) {
+                continue;
+            }
             roots.push(UnresolvedRootStatus {
                 asset: asset.clone(),
                 root_planned_cloid: pending.original_planned_cloid.clone(),
@@ -11570,6 +11633,135 @@ pub(crate) mod tests {
         assert!(engine.pending_book.is_empty());
         assert!(engine.take_prepared_authorized_intents().is_empty());
         assert_eq!(engine.action_lifecycle_events.len(), lifecycle_count);
+    }
+
+    #[test]
+    fn manual_short_with_flow_and_moving_marks_never_roots_or_gates_health() {
+        // Production mirror: an operator-owned short with live flow, books,
+        // and drifting marks across many decision cycles. The engine must
+        // hold it without creating pending roots, preparing intents, logging
+        // per-pass churn, or counting it toward unresolved health.
+        let now = 60_000;
+        let mut engine = flow_engine(now);
+        engine.enable_production_intents(ProductionIntentIdentity {
+            observer_release_hash: [1; 32],
+            signer_release_hash: [1; 32],
+            release_manifest_hash: [2; 32],
+            market_rules_hash: [3; 32],
+            dynamic_floor_policy_hash: [4; 32],
+            ioc_policy_hash: [5; 32],
+            expires_after_ms: 10_000,
+        });
+        engine
+            .mids
+            .as_mut()
+            .unwrap()
+            .0
+            .mids
+            .insert("AERO".into(), Decimal::new(5717, 4));
+        let metadata = engine.metadata.as_mut().unwrap();
+        metadata.universe.push(MarketMetadataAsset {
+            name: "AERO".into(),
+            size_decimals: 3,
+            growth_mode: false,
+        });
+        metadata.contexts.insert(
+            "AERO".into(),
+            crate::public_mainnet::MarketAssetContext {
+                funding_rate_hourly: Decimal::ZERO,
+            },
+        );
+        engine.production_positions = Some(BTreeMap::from([("AERO".into(), Decimal::from(-300))]));
+        assert!(engine.ledger.source_positions_for_asset("AERO").is_empty());
+
+        for cycle in 0..12_u64 {
+            let at = now + cycle * 1_000;
+            // Drifting mark + fresh flow + fresh book every cycle, as in
+            // production. Any per-cycle root birth would accumulate here.
+            let mark = Decimal::new(5717 + cycle as i64 * 13, 4);
+            engine
+                .mids
+                .as_mut()
+                .unwrap()
+                .0
+                .mids
+                .insert("AERO".into(), mark);
+            let mut flow = MarketFlow::default();
+            flow.trade(at, 1, Decimal::from(10_000), false);
+            flow.last_sent_ms = at;
+            engine.ingest_market_flow("AERO".into(), flow, at);
+            engine.books.insert(
+                "AERO".into(),
+                (
+                    mfce_test_book(
+                        "AERO",
+                        at,
+                        mark - Decimal::new(1, 4),
+                        mark + Decimal::new(1, 4),
+                        Decimal::from(100),
+                    ),
+                    at,
+                ),
+            );
+            engine.construct_next_decision(at).unwrap().unwrap();
+            assert!(
+                engine.pending.is_empty(),
+                "cycle {cycle}: manual hold must not root"
+            );
+            assert!(
+                engine.pending_book.is_empty(),
+                "cycle {cycle}: manual hold must not await books"
+            );
+            assert!(
+                engine.take_prepared_authorized_intents().is_empty(),
+                "cycle {cycle}: manual hold must not prepare intents"
+            );
+            assert_eq!(
+                engine.unresolved_actionable_root_count(),
+                0,
+                "cycle {cycle}: manual hold must not gate health"
+            );
+            assert!(engine.strategy_target_execution_enabled());
+        }
+        assert!(engine.action_lifecycle_events.is_empty());
+
+        // A stale root left by a flickering attribution (the production
+        // failure shape) is purged on the next decision without gating
+        // health or reaching submission.
+        engine.pending.insert(
+            "AERO".into(),
+            PendingAction {
+                action: PlannedAction {
+                    decision_id: DecisionId([7; 32]),
+                    target_version: TargetVersion(1),
+                    asset: "AERO".into(),
+                    side: Side::Buy,
+                    rounded_notional: Decimal::from(150),
+                    reduce_only: true,
+                    action_ordinal: 0,
+                    retry_generation: 0,
+                    planned_cloid: PlannedCloid([8; 16]),
+                },
+                root_planned_cloid: PlannedCloid([8; 16]).to_string(),
+                remaining_order_quantity: Decimal::ONE,
+                component_remaining: BTreeMap::new(),
+                mfce_lineage: Default::default(),
+                execution: None,
+            },
+        );
+        assert_eq!(engine.unresolved_actionable_root_count(), 0);
+        engine
+            .construct_next_decision(now + 12_000)
+            .unwrap()
+            .unwrap();
+        assert!(engine.pending.is_empty());
+        assert!(engine.take_prepared_authorized_intents().is_empty());
+        assert_eq!(engine.unresolved_actionable_root_count(), 0);
+        // The stale root retires as blocked risk without ever becoming an
+        // intent; nothing else is emitted across all thirteen cycles.
+        assert!(engine.action_lifecycle_events.iter().all(|event| {
+            event.asset == "AERO" && event.outcome == ActionAttemptOutcome::BlockedByCurrentRisk
+        }));
     }
 
     #[test]
