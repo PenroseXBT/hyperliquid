@@ -1320,6 +1320,8 @@ mod tests {
             open_order_state_complete: true,
             unconstrained_targets: targets,
             market_rules,
+            gross_cap_override: None,
+            held_manual_assets: BTreeSet::new(),
         };
         let hash =
             derive_projection_hash(&project_and_validate_portfolio(&input).unwrap()).unwrap();

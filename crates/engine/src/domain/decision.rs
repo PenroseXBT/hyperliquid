@@ -926,6 +926,8 @@ mod tests {
                 )]
                 .into_iter()
                 .collect(),
+                gross_cap_override: None,
+                held_manual_assets: BTreeSet::new(),
             },
             previous_target: None,
             created_at_mono: 1_000,

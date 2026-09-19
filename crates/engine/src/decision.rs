@@ -3917,6 +3917,67 @@ impl DecisionEngine {
             && !self.strategy_attributed_asset(asset)
     }
 
+    fn held_manual_assets(&self) -> BTreeSet<String> {
+        self.authoritative_assets()
+            .into_iter()
+            .filter(|asset| self.production_manual_hold_blocks_asset(asset))
+            .collect()
+    }
+
+    fn gross_cap_override(&self, settled_equity: Decimal) -> Result<Option<Decimal>, EngineError> {
+        let Some(multiple) = self.config.global_risk.gross_cap_settled_multiple else {
+            return Ok(None);
+        };
+        let multiple_decimal = Decimal::from_f64(multiple).ok_or(EngineError::Arithmetic)?;
+        settled_equity
+            .checked_mul(multiple_decimal)
+            .ok_or(EngineError::Arithmetic)
+            .map(Some)
+    }
+
+    pub fn manual_book_over_caps(&self) -> Option<String> {
+        let held = self.held_manual_assets();
+        if held.is_empty() {
+            return None;
+        }
+        let mids = self.mids.as_ref().map(|(snapshot, _)| &snapshot.mids)?;
+        let mut gross = Decimal::ZERO;
+        for asset in &held {
+            let quantity = self.authoritative_position(asset);
+            if quantity.is_zero() {
+                continue;
+            }
+            let mark = mids.get(asset)?;
+            let notional = quantity.checked_mul(*mark)?;
+            gross = gross.checked_add(notional.abs())?;
+        }
+        if gross.is_zero() {
+            return None;
+        }
+        let deployment = self.deployment_equity().ok()?;
+        let cap = self
+            .gross_cap_override(deployment.settled_equity)
+            .ok()
+            .flatten()
+            .or_else(|| {
+                let equity = deployment.deployment_equity;
+                let equity_f64 = equity.to_f64()?;
+                let leverage = curve_leverage(&self.config, equity_f64).ok()?;
+                let leverage_decimal = Decimal::from_f64(leverage)?;
+                let scale = Decimal::from_f64(self.config.global_risk.global_risk_scale)?;
+                equity
+                    .checked_mul(leverage_decimal)
+                    .and_then(|value| value.checked_mul(scale))
+            })?;
+        if gross > cap {
+            Some(format!(
+                "manual_book_over_caps=true gross={gross} cap={cap}"
+            ))
+        } else {
+            None
+        }
+    }
+
     fn authoritative_assets(&self) -> Vec<String> {
         self.production_positions
             .as_ref()
@@ -6358,6 +6419,8 @@ impl DecisionEngine {
             open_order_state_complete: true,
             unconstrained_targets: BTreeMap::new(),
             market_rules,
+            gross_cap_override: self.gross_cap_override(deployment.settled_equity)?,
+            held_manual_assets: self.held_manual_assets(),
         };
         let execution_cushion = Decimal::from_f64(self.config.slippage_buffer_bps / 10_000.0)
             .ok_or(EngineError::Arithmetic)?;
@@ -11218,6 +11281,98 @@ pub(crate) mod tests {
         // fails closed on that scale, every admitted output dies silently
         // with zero lifecycle events, exactly the live symptom.
         unavailable_manual_hold_scenario(Decimal::from(-300));
+    }
+
+    #[test]
+    fn dynamic_gross_cap_with_held_manual_book_admits_fresh_asset() {
+        // Live mirror: settled 427 → gross ceiling 2.5*427 ≈ 1068, manual
+        // book AERO 200 + WIF 186 (gross 386 inside), fresh BTC probe ~10
+        // inside asset/net caps. Override floats with realized PnL; held set
+        // comes from production_manual_hold_blocks_asset (authoritative, no
+        // strategy components). Asset/net caps still vet new risk in full.
+        let now = 60_000;
+        let mut engine = flow_engine(now);
+        for asset in ["AERO", "WIF"] {
+            engine
+                .mids
+                .as_mut()
+                .unwrap()
+                .0
+                .mids
+                .insert(asset.into(), Decimal::from(1));
+            let metadata = engine.metadata.as_mut().unwrap();
+            metadata.universe.push(MarketMetadataAsset {
+                name: asset.into(),
+                size_decimals: 3,
+                growth_mode: false,
+            });
+            metadata.contexts.insert(
+                asset.into(),
+                crate::public_mainnet::MarketAssetContext {
+                    funding_rate_hourly: Decimal::ZERO,
+                },
+            );
+        }
+        engine.enable_production_intents(ProductionIntentIdentity {
+            observer_release_hash: [1; 32],
+            signer_release_hash: [1; 32],
+            release_manifest_hash: [2; 32],
+            market_rules_hash: [3; 32],
+            dynamic_floor_policy_hash: [4; 32],
+            ioc_policy_hash: [5; 32],
+            expires_after_ms: 10_000,
+        });
+        assert_eq!(
+            engine.config.global_risk.gross_cap_settled_multiple,
+            Some(2.5)
+        );
+        engine.construct_next_decision(now).unwrap().unwrap();
+        assert!(engine.pending.contains_key("BTC"));
+
+        // Settled 427 → override 1067.5; deployment 427.
+        engine.production_equities =
+            Some((Decimal::from(427), Decimal::from(427), Decimal::from(427)));
+        engine.production_positions = Some(BTreeMap::from([
+            ("AERO".into(), Decimal::from(200)),
+            ("WIF".into(), Decimal::from(-186)),
+        ]));
+        assert!(engine.production_manual_hold_blocks_asset("AERO"));
+        assert!(engine.production_manual_hold_blocks_asset("WIF"));
+        let held = engine.held_manual_assets();
+        assert!(held.contains("AERO"));
+        assert!(held.contains("WIF"));
+        let deployment = engine.deployment_equity().unwrap();
+        assert_eq!(deployment.settled_equity, Decimal::from(427));
+        let override_cap = engine
+            .gross_cap_override(deployment.settled_equity)
+            .unwrap()
+            .unwrap();
+        assert_eq!(override_cap, Decimal::from(427) * Decimal::new(25, 1));
+        // Manual book 386 inside 1067.5; no degraded veto (visibility only).
+        assert!(engine.manual_book_over_caps().is_none());
+
+        engine
+            .construct_next_decision(now + 1_000)
+            .unwrap()
+            .unwrap();
+
+        assert!(engine.strategy_target_execution_enabled());
+        assert!(!engine.pending.contains_key("AERO"));
+        assert!(!engine.pending.contains_key("WIF"));
+        let mut intents = engine.take_prepared_authorized_intents();
+        if intents.is_empty() {
+            assert!(engine.pending.contains_key("BTC"));
+            let btc_book = engine.books["BTC"].0.clone();
+            engine
+                .try_execute_pending(&btc_book, now + engine.config.latency_timeout_ms)
+                .unwrap();
+            intents = engine.take_prepared_authorized_intents();
+        }
+        assert!(intents.iter().any(|intent| intent.asset == "BTC"));
+        let trace = engine.last_decision_trace();
+        if let Some(btc) = trace.get("BTC") {
+            assert!(!btc.executable.is_zero() || btc.in_pending);
+        }
     }
 
     fn unavailable_manual_hold_scenario(manual_quantity: Decimal) {

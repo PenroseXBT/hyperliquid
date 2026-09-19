@@ -63,6 +63,10 @@ pub struct PortfolioProjectionInput {
     pub open_order_state_complete: bool,
     pub unconstrained_targets: BTreeMap<Asset, SignedNotional>,
     pub market_rules: BTreeMap<Asset, MarketRules>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gross_cap_override: Option<Decimal>,
+    #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
+    pub held_manual_assets: BTreeSet<Asset>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -114,7 +118,7 @@ pub fn project_and_validate_portfolio(
         input.max_single_asset_equity_pct,
         "single-asset cap",
     )?;
-    let gross_cap = checked_mul(
+    let legacy_gross_cap = checked_mul(
         checked_mul(
             input.current_equity,
             input.curve_leverage,
@@ -123,6 +127,12 @@ pub fn project_and_validate_portfolio(
         input.global_risk_scale,
         "gross cap",
     )?;
+    let gross_cap = input.gross_cap_override.unwrap_or(legacy_gross_cap);
+    if gross_cap <= Decimal::ZERO {
+        return Err(RiskViolation::InvalidInput(
+            "gross cap override must be positive".to_string(),
+        ));
+    }
     let net_cap = checked_mul(input.current_equity, input.max_net_equity_pct, "net cap")?;
 
     let assets = portfolio_assets(input);
@@ -176,11 +186,30 @@ pub fn project_and_validate_portfolio(
         projected_ranges(input, &assets, &open_by_asset, &rounded_deltas)?;
     let (mut maximum_projected_gross, mut minimum_projected_net, mut maximum_projected_net) =
         range_metrics(&projected_exposure_ranges)?;
-    let transition_breaches = projected_exposure_ranges
-        .values()
-        .any(|range| range.minimum.abs().max(range.maximum.abs()) > asset_cap)
-        || maximum_projected_gross > gross_cap
-        || minimum_projected_net.abs().max(maximum_projected_net.abs()) > net_cap;
+    // Held-manual assets are excluded from the gross breach *trigger* only.
+    // Asset/net caps still vet all new risk in full. Reported ranges and
+    // metrics stay complete; final validation still vets all new risk.
+    let transition_breaches = {
+        let held = &input.held_manual_assets;
+        let asset_breach = projected_exposure_ranges
+            .values()
+            .any(|range| range.minimum.abs().max(range.maximum.abs()) > asset_cap);
+        if asset_breach {
+            true
+        } else {
+            let filtered_gross: Decimal = {
+                let filtered: BTreeMap<Asset, ExposureRange> = projected_exposure_ranges
+                    .iter()
+                    .filter(|(asset, _)| !held.contains(asset.as_str()))
+                    .map(|(asset, range)| (asset.clone(), range.clone()))
+                    .collect();
+                let (gross, _, _) = range_metrics(&filtered)?;
+                gross
+            };
+            let net_breach = minimum_projected_net.abs().max(maximum_projected_net.abs()) > net_cap;
+            filtered_gross > gross_cap || net_breach
+        }
+    };
     if transition_breaches
         && stage_risk_reducing_deltas(input, &assets, &open_by_asset, &mut rounded_deltas)?
     {
@@ -222,6 +251,7 @@ fn stage_risk_reducing_deltas(
     open_by_asset: &BTreeMap<Asset, (Decimal, Decimal)>,
     rounded_deltas: &mut BTreeMap<Asset, Decimal>,
 ) -> Result<bool, RiskViolation> {
+    let original_deltas = rounded_deltas.clone();
     let empty = BTreeMap::new();
     let baseline = projected_ranges(input, assets, open_by_asset, &empty)?;
     let mut staged = BTreeMap::new();
@@ -296,6 +326,14 @@ fn stage_risk_reducing_deltas(
     // breach. Even when no portfolio-safe reduction remains, the safe staged
     // transition is the all-zero delta vector. Returning `false` here would
     // leave the original violating additions in place.
+    for (asset, staged_delta) in &staged {
+        let original = original_deltas.get(asset).copied().unwrap_or(Decimal::ZERO);
+        if !original.is_zero() && staged_delta.is_zero() {
+            eprintln!(
+                "projection_breach_fallback=true asset={asset} action=STAGE_RISK_REDUCTION nonfatal=true"
+            );
+        }
+    }
     *rounded_deltas = staged;
     Ok(true)
 }
@@ -792,6 +830,8 @@ mod tests {
             open_order_state_complete: true,
             unconstrained_targets,
             market_rules,
+            gross_cap_override: None,
+            held_manual_assets: BTreeSet::new(),
         }
     }
 
@@ -1177,6 +1217,80 @@ mod tests {
             project_and_validate_portfolio(&first).unwrap(),
             project_and_validate_portfolio(&second).unwrap()
         );
+    }
+
+    #[test]
+    fn gross_cap_override_expands_ceiling() {
+        let mut legacy = input_with_targets(&[("BTC", "1000")]);
+        let legacy_projection = project_and_validate_portfolio(&legacy).unwrap();
+        assert_eq!(legacy_projection.constrained_targets["BTC"], d("200"));
+
+        legacy.gross_cap_override = Some(d("1000"));
+        let overridden = project_and_validate_portfolio(&legacy).unwrap();
+        // Asset cap (0.65 * 1000 = 650) still applies; gross override lifts
+        // the 200 ceiling to 650 for this single-asset vector.
+        assert_eq!(overridden.constrained_targets["BTC"], d("650"));
+        assert_eq!(overridden.maximum_projected_gross, d("650"));
+    }
+
+    #[test]
+    fn held_manual_assets_excluded_from_gross_trigger() {
+        // Live shape: settled book inside the dynamic ceiling, fresh probe
+        // inside asset/net caps. Override carries the ceiling; held set
+        // carries the manual book for trigger filtering.
+        let mut input = input_with_targets(&[("BTC", "10")]);
+        input.current_equity = d("427");
+        input.curve_leverage = d("8");
+        input.global_risk_scale = d("0.10");
+        input.gross_cap_override = Some(d("1068"));
+        input.filled_positions = BTreeMap::from([
+            ("AERO".to_string(), d("200")),
+            ("WIF".to_string(), d("186")),
+        ]);
+        input.market_rules.insert("AERO".into(), rules("1"));
+        input.market_rules.insert("WIF".into(), rules("1"));
+        input.market_rules.insert("BTC".into(), rules("1"));
+        input
+            .unconstrained_targets
+            .insert("AERO".to_string(), d("0"));
+        input
+            .unconstrained_targets
+            .insert("WIF".to_string(), d("0"));
+        input.held_manual_assets = BTreeSet::from(["AERO".to_string(), "WIF".to_string()]);
+        // Book 386 inside 1068, fresh 10 inside asset (277) and net caps.
+        // Use mixed signs to keep net inside cap: AERO long, WIF short.
+        input.filled_positions.insert("WIF".to_string(), d("-186"));
+        let projection = project_and_validate_portfolio(&input).unwrap();
+        assert_eq!(projection.rounded_deltas["BTC"], d("10"));
+        assert!(projection.maximum_projected_gross <= d("1068"));
+    }
+
+    #[test]
+    fn genuine_breach_still_vetoes_with_override_and_held() {
+        // Existing strategy position over asset cap + fresh addition that
+        // increases risk must still fail closed, even with override + held.
+        let mut input = input_with_targets(&[("ETH", "50")]);
+        input.current_equity = d("100");
+        input.curve_leverage = d("8");
+        input.global_risk_scale = d("0.10");
+        input.gross_cap_override = Some(d("250"));
+        input.filled_positions = BTreeMap::from([("BTC".to_string(), d("700"))]);
+        input.market_rules.insert("BTC".into(), rules("1"));
+        input.market_rules.insert("ETH".into(), rules("1"));
+        input
+            .unconstrained_targets
+            .insert("BTC".to_string(), d("0"));
+        // BTC is strategy-owned (not held), so filled violation is genuine.
+        // Fresh ETH addition must be vetoed via staging (zeroed, no intent).
+        let vetoed = project_and_validate_portfolio(&input).unwrap();
+        assert_eq!(vetoed.rounded_deltas["ETH"], Decimal::ZERO);
+
+        // Same shape but BTC held-manual: asset breach still triggers
+        // staging (asset/net vet full), fresh ETH is zeroed, not admitted.
+        // With gross-only exclusion, asset breach still stages.
+        input.held_manual_assets = BTreeSet::from(["BTC".to_string()]);
+        let staged = project_and_validate_portfolio(&input).unwrap();
+        assert_eq!(staged.rounded_deltas["ETH"], Decimal::ZERO);
     }
 
     fn open(

@@ -379,6 +379,8 @@ pub struct GlobalRiskConfig {
     pub closeability_margin_usd: f64,
     pub slot_rank_hysteresis: f64,
     pub source_snapshot_max_age_ms: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gross_cap_settled_multiple: Option<f64>,
 }
 
 impl GlobalRiskConfig {
@@ -428,6 +430,13 @@ impl GlobalRiskConfig {
             return Err(ConfigError::new(
                 "global_risk.source_snapshot_max_age_ms must be positive",
             ));
+        }
+        if let Some(multiple) = self.gross_cap_settled_multiple {
+            if !multiple.is_finite() || multiple <= 0.0 || multiple > 10.0 {
+                return Err(ConfigError::new(
+                    "global_risk.gross_cap_settled_multiple must be finite and within (0, 10]",
+                ));
+            }
         }
         Ok(())
     }
@@ -633,5 +642,32 @@ mod tests {
         config.candidates[1].address = config.candidates[0].address.to_ascii_uppercase();
         config.candidates[1].address.replace_range(..2, "0x");
         assert!(config.validate_production().is_err());
+    }
+
+    #[test]
+    fn gross_cap_settled_multiple_defaults_to_none_and_validates_bounds() {
+        let mut config = production_config();
+        // Production config sets 2.5 explicitly.
+        assert_eq!(config.global_risk.gross_cap_settled_multiple, Some(2.5));
+        assert!(config.validate_production().is_ok());
+
+        // Legacy configs without the field parse as None (serde default).
+        config.global_risk.gross_cap_settled_multiple = None;
+        assert!(config.validate_production().is_ok());
+
+        for invalid in [f64::NAN, f64::INFINITY, 0.0, -1.0, 10.0001] {
+            config.global_risk.gross_cap_settled_multiple = Some(invalid);
+            assert!(
+                config.validate_production().is_err(),
+                "multiple {invalid} must fail closed"
+            );
+        }
+        for valid in [0.0001, 1.0, 2.5, 10.0] {
+            config.global_risk.gross_cap_settled_multiple = Some(valid);
+            assert!(
+                config.validate_production().is_ok(),
+                "multiple {valid} must validate"
+            );
+        }
     }
 }

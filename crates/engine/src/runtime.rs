@@ -1552,6 +1552,9 @@ fn write_continuous_status(
     if equity_mark_prices_missing {
         degraded_reasons.push("financial_mark_prices_missing".to_string());
     }
+    if let Some(reason) = engine.manual_book_over_caps() {
+        degraded_reasons.push(reason);
+    }
     let elapsed_seconds = now.saturating_sub(start) / 1_000;
     let status = ContinuousStatus {
         strategy_target_execution_enabled: engine.strategy_target_execution_enabled(),

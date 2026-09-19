@@ -9,7 +9,8 @@
     "order_rounding_buffer_usd": 0.2,
     "closeability_margin_usd": 0.5,
     "slot_rank_hysteresis": 0.02,
-    "source_snapshot_max_age_ms": 75000
+    "source_snapshot_max_age_ms": 75000,
+    "gross_cap_settled_multiple": 2.5
   },
   "unlimited_mode": true,
   "starting_equity_usd": 100.0,
