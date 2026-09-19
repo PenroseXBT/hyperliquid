@@ -502,6 +502,32 @@ class VerifierStreamingContract(unittest.TestCase):
             source_degraded_coverage_eligible=True, scan_commits=1)
         self.assertFalse(hl.source_coverage_gate(self.status(rubber), rubber))
 
+    def test_degraded_floor_scales_with_live_candidate_count(self):
+        # Production cohort size is dynamic (config candidates plus expanded
+        # layer members: 169/246/... not 375). An absolute confirmed floor
+        # would silently disable degraded mode on any cohort resize; the
+        # floor must stay at candidate_count - pending_max at every size.
+        for count in [169, 246, 375]:
+            healthy=dict(self.healthy_streaming(), live_state_confirmed=count,
+                engine_live_state_confirmed=count, durable_baselines=count,
+                hydrated_source_count=count, source_history_contiguous=count)
+            status={'candidate_count':count,'persistence_failures':0,
+                'source_persistence_failures':0,'streaming':healthy}
+            self.assertTrue(hl.source_coverage_gate(status, healthy),
+                f'strict must pass at cohort size {count}')
+            degraded=dict(healthy, source_healthy=False,
+                live_state_confirmed=count-2, engine_live_state_confirmed=count-2,
+                durable_baselines=count-2, hydrated_source_count=count-2,
+                live_state_recovering=2, source_history_catching_up=2,
+                coverage_reconciliation_wallets_pending=2,
+                coverage_reconciliation_wallets_pending_sample=['a','b'])
+            self.assertTrue(hl.source_coverage_gate(status, degraded),
+                f'degraded must pass at cohort size {count}')
+            rubber=dict(degraded, live_state_confirmed=0,
+                engine_live_state_confirmed=0)
+            self.assertFalse(hl.source_coverage_gate(status, rubber),
+                f'zero confirmed must fail at cohort size {count}')
+
     def test_gap_counters_are_observable_for_acceptance(self):
         streaming=self.healthy_streaming(gaps=7, source_history_gapped=3,
             source_history_catching_up=2)

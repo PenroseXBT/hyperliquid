@@ -28,7 +28,6 @@ AUTO_ALERT_INTERVAL = 14 * 60
 STATUS_MAX_AGE = 120
 BOOT_TIMEOUT = 900
 SOURCE_DEGRADED_PENDING_MAX = 2
-SOURCE_DEGRADED_CONFIRMED_FLOOR = 370
 
 
 def source_coverage_gate(status, streaming):
@@ -49,12 +48,16 @@ def source_coverage_gate(status, streaming):
     # Documented degraded mode: the cohort is structurally loaded and clean,
     # but at most two wallets are trailing current-generation confirmation.
     # The engine excludes unconfirmed wallets from source targeting; this gate
-    # only prevents a single straggler from parking an otherwise live service.
+    # only prevents a straggler from parking an otherwise live service.
+    # The confirmed floor is relative to the live candidate count (which the
+    # runtime expands beyond the config file), never an absolute constant:
+    # an absolute floor silently disables degraded mode whenever the cohort
+    # size changes.
     return (streaming.get('source_degraded_coverage_eligible') is True
             and pending <= SOURCE_DEGRADED_PENDING_MAX
             and durable >= candidate_count - SOURCE_DEGRADED_PENDING_MAX
             and hydrated >= candidate_count - SOURCE_DEGRADED_PENDING_MAX
-            and confirmed >= SOURCE_DEGRADED_CONFIRMED_FLOOR)
+            and confirmed >= candidate_count - SOURCE_DEGRADED_PENDING_MAX)
 
 
 def cohort_committed_gate(status, streaming):
